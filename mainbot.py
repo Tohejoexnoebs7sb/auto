@@ -67,7 +67,7 @@ log = logging.getLogger("bot")
 TEHRAN_TZ = pytz.timezone('Asia/Tehran')
 
 # Professional semantic version for this build.
-BOT_VERSION = "2.1.0"
+BOT_VERSION = "2.1.1"
 
 
 
@@ -2216,9 +2216,18 @@ def normalize_telegram_proxy(url):
     return url
 
 def clean_config_url(url: str) -> str:
+    """Normalize a config URI without decoding reserved characters globally.
+
+    Trojan passwords are frequently percent-encoded (for example ``%23`` for
+    ``#``). Decoding the complete URI before parsing would turn an encoded
+    password character into a URL delimiter and corrupt the netloc. Only HTML
+    entities and surrounding whitespace are normalized here; percent-encoding
+    is intentionally preserved.
+    """
     if not url:
         return url
-    url = url.replace('&amp;', '&')
+    url = html.unescape(str(url)).strip()
+    url = url.replace("&amp;", "&")
     return url
 
 # ======================================================================
@@ -2265,29 +2274,46 @@ def validate_vmess(url):
         return False, f"decode error: {str(e)}"
 
 def validate_trojan(url):
-    """Validate common Trojan URI forms without requiring a literal user:password pair.
+    """Validate standard Trojan URIs, including percent-encoded passwords.
 
-    Trojan links are commonly published as:
-        trojan://PASSWORD@HOST:PORT?...#NAME
-    urlparse() exposes PASSWORD as ``username`` in that form, not ``password``.
-    The previous validator incorrectly rejected those perfectly normal links.
+    Supported common forms include:
+      trojan://PASSWORD@HOST:PORT
+      trojan://PASSWORD@HOST:PORT?security=tls&sni=example.com
+      trojan://user:PASSWORD@HOST:PORT?...   (accepted for compatibility)
+
+    The credential is opaque data; it must not be URL-decoded before parsing
+    because encoded delimiters such as %23 and %40 are valid password bytes.
     """
     try:
-        parsed = urlparse((url or "").strip())
+        value = clean_config_url(url)
+        parsed = urlparse(value)
         if parsed.scheme.lower() != "trojan":
             return False, "not trojan"
-        # In trojan://password@host, the credential is parsed as username.
-        credential = parsed.username or parsed.password
-        if not credential:
-            return False, "missing password"
+
         if not parsed.hostname:
             return False, "missing host"
+
         try:
             port = parsed.port
         except ValueError:
             return False, "invalid port"
         if not port or not (1 <= port <= 65535):
             return False, "invalid port"
+
+        # In the normal Trojan form (PASSWORD@HOST), urllib exposes the
+        # password as ``username`` because there is no separate user field.
+        credential = parsed.password if parsed.password is not None else parsed.username
+        if credential is None or credential == "":
+            return False, "missing password"
+
+        # Validate percent escapes in the credential without changing the URI.
+        # urllib.parse.unquote tolerates malformed escapes, so explicitly
+        # reject a stray '%' followed by a non-hex pair.
+        if re.search(r"%(?![0-9A-Fa-f]{2})", credential):
+            return False, "invalid percent-encoding in password"
+
+        # A raw '@' in userinfo would be parsed as a delimiter. Encoded %40
+        # remains part of the credential and is therefore fully supported.
         return True, "valid"
     except Exception as e:
         return False, f"parse error: {e}"
@@ -2452,12 +2478,18 @@ def extract_links_from_text(text):
     results = []
     seen = set()
     pattern = re.compile(
-        r'(?:vless|vmess|trojan|wireguard|wg|shadowsocks|ss|socks5|socks4|socks|hysteria2|hy2)://[^\s<>\"\'{}()\[\]]+',
+        # Keep URI punctuation such as (), [], quotes and # inside the
+        # candidate. URL-encoded credentials and fragments may legally contain
+        # those characters. Whitespace/HTML delimiters are the reliable
+        # message-level boundaries.
+        r'(?:vless|vmess|trojan|wireguard|wg|shadowsocks|ss|socks5|socks4|socks|hysteria2|hy2)://[^\s<>]+',
         re.IGNORECASE
     )
 
     def add_candidate(link):
         link = clean_config_url(link.strip())
+        # Remove only obvious sentence punctuation after a URI. Do not remove
+        # ')' / ']' because those may be part of a Trojan fragment/name.
         link = re.sub(r'[.,;:!؟\'"`]+$', '', link)
         ok, reason = validate_config_link(link)
         if ok:
@@ -4688,16 +4720,31 @@ def backup_export_scope_kb(profile_id, backup_type):
     ])
 
 def manual_schedule_kb(profile_id):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚡️ همین الان", callback_data=f"mqs_{profile_id}_0_50_0", style="success")],
-        [InlineKeyboardButton("⏱️ هر ۳۰ دقیقه", callback_data=f"mqs_{profile_id}_30_1_0", style="primary"),
-         InlineKeyboardButton("⏱️ هر ۱ ساعت", callback_data=f"mqs_{profile_id}_60_1_0", style="primary")],
-        [InlineKeyboardButton("⏱️ هر ۱۲ ساعت", callback_data=f"mqs_{profile_id}_720_1_0", style="primary"),
-         InlineKeyboardButton("⚙️ دلخواه", callback_data=f"mq_custom_interval_{profile_id}", style="primary")],
-        [InlineKeyboardButton("📦 تقسیم بر اساس تعداد دلخواه", callback_data=f"mq_batch_{profile_id}", style="primary")],
+    """Default manual scheduling menu (no draft context required)."""
+    return manual_schedule_kb_with_draft(profile_id, None)
+
+def manual_schedule_kb_with_draft(profile_id, draft=None):
+    draft = draft or {}
+    interval = max(0, int(draft.get("interval", 0) or 0))
+    batch = max(1, min(50, int(draft.get("batch", 1) or 1)))
+    buttons = [
+        [InlineKeyboardButton("⚡️ همین الان", callback_data=f"mqs_{profile_id}_0_{min(50, batch)}_0", style="success")],
+        [InlineKeyboardButton("⏱️ هر ۳۰ دقیقه", callback_data=f"mqs_{profile_id}_30_{min(50, batch)}_0", style="primary"),
+         InlineKeyboardButton("⏱️ هر ۱ ساعت", callback_data=f"mqs_{profile_id}_60_{min(50, batch)}_0", style="primary")],
+        [InlineKeyboardButton("⏱️ هر ۱۲ ساعت", callback_data=f"mqs_{profile_id}_720_{min(50, batch)}_0", style="primary"),
+         InlineKeyboardButton("⚙️ تغییر فاصله", callback_data=f"mq_custom_interval_{profile_id}", style="primary")],
+        [InlineKeyboardButton("📦 تغییر تعداد در هر پست", callback_data=f"mq_batch_{profile_id}", style="primary")],
         [InlineKeyboardButton("📋 صف ارسال‌های دستی", callback_data=f"mq_list_{profile_id}", style="primary")],
-        [InlineKeyboardButton("❌ لغو", callback_data=f"prof_{profile_id}", style="danger")],
-    ])
+    ]
+    if draft:
+        buttons.append([InlineKeyboardButton(
+            f"✅ ثبت: {'فوری' if interval == 0 else f'هر {interval} دقیقه'} • {batch} مورد",
+            callback_data=f"mq_apply_{profile_id}",
+            style="success"
+        )])
+    buttons.append([InlineKeyboardButton("❌ لغو", callback_data=f"prof_{profile_id}", style="danger")])
+    return InlineKeyboardMarkup(buttons)
+
 
 def manual_queue_list_kb(profile_id):
     jobs = get_manual_queue(profile_id)
@@ -4952,10 +4999,23 @@ async def cmd_status(update: Update, context):
 # کالبک (با اضافه شدن هندلرهای جدید)
 # ======================================================================
 def clear_pending_input_state(ctx):
-    """Cancel every pending text-entry workflow for this chat/user.
-    This prevents text sent after Back/Cancel from being consumed by an old form.
+    """Cancel active text-entry workflows without destroying manual-send data.
+
+    Manual sending is a small state machine: the parsed links live in
+    ``manual_pending`` and the temporary input prompts live in
+    ``manual_schedule_custom`` / ``manual_queue_edit``. Navigation should
+    cancel only the active prompt, not the already parsed links or draft
+    scheduling values, so Back can safely return to the previous manual menu.
     """
-    for key in ("action", "sponsor_add", "sponsor_edit", "backup_export", "backup_export_custom"):
+    for key in (
+        "action",
+        "sponsor_add",
+        "sponsor_edit",
+        "backup_export",
+        "backup_export_custom",
+        "manual_schedule_custom",
+        "manual_queue_edit",
+    ):
         ctx.user_data.pop(key, None)
 
 
@@ -5092,6 +5152,10 @@ async def on_callback(u, ctx):
             return
 
         if d.startswith("prof_"):
+            ctx.user_data.pop("manual_pending", None)
+            ctx.user_data.pop("manual_schedule_custom", None)
+            ctx.user_data.pop("manual_schedule_draft", None)
+            ctx.user_data.pop("manual_queue_edit", None)
             parts = d.split("_")
             if len(parts) >= 2:
                 try:
@@ -6155,7 +6219,10 @@ async def on_callback(u, ctx):
         if d.startswith("mqs_"):
             parts = d.split("_")
             try:
-                profile_id = int(parts[1]); interval = max(0, int(parts[2])); batch = max(1, min(50, int(parts[3]))); delay = max(0, int(parts[4]))
+                profile_id = int(parts[1])
+                interval = max(0, int(parts[2]))
+                batch = max(1, min(50, int(parts[3])))
+                delay = max(0, int(parts[4]))
             except (ValueError, IndexError):
                 await q.answer("⚠️ تنظیمات صف نامعتبر است", show_alert=True)
                 return
@@ -6163,14 +6230,47 @@ async def on_callback(u, ctx):
             if not pending or int(pending.get("profile_id", -1)) != profile_id:
                 await q.answer("⚠️ داده ارسال دستی منقضی شده؛ دوباره لینک‌ها را وارد کن.", show_alert=True)
                 return
+            # Preset buttons commit immediately, preserving the selected batch size.
             created = []
             configs = list(pending.get("configs") or [])
             proxies = list(pending.get("proxies") or [])
             if configs:
-                created.append(create_manual_queue_job(profile_id, "config", configs, interval, batch, (interval if interval > 0 else 0)))
+                created.append(create_manual_queue_job(profile_id, "config", configs, interval, batch, (delay if delay > 0 else (interval if interval > 0 else 0))))
             if proxies:
-                created.append(create_manual_queue_job(profile_id, "proxy", proxies, interval, batch, (interval if interval > 0 else 0)))
+                created.append(create_manual_queue_job(profile_id, "proxy", proxies, interval, batch, (delay if delay > 0 else (interval if interval > 0 else 0))))
             ctx.user_data.pop("manual_pending", None)
+            ctx.user_data.pop("manual_schedule_custom", None)
+            ctx.user_data.pop("manual_schedule_draft", None)
+            ctx.user_data.pop("action", None)
+            await q.answer("✅ در صف قرار گرفت")
+            await q.edit_message_text(
+                f"✅ زمان‌بندی ثبت شد.\n\n📋 شناسه صف: {', '.join('#'+str(x) for x in created if x)}\n"
+                f"⏱ فاصله: {'فوری' if interval == 0 else str(interval)+' دقیقه'}\n📦 تعداد هر پست: {batch}",
+                reply_markup=manual_queue_list_kb(profile_id)
+            )
+            return
+
+        if d.startswith("mq_apply_"):
+            try:
+                profile_id = int(d.rsplit("_", 1)[1])
+            except ValueError:
+                await q.answer("⚠️ شناسه نامعتبر", show_alert=True)
+                return
+            pending = ctx.user_data.get("manual_pending")
+            draft = ctx.user_data.get("manual_schedule_draft") or {}
+            if not pending or int(pending.get("profile_id", -1)) != profile_id:
+                await q.answer("⚠️ داده ارسال دستی منقضی شده؛ دوباره لینک‌ها را وارد کن.", show_alert=True)
+                return
+            interval = max(0, int(draft.get("interval", 0) or 0))
+            batch = max(1, min(50, int(draft.get("batch", 1) or 1)))
+            created = []
+            if pending.get("configs"):
+                created.append(create_manual_queue_job(profile_id, "config", pending["configs"], interval, batch, interval if interval > 0 else 0))
+            if pending.get("proxies"):
+                created.append(create_manual_queue_job(profile_id, "proxy", pending["proxies"], interval, batch, interval if interval > 0 else 0))
+            ctx.user_data.pop("manual_pending", None)
+            ctx.user_data.pop("manual_schedule_custom", None)
+            ctx.user_data.pop("manual_schedule_draft", None)
             ctx.user_data.pop("action", None)
             await q.answer("✅ در صف قرار گرفت")
             await q.edit_message_text(
@@ -6185,8 +6285,18 @@ async def on_callback(u, ctx):
                 profile_id = int(d.rsplit("_", 1)[1])
             except ValueError:
                 await q.answer("⚠️ شناسه نامعتبر"); return
+            if not ctx.user_data.get("manual_pending"):
+                await q.answer("⚠️ داده ارسال دستی منقضی شده است.", show_alert=True)
+                return
+            draft = ctx.user_data.setdefault("manual_schedule_draft", {"profile_id": profile_id, "interval": 0, "batch": 1})
+            draft["profile_id"] = profile_id
             ctx.user_data["manual_schedule_custom"] = {"profile_id": profile_id, "step": "interval"}
-            await q.edit_message_text("⏱ فاصله زمانی را فقط به دقیقه وارد کن. مثال: 30 یا 60 یا 720", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data=f"manual_{profile_id}", style="primary")]]))
+            await q.edit_message_text(
+                "⏱ فاصله زمانی را فقط به دقیقه وارد کن. مثال: 30 یا 60 یا 720",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 بازگشت", callback_data=f"mq_schedule_back_{profile_id}", style="primary")
+                ]])
+            )
             return
 
         if d.startswith("mq_batch_"):
@@ -6194,11 +6304,42 @@ async def on_callback(u, ctx):
                 profile_id = int(d.rsplit("_", 1)[1])
             except ValueError:
                 await q.answer("⚠️ شناسه نامعتبر"); return
+            if not ctx.user_data.get("manual_pending"):
+                await q.answer("⚠️ داده ارسال دستی منقضی شده است.", show_alert=True)
+                return
+            draft = ctx.user_data.setdefault("manual_schedule_draft", {"profile_id": profile_id, "interval": 0, "batch": 1})
+            draft["profile_id"] = profile_id
             ctx.user_data["manual_schedule_custom"] = {"profile_id": profile_id, "step": "pair"}
-            await q.edit_message_text("⚙️ فرمت را این‌طور وارد کن: دقیقه,تعداد\nمثال: 30,5 یعنی هر ۳۰ دقیقه ۵ سرور؛ 60,2 یعنی هر ۱ ساعت ۲ سرور؛ 0,50 یعنی فوری و تا ۵۰ مورد در هر پست.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data=f"manual_{profile_id}", style="primary")]]))
+            await q.edit_message_text(
+                "📦 تعداد در هر پست را وارد کن (1 تا 50).\n"
+                "اگر فاصله هم می‌خواهی تغییر کند، فرمت «دقیقه,تعداد» را بفرست؛ مثال: 30,5",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 بازگشت", callback_data=f"mq_schedule_back_{profile_id}", style="primary")
+                ]])
+            )
+            return
+
+        if d.startswith("mq_schedule_back_"):
+            try:
+                profile_id = int(d.rsplit("_", 1)[1])
+            except ValueError:
+                await q.answer("⚠️ شناسه نامعتبر"); return
+            pending = ctx.user_data.get("manual_pending")
+            if not pending or int(pending.get("profile_id", -1)) != profile_id:
+                await q.answer("⚠️ داده ارسال دستی منقضی شده است.", show_alert=True)
+                return
+            ctx.user_data.pop("manual_schedule_custom", None)
+            draft = ctx.user_data.get("manual_schedule_draft") or {"profile_id": profile_id, "interval": 0, "batch": 1}
+            await q.edit_message_text(
+                "📋 تنظیمات ارسال دستی\n\n"
+                "می‌توانی چند مورد را تنظیم کنی و بعد «ثبت» را بزنی.",
+                reply_markup=manual_schedule_kb_with_draft(profile_id, draft)
+            )
             return
 
         if d.startswith("mq_list_"):
+            ctx.user_data.pop("manual_queue_edit", None)
+            ctx.user_data.pop("manual_schedule_custom", None)
             try:
                 profile_id = int(d.rsplit("_", 1)[1])
             except ValueError:
@@ -6208,6 +6349,8 @@ async def on_callback(u, ctx):
             return
 
         if d.startswith("mq_detail_"):
+            ctx.user_data.pop("manual_queue_edit", None)
+            ctx.user_data.pop("manual_schedule_custom", None)
             parts = d.split("_")
             try:
                 profile_id = int(parts[2]); job_id = int(parts[3])
@@ -6262,19 +6405,37 @@ async def on_callback(u, ctx):
             await q.answer("⏩ برای ارسال فوری علامت‌گذاری شد")
             return
 
+        if d.startswith("mq_edit_back_"):
+            parts = d.split("_")
+            try:
+                profile_id = int(parts[3]); job_id = int(parts[4])
+            except (ValueError, IndexError):
+                await q.answer("⚠️ داده نامعتبر"); return
+            ctx.user_data.pop("manual_queue_edit", None)
+            job = get_manual_queue_job(job_id, profile_id)
+            if not job:
+                await q.answer("❌ صف پیدا نشد", show_alert=True)
+                await q.edit_message_text("📋 صف فعال", reply_markup=manual_queue_list_kb(profile_id))
+                return
+            await q.edit_message_text(
+                manual_queue_text(job), parse_mode="HTML",
+                reply_markup=manual_queue_detail_kb(profile_id, job_id, job.get("items") or [])
+            )
+            return
+
         if d.startswith("mq_edit_interval_"):
             parts=d.split("_")
             try: profile_id=int(parts[3]); job_id=int(parts[4])
             except (ValueError,IndexError): await q.answer("⚠️ داده نامعتبر"); return
             ctx.user_data["manual_queue_edit"]={"profile_id":profile_id,"job_id":job_id,"field":"interval"}
-            await q.edit_message_text("⏱ فاصله جدید را به دقیقه وارد کن. 0 یعنی فوری.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data=f"mq_detail_{profile_id}_{job_id}", style="primary")]])); return
+            await q.edit_message_text("⏱ فاصله جدید را به دقیقه وارد کن. 0 یعنی فوری.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data=f"mq_edit_back_{profile_id}_{job_id}", style="primary")]])); return
 
         if d.startswith("mq_edit_batch_"):
             parts=d.split("_")
             try: profile_id=int(parts[3]); job_id=int(parts[4])
             except (ValueError,IndexError): await q.answer("⚠️ داده نامعتبر"); return
             ctx.user_data["manual_queue_edit"]={"profile_id":profile_id,"job_id":job_id,"field":"batch"}
-            await q.edit_message_text("📦 تعداد جدید در هر پست را وارد کن (1 تا 50).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data=f"mq_detail_{profile_id}_{job_id}", style="primary")]])); return
+            await q.edit_message_text("📦 تعداد جدید در هر پست را وارد کن (1 تا 50).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data=f"mq_edit_back_{profile_id}_{job_id}", style="primary")]])); return
 
         if d.startswith("manual_"):
             parts = d.split("_")
@@ -6284,8 +6445,19 @@ async def on_callback(u, ctx):
                 except ValueError:
                     await q.answer("⚠️ شناسه نامعتبر")
                     return
-                ctx.user_data["action"] = f"manual_{profile_id}"
-                await q.edit_message_text(msg("manual_send_prompt"), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"prof_{profile_id}", style="danger")]]))
+                pending = ctx.user_data.get("manual_pending")
+                if pending and int(pending.get("profile_id", -1)) == profile_id:
+                    draft = ctx.user_data.get("manual_schedule_draft") or {"profile_id": profile_id, "interval": 0, "batch": 1}
+                    ctx.user_data.pop("manual_schedule_custom", None)
+                    ctx.user_data.pop("manual_queue_edit", None)
+                    await q.edit_message_text(
+                        "📋 تنظیمات ارسال دستی\n\n"
+                        "می‌توانی چند مورد را تنظیم کنی و بعد «ثبت» را بزنی.",
+                        reply_markup=manual_schedule_kb_with_draft(profile_id, draft)
+                    )
+                else:
+                    ctx.user_data["action"] = f"manual_{profile_id}"
+                    await q.edit_message_text(msg("manual_send_prompt"), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"prof_{profile_id}", style="danger")]]))
             else:
                 await q.answer("⚠️ خطا در داده")
             return
@@ -6862,36 +7034,46 @@ async def on_text(u, ctx):
         pending = ctx.user_data.get("manual_pending")
         if not pending or int(pending.get("profile_id", -1)) != profile_id:
             ctx.user_data.pop("manual_schedule_custom", None)
+            ctx.user_data.pop("manual_schedule_draft", None)
             await u.message.reply_text("❌ داده ارسال دستی منقضی شده است.")
             return
         raw = (u.message.text or "").strip()
         try:
+            draft = ctx.user_data.setdefault(
+                "manual_schedule_draft",
+                {"profile_id": profile_id, "interval": 0, "batch": 1}
+            )
             if custom.get("step") == "interval":
                 interval = int(raw)
                 if interval < 0 or interval > 100000:
                     raise ValueError
-                batch = 1
+                draft["interval"] = interval
             else:
                 parts = re.split(r"[,،\s]+", raw)
-                if len(parts) != 2:
-                    raise ValueError
-                interval, batch = int(parts[0]), int(parts[1])
-                if interval < 0 or interval > 100000 or not (1 <= batch <= 50):
+                if len(parts) == 1:
+                    batch = int(parts[0])
+                    if not (1 <= batch <= 50):
+                        raise ValueError
+                    draft["batch"] = batch
+                elif len(parts) == 2:
+                    interval, batch = int(parts[0]), int(parts[1])
+                    if interval < 0 or interval > 100000 or not (1 <= batch <= 50):
+                        raise ValueError
+                    draft["interval"] = interval
+                    draft["batch"] = batch
+                else:
                     raise ValueError
         except ValueError:
-            await u.message.reply_text("❌ فرمت نامعتبر. مثال: 30 یا 30,5")
+            await u.message.reply_text("❌ فرمت نامعتبر. فاصله: 30 یا تعداد: 5 یا هر دو: 30,5")
             return
-        configs = list(pending.get("configs") or [])
-        proxies = list(pending.get("proxies") or [])
-        ids=[]
-        if configs:
-            ids.append(create_manual_queue_job(profile_id,"config",configs,interval,batch,(interval if interval > 0 else 0)))
-        if proxies:
-            ids.append(create_manual_queue_job(profile_id,"proxy",proxies,interval,batch,(interval if interval > 0 else 0)))
+
+        ctx.user_data["manual_schedule_draft"] = draft
         ctx.user_data.pop("manual_schedule_custom", None)
-        ctx.user_data.pop("manual_pending", None)
-        ctx.user_data.pop("action", None)
-        await u.message.reply_text(f"✅ صف ثبت شد: {', '.join('#'+str(x) for x in ids if x)}\n⏱ فاصله: {'فوری' if interval==0 else str(interval)+' دقیقه'}\n📦 هر پست: {batch}", reply_markup=manual_queue_list_kb(profile_id))
+        await u.message.reply_text(
+            "✅ مقدار ذخیره شد؛ هنوز صف ثبت نشده است.\n"
+            "می‌توانی تنظیم دیگری را هم تغییر بدهی و بعد «ثبت» را بزن.",
+            reply_markup=manual_schedule_kb_with_draft(profile_id, draft)
+        )
         return
 
     edit = ctx.user_data.get("manual_queue_edit")
@@ -7465,6 +7647,10 @@ async def on_document(u, ctx):
 # ======================================================================
 async def process_manual_text(u, message, profile_id, is_document=False, ctx=None):
     """Parse manual input and hand it to the persistent scheduling UI."""
+    if ctx is not None:
+        ctx.user_data.pop("manual_queue_edit", None)
+        ctx.user_data.pop("manual_schedule_custom", None)
+        ctx.user_data.pop("manual_schedule_draft", None)
     pmsg = await message.reply_text(msg("manual_send_processing"))
     try:
         if is_document:
@@ -7534,10 +7720,11 @@ async def process_manual_text(u, message, profile_id, is_document=False, ctx=Non
             "configs": valid_configs,
             "proxies": valid_proxies,
         }
+        ctx.user_data["manual_schedule_draft"] = {"profile_id": int(profile_id), "interval": 0, "batch": 1}
         await pmsg.edit_text(
             f"📋 آماده زمان‌بندی\n\n📡 کانفیگ: {len(valid_configs)}\n🌐 پروکسی: {len(valid_proxies)}\n\n"
             "حالت ارسال را انتخاب کن:",
-            reply_markup=manual_schedule_kb(profile_id)
+            reply_markup=manual_schedule_kb_with_draft(profile_id, ctx.user_data["manual_schedule_draft"])
         )
     except Exception as e:
         log.exception("manual send error")
