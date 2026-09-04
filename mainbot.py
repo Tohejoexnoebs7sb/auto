@@ -67,7 +67,7 @@ log = logging.getLogger("bot")
 TEHRAN_TZ = pytz.timezone('Asia/Tehran')
 
 # Professional semantic version for this build.
-BOT_VERSION = "2.1.1"
+BOT_VERSION = "2.1.2"
 
 
 
@@ -575,6 +575,8 @@ c.execute("""CREATE TABLE IF NOT EXISTS profiles (
     post_configs INTEGER DEFAULT 1,
     post_proxies INTEGER DEFAULT 1,
     ping_mode TEXT DEFAULT 'global',
+    config_ping_mode TEXT DEFAULT 'global',
+    proxy_ping_mode TEXT DEFAULT 'global',
     last_num INTEGER DEFAULT 0,
     created_at TEXT,
     show_numbers INTEGER DEFAULT 1,
@@ -617,6 +619,8 @@ ensure_column("profiles", "max_post_config", "INTEGER DEFAULT 8", 8)
 ensure_column("profiles", "max_post_proxy", "INTEGER DEFAULT 10", 10)
 ensure_column("profiles", "naming_template", "TEXT DEFAULT '{Flag} | ⚡️Telegram = {CHANNEL_ID}'", "{Flag} | ⚡️Telegram = {CHANNEL_ID}")
 ensure_column("profiles", "channel_link", "TEXT DEFAULT ''", "")
+ensure_column("profiles", "config_ping_mode", "TEXT DEFAULT 'global'", "global")
+ensure_column("profiles", "proxy_ping_mode", "TEXT DEFAULT 'global'", "global")
 ensure_column("profiles", "ping_enabled", "INTEGER DEFAULT 1", 1)
 ensure_column("profiles", "profile_enabled", "INTEGER DEFAULT 1", 1)
 ensure_column("profiles", "country_display", "INTEGER DEFAULT 2", 2)
@@ -662,6 +666,8 @@ def fix_column_types():
                     post_configs INTEGER DEFAULT 1,
                     post_proxies INTEGER DEFAULT 1,
                     ping_mode TEXT DEFAULT 'global',
+                    config_ping_mode TEXT DEFAULT 'global',
+                    proxy_ping_mode TEXT DEFAULT 'global',
                     last_num INTEGER DEFAULT 0,
                     created_at TEXT,
                     show_numbers INTEGER DEFAULT 1,
@@ -690,14 +696,14 @@ def fix_column_types():
             c.execute("""
                 INSERT INTO profiles_new
                     (id, dest_name, sources, banner_config, banner_proxy, interval_min,
-                     max_post, max_proxies, post_configs, post_proxies, ping_mode, last_num,
+                     max_post, max_proxies, post_configs, post_proxies, ping_mode, config_ping_mode, proxy_ping_mode, last_num,
                      created_at, show_numbers, custom_query, show_date_config, show_date_proxy,
                      schedule_cron, last_backup_count, timer_expiry, timer_duration, backup_interval,
                      interval_config, interval_proxy, max_post_config, max_post_proxy,
                      naming_template, channel_link, ping_enabled, profile_enabled,
                      country_display, show_ping, proxy_banner_template, proxy_post_mode, ping_testing)
                 SELECT id, dest_name, sources, banner_config, banner_proxy, interval_min,
-                       max_post, max_proxies, post_configs, post_proxies, ping_mode, last_num,
+                       max_post, max_proxies, post_configs, post_proxies, ping_mode, config_ping_mode, proxy_ping_mode, last_num,
                        created_at, show_numbers, custom_query, show_date_config, show_date_proxy,
                        schedule_cron, last_backup_count, timer_expiry, timer_duration, backup_interval,
                        interval_config, interval_proxy, max_post_config, max_post_proxy,
@@ -1148,6 +1154,8 @@ async def manual_queue_worker(bot):
 
 # Normalize missing Ping mode to the new default (Global) without overwriting explicit user choices.
 c.execute("UPDATE profiles SET ping_mode=? WHERE ping_mode IS NULL OR TRIM(ping_mode)=?", ("global", ""))
+c.execute("UPDATE profiles SET config_ping_mode=CASE WHEN LOWER(TRIM(COALESCE(ping_mode, 'global')))='iran' THEN 'iran' ELSE 'global' END WHERE config_ping_mode IS NULL OR TRIM(config_ping_mode)=?", ("",))
+c.execute("UPDATE profiles SET proxy_ping_mode=CASE WHEN LOWER(TRIM(COALESCE(ping_mode, 'global')))='iran' THEN 'iran' ELSE 'global' END WHERE proxy_ping_mode IS NULL OR TRIM(proxy_ping_mode)=?", ("",))
 conn.commit()
 
 # ======================================================================
@@ -1230,7 +1238,7 @@ def create_profile(dest_name, sources="", banner_config=None, banner_proxy=None,
 def update_profile(profile_id, **kwargs):
     allowed = ["dest_name", "sources", "banner_config", "banner_proxy",
                "interval_min", "max_post", "max_proxies", "post_configs",
-               "post_proxies", "ping_mode", "last_num",
+               "post_proxies", "ping_mode", "config_ping_mode", "proxy_ping_mode", "last_num",
                "show_numbers", "custom_query", "show_date_config", "show_date_proxy",
                "schedule_cron", "last_backup_count", "timer_expiry", "timer_duration",
                "backup_interval", "interval_config", "interval_proxy", "max_post_config", "max_post_proxy",
@@ -1318,12 +1326,35 @@ def get_profile_last_num(profile_id):
 def set_profile_last_num(profile_id, num):
     update_profile(profile_id, last_num=num)
 
+def _normalize_ping_mode(mode):
+    return "iran" if str(mode).lower().strip() == "iran" else "global"
+
 def get_profile_ping_mode(profile_id):
+    """Backward-compatible master ping mode; new UI uses per-stream modes."""
     prof = get_profile(profile_id)
-    return prof["ping_mode"] if prof else "iran"
+    return _normalize_ping_mode(prof.get("ping_mode", "global")) if prof else "global"
 
 def set_profile_ping_mode(profile_id, mode):
-    update_profile(profile_id, ping_mode=mode)
+    mode = _normalize_ping_mode(mode)
+    update_profile(profile_id, ping_mode=mode, config_ping_mode=mode, proxy_ping_mode=mode)
+
+def get_profile_config_ping_mode(profile_id):
+    prof = get_profile(profile_id)
+    if not prof:
+        return "global"
+    return _normalize_ping_mode(prof.get("config_ping_mode", "global"))
+
+def set_profile_config_ping_mode(profile_id, mode):
+    update_profile(profile_id, config_ping_mode=_normalize_ping_mode(mode))
+
+def get_profile_proxy_ping_mode(profile_id):
+    prof = get_profile(profile_id)
+    if not prof:
+        return "global"
+    return _normalize_ping_mode(prof.get("proxy_ping_mode", "global"))
+
+def set_profile_proxy_ping_mode(profile_id, mode):
+    update_profile(profile_id, proxy_ping_mode=_normalize_ping_mode(mode))
 
 def get_profile_ping_enabled(profile_id):
     # This now represents the master switch for ping testing
@@ -3586,7 +3617,9 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
             pass
         return 0, "no destination"
 
-    ping_mode = get_profile_ping_mode(profile_id)
+    config_ping_mode = get_profile_config_ping_mode(profile_id)
+    proxy_ping_mode = get_profile_proxy_ping_mode(profile_id)
+    ping_mode = config_ping_mode  # backward-compatible local alias for config checks
     ping_testing = get_profile_ping_enabled(profile_id)
     stream = "combined" if enable_configs and enable_proxies else ("config" if enable_configs else "proxy")
     log.info(f"📡 [profile={profile_id}] Sources: {len(sources)} | 🎯 {dest} | stream={stream} | internal_health_test={ping_testing}")
@@ -3654,7 +3687,7 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
             async with sem:
                 try:
                     if ping_testing:
-                        ping, ok, cnt = await check_full_link_ping(u, ping_mode, perform_ping=True)
+                        ping, ok, cnt = await check_full_link_ping(u, config_ping_mode, perform_ping=True)
                     else:
                         # Ping testing disabled: we still check host resolution and TCP? But we don't filter.
                         # We'll just consider it reachable if we can resolve host.
@@ -3718,6 +3751,15 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
                             log.debug(f"[PROXY] GeoIP lookup failed for {host}: {e}")
                     if not host or not port or not (1 <= int(port) <= 65535):
                         return proxy_url, 0, flag, country_code
+                    if ping_testing:
+                        try:
+                            ping, ok, _ = await check_full_link_ping(proxy_url, proxy_ping_mode, perform_ping=True)
+                            if not ok:
+                                return proxy_url, 0, flag, country_code
+                            return proxy_url, ping, flag, country_code
+                        except Exception as e:
+                            log.debug(f"[PROXY] ping failed for {host}:{port}: {e}")
+                            return proxy_url, 0, flag, country_code
                     return proxy_url, 0, flag, country_code
 
             results = await asyncio.gather(
@@ -4598,7 +4640,9 @@ def profile_admin_kb(profile_id):
         [InlineKeyboardButton(f"🌐 حالت انتشار پروکسی: {'شیشه‌ای' if get_profile_proxy_post_mode(profile_id) == 1 else 'عادی'}", callback_data=f"tgl_prx_mode_{profile_id}", style="primary"),
          InlineKeyboardButton(f"📡 تست Ping: {'✅' if ping_testing else '❌'}", callback_data=f"tgl_ping_test_{profile_id}", style="primary")],
         [InlineKeyboardButton(f"👁 نمایش Ping: {'✅' if prof.get('show_ping', 1) else '❌'}", callback_data=f"tgl_show_ping_{profile_id}", style="primary"),
-         InlineKeyboardButton(f"📍 منطقه Ping: {'🇮🇷 ایران' if ping_mode == 'iran' else '🌍 جهانی'}", callback_data=f"tglping_{profile_id}", style="primary")],
+         InlineKeyboardButton("📍 تنظیم مناطق Ping", callback_data=f"ping_regions_{profile_id}", style="primary")],
+        [InlineKeyboardButton(f"📍 Ping ویتوری: {'🇮🇷 ایران' if get_profile_config_ping_mode(profile_id) == 'iran' else '🌍 جهانی'}", callback_data=f"ping_region_config_{profile_id}", style="primary"),
+         InlineKeyboardButton(f"📍 Ping پروکسی: {'🇮🇷 ایران' if get_profile_proxy_ping_mode(profile_id) == 'iran' else '🌍 جهانی'}", callback_data=f"ping_region_proxy_{profile_id}", style="primary")],
         [InlineKeyboardButton(msg("btn_toggle_profile", status=profile_status), callback_data=f"tgl_profile_{profile_id}", style="danger")],
         [InlineKeyboardButton(cfg_btn, callback_data=f"tglcfg_{profile_id}", style="primary"),
          InlineKeyboardButton(prx_btn, callback_data=f"tglproxy_{profile_id}", style="primary")],
@@ -4627,6 +4671,25 @@ def profile_admin_kb(profile_id):
          InlineKeyboardButton(msg("btn_clear"), callback_data=f"cd1_{profile_id}", style="danger")],
         [InlineKeyboardButton("❌ Delete Profile", callback_data=f"delprof_{profile_id}", style="danger")],
         [InlineKeyboardButton(msg("btn_back"), callback_data="profiles_list", style="primary")],
+    ])
+
+def ping_regions_kb(profile_id):
+    cfg = get_profile_config_ping_mode(profile_id)
+    prx = get_profile_proxy_ping_mode(profile_id)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🧩 ویتوری: {'🇮🇷 ایران' if cfg == 'iran' else '🌍 جهانی'}", callback_data=f"ping_region_config_{profile_id}", style="primary")],
+        [InlineKeyboardButton(f"🌐 پروکسی: {'🇮🇷 ایران' if prx == 'iran' else '🌍 جهانی'}", callback_data=f"ping_region_proxy_{profile_id}", style="primary")],
+        [InlineKeyboardButton("🌍 هر دو = جهانی", callback_data=f"ping_region_all_global_{profile_id}", style="success")],
+        [InlineKeyboardButton("↩️ بازگشت", callback_data=f"prof_{profile_id}", style="primary")],
+    ])
+
+def ping_region_choice_kb(profile_id, kind):
+    current = get_profile_config_ping_mode(profile_id) if kind == "config" else get_profile_proxy_ping_mode(profile_id)
+    title = "ویتوری/کانفیگ" if kind == "config" else "پروکسی"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{'◉' if current == 'global' else '○'} 🌍 جهانی", callback_data=f"set_ping_region_{kind}_global_{profile_id}", style="success" if current == "global" else "primary")],
+        [InlineKeyboardButton(f"{'◉' if current == 'iran' else '○'} 🇮🇷 ایران", callback_data=f"set_ping_region_{kind}_iran_{profile_id}", style="success" if current == "iran" else "primary")],
+        [InlineKeyboardButton("↩️ بازگشت به مناطق Ping", callback_data=f"ping_regions_{profile_id}", style="primary")],
     ])
 
 def destinations_kb(profile_id):
@@ -5971,6 +6034,63 @@ async def on_callback(u, ctx):
             await show_profile_admin(q.message, profile_id)
             return
 
+        if d.startswith("ping_regions_"):
+            try:
+                profile_id = int(d.rsplit("_", 1)[1])
+            except ValueError:
+                await q.answer("⚠️ شناسه نامعتبر"); return
+            await q.edit_message_text("📍 <b>تنظیم مستقل مناطق Ping</b>\n\nبرای ویتوری و پروکسی می‌توانی منطقه جداگانه انتخاب کنی.\nپیش‌فرض هر دو: 🌍 جهانی", parse_mode="HTML", reply_markup=ping_regions_kb(profile_id))
+            return
+
+        if d.startswith("ping_region_config_"):
+            try:
+                profile_id = int(d.rsplit("_", 1)[1])
+            except ValueError:
+                await q.answer("⚠️ شناسه نامعتبر"); return
+            await q.edit_message_text("🧩 منطقه Ping ویتوری/کانفیگ را انتخاب کن:", reply_markup=ping_region_choice_kb(profile_id, "config"))
+            return
+
+        if d.startswith("ping_region_proxy_"):
+            try:
+                profile_id = int(d.rsplit("_", 1)[1])
+            except ValueError:
+                await q.answer("⚠️ شناسه نامعتبر"); return
+            await q.edit_message_text("🌐 منطقه Ping پروکسی را انتخاب کن:", reply_markup=ping_region_choice_kb(profile_id, "proxy"))
+            return
+
+        if d.startswith("set_ping_region_"):
+            parts = d.split("_")
+            if len(parts) != 5:
+                await q.answer("⚠️ داده نامعتبر"); return
+            _, _, kind, mode, profile_raw = parts
+            try:
+                profile_id = int(profile_raw)
+            except ValueError:
+                await q.answer("⚠️ شناسه نامعتبر"); return
+            mode = _normalize_ping_mode(mode)
+            if kind == "config":
+                set_profile_config_ping_mode(profile_id, mode)
+                label = "ویتوری/کانفیگ"
+            elif kind == "proxy":
+                set_profile_proxy_ping_mode(profile_id, mode)
+                label = "پروکسی"
+            else:
+                await q.answer("⚠️ نوع نامعتبر"); return
+            await q.answer(f"✅ منطقه Ping {label}: {'جهانی' if mode == 'global' else 'ایران'}")
+            await q.edit_message_text(f"🧩 منطقه Ping {label} تنظیم شد.", reply_markup=ping_region_choice_kb(profile_id, kind))
+            return
+
+        if d.startswith("ping_region_all_global_"):
+            try:
+                profile_id = int(d.rsplit("_", 1)[1])
+            except ValueError:
+                await q.answer("⚠️ شناسه نامعتبر"); return
+            set_profile_config_ping_mode(profile_id, "global")
+            set_profile_proxy_ping_mode(profile_id, "global")
+            await q.answer("🌍 هر دو منطقه Ping روی جهانی قرار گرفت")
+            await q.edit_message_text("🌍 منطقه Ping ویتوری و پروکسی هر دو روی جهانی تنظیم شدند.", reply_markup=ping_regions_kb(profile_id))
+            return
+
         if d.startswith("tglping_"):
             parts = d.split("_")
             if len(parts) >= 2:
@@ -6958,7 +7078,7 @@ async def show_profile_admin(msg_or_q, profile_id):
     sponsors = get_sponsors(profile_id)
     sponsor_st = f"{len(sponsors)} اسپانسر" if sponsors else "خالی"
     ping_mode = prof["ping_mode"]
-    ping_display = "ایران" if ping_mode == "iran" else "جهانی"
+    ping_display = f"ویتوری:{get_profile_config_ping_mode(profile_id)} / پروکسی:{get_profile_proxy_ping_mode(profile_id)}"
     ping_testing = get_profile_ping_enabled(profile_id)
     ping_status = "✅" if ping_testing else "❌"
     profile_enabled = get_profile_enabled(profile_id)
