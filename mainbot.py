@@ -66,6 +66,9 @@ log = logging.getLogger("bot")
 # ======================================================================
 TEHRAN_TZ = pytz.timezone('Asia/Tehran')
 
+# Professional semantic version for this build.
+BOT_VERSION = "2.1.0"
+
 
 
 
@@ -864,6 +867,285 @@ def migrate_old_config():
 migrate_old_config()
 # Header display modes are per-profile and migrated safely after profiles exists.
 migrate_header_modes()
+
+# ======================================================================
+# صف ارسال دستی زمان‌بندی‌شده (Persistent Manual Queue)
+# ======================================================================
+# این صف عمداً در SQLite ذخیره می‌شود تا با restart/redeploy زمان‌بندی‌ها از بین نروند.
+c.execute("""CREATE TABLE IF NOT EXISTS manual_send_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    items_json TEXT NOT NULL,
+    interval_minutes INTEGER NOT NULL DEFAULT 0,
+    batch_size INTEGER NOT NULL DEFAULT 1,
+    next_run_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_error TEXT DEFAULT '',
+    sent_count INTEGER NOT NULL DEFAULT 0
+)""")
+ensure_column("manual_send_queue", "last_error", "TEXT DEFAULT ''", "")
+ensure_column("manual_send_queue", "sent_count", "INTEGER DEFAULT 0", 0)
+c.execute("CREATE INDEX IF NOT EXISTS idx_manual_queue_due ON manual_send_queue(status, next_run_at)")
+c.execute("CREATE INDEX IF NOT EXISTS idx_manual_queue_profile ON manual_send_queue(profile_id, status)")
+conn.commit()
+
+def _queue_now():
+    return datetime.now(TEHRAN_TZ)
+
+def _queue_iso(dt):
+    return dt.astimezone(TEHRAN_TZ).isoformat()
+
+def _queue_parse_time(value):
+    try:
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = TEHRAN_TZ.localize(dt)
+        return dt.astimezone(TEHRAN_TZ)
+    except Exception:
+        return _queue_now()
+
+def create_manual_queue_job(profile_id, kind, items, interval_minutes=0, batch_size=1, first_delay_minutes=0):
+    items = [str(x).strip() for x in (items or []) if str(x).strip()]
+    if not items:
+        return None
+    kind = str(kind).lower().strip()
+    if kind not in ("config", "proxy"):
+        raise ValueError("invalid queue kind")
+    interval_minutes = max(0, int(interval_minutes or 0))
+    batch_size = max(1, int(batch_size or 1))
+    # Telegram text has a practical ceiling; keep one queue batch bounded.
+    batch_size = min(batch_size, 50)
+    now = _queue_now()
+    first_run = now + timedelta(minutes=max(0, int(first_delay_minutes or 0)))
+    stamp = _queue_iso(now)
+    c.execute("""INSERT INTO manual_send_queue
+        (profile_id, kind, items_json, interval_minutes, batch_size, next_run_at, status, created_at, updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?)""",
+        (profile_id, kind, json.dumps(items, ensure_ascii=False), interval_minutes,
+         batch_size, _queue_iso(first_run), "pending", stamp, stamp))
+    conn.commit()
+    return c.lastrowid
+
+def get_manual_queue(profile_id, include_done=False):
+    if include_done:
+        rows = c.execute(
+            "SELECT * FROM manual_send_queue WHERE profile_id=? ORDER BY next_run_at, id", (profile_id,)
+        ).fetchall()
+    else:
+        rows = c.execute(
+            "SELECT * FROM manual_send_queue WHERE profile_id=? AND status='pending' ORDER BY next_run_at, id",
+            (profile_id,)
+        ).fetchall()
+    cols = [d[0] for d in c.description]
+    out = []
+    for row in rows:
+        d = dict(zip(cols, row))
+        try:
+            d["items"] = json.loads(d.get("items_json") or "[]")
+        except Exception:
+            d["items"] = []
+        out.append(d)
+    return out
+
+def get_manual_queue_job(job_id, profile_id=None):
+    if profile_id is None:
+        row = c.execute("SELECT * FROM manual_send_queue WHERE id=?", (job_id,)).fetchone()
+    else:
+        row = c.execute("SELECT * FROM manual_send_queue WHERE id=? AND profile_id=?", (job_id, profile_id)).fetchone()
+    if not row:
+        return None
+    cols = [d[0] for d in c.description]
+    d = dict(zip(cols, row))
+    try:
+        d["items"] = json.loads(d.get("items_json") or "[]")
+    except Exception:
+        d["items"] = []
+    return d
+
+def update_manual_queue_job(job_id, profile_id, **changes):
+    job = get_manual_queue_job(job_id, profile_id)
+    if not job:
+        return False
+    allowed = {"interval_minutes", "batch_size", "next_run_at", "status", "last_error", "items_json"}
+    clauses, params = [], []
+    for k, v in changes.items():
+        if k in allowed:
+            clauses.append(f"{k}=?")
+            params.append(v)
+    if not clauses:
+        return False
+    clauses.append("updated_at=?")
+    params.append(_queue_iso(_queue_now()))
+    params.extend([job_id, profile_id])
+    c.execute(f"UPDATE manual_send_queue SET {', '.join(clauses)} WHERE id=? AND profile_id=?", params)
+    conn.commit()
+    return c.rowcount > 0
+
+def cancel_manual_queue_job(job_id, profile_id):
+    return update_manual_queue_job(job_id, profile_id, status="cancelled")
+
+def delete_manual_queue_job(job_id, profile_id):
+    c.execute("DELETE FROM manual_send_queue WHERE id=? AND profile_id=?", (job_id, profile_id))
+    conn.commit()
+    return c.rowcount > 0
+
+def remove_manual_queue_item(job_id, profile_id, index):
+    job = get_manual_queue_job(job_id, profile_id)
+    if not job or job["status"] != "pending":
+        return False
+    items = list(job.get("items") or [])
+    if not (0 <= index < len(items)):
+        return False
+    items.pop(index)
+    if not items:
+        return delete_manual_queue_job(job_id, profile_id)
+    return update_manual_queue_job(job_id, profile_id, items_json=json.dumps(items, ensure_ascii=False))
+
+def _manual_queue_take_batch(job):
+    items = list(job.get("items") or [])
+    if not items:
+        return []
+    return items[:max(1, min(50, int(job.get("batch_size") or 1)))]
+
+def _manual_queue_commit_batch(job_id, profile_id, sent_items, error=""):
+    job = get_manual_queue_job(job_id, profile_id)
+    if not job:
+        return
+    remaining = list(job.get("items") or [])
+    sent_set = set(sent_items or [])
+    # Preserve order while removing exactly the items that were successfully published.
+    remaining = [x for x in remaining if x not in sent_set]
+    sent_count = int(job.get("sent_count") or 0) + len(sent_items or [])
+    if error and not sent_items:
+        update_manual_queue_job(job_id, profile_id, status="pending", last_error=str(error)[:500])
+        return
+    if not remaining:
+        update_manual_queue_job(job_id, profile_id, items_json="[]", status="done",
+                                sent_count=sent_count, last_error="")
+    else:
+        next_run = _queue_now() + timedelta(minutes=max(0, int(job.get("interval_minutes") or 0)))
+        update_manual_queue_job(
+            job_id, profile_id,
+            items_json=json.dumps(remaining, ensure_ascii=False),
+            next_run_at=_queue_iso(next_run),
+            status="pending",
+            sent_count=sent_count,
+            last_error=str(error or "")[:500]
+        )
+
+async def _send_manual_queue_batch(bot, job):
+    profile_id = int(job["profile_id"])
+    kind = job["kind"]
+    batch = _manual_queue_take_batch(job)
+    if not batch:
+        delete_manual_queue_job(job["id"], profile_id)
+        return 0
+
+    if kind == "config":
+        # Do not run the generic health filter here. Manual scheduling is an explicit
+        # admin action; structural validation was already performed at intake.
+        working = [(url, 0, 0) for url in batch]
+        sent = await post_configs(
+            bot, profile_id, working, source_for_seen="manual",
+            is_instant=False, max_post_override=len(batch)
+        )
+        if sent <= 0:
+            _manual_queue_commit_batch(job["id"], profile_id, [], "Telegram config send failed")
+            return 0
+        # post_configs marks exactly the successfully delivered configs. Remove the
+        # corresponding leading items; if a duplicate was already posted, it is also safe.
+        _manual_queue_commit_batch(job["id"], profile_id, batch[:sent], "")
+        return sent
+
+    proxy_with_ping = []
+    for proxy_url in batch:
+        host, _ = extract_host(proxy_url)
+        flag, country_code = "🌐", ""
+        if host:
+            try:
+                ip = await host_to_ip(host)
+                if ip:
+                    flag, country_code = await get_flag_for_ip(ip)
+            except Exception:
+                pass
+        proxy_with_ping.append((proxy_url, 0, flag, country_code))
+
+    cnt, payload, selected = await post_proxies(
+        bot, profile_id, proxy_with_ping, is_instant=False, max_proxies_override=len(batch)
+    )
+    if cnt <= 0 or not payload:
+        _manual_queue_commit_batch(job["id"], profile_id, [], "No publishable proxies in batch")
+        return 0
+    text_p, buttons = payload
+    sent_ok = await send_to_destination(bot, profile_id, text_p, buttons)
+    if not sent_ok:
+        _manual_queue_commit_batch(job["id"], profile_id, [], "Telegram proxy send failed")
+        return 0
+    for proxy_url in selected:
+        if not is_proxy_posted(profile_id, proxy_url):
+            mark_proxy_posted(profile_id, proxy_url)
+    _manual_queue_commit_batch(job["id"], profile_id, selected, "")
+    return len(selected)
+
+async def manual_queue_worker(bot):
+    """Persistent scheduler: wakes on the nearest due job, so edits take effect immediately."""
+    log.info("⏱️ Persistent manual-send scheduler started")
+    while True:
+        try:
+            rows = c.execute(
+                "SELECT id FROM manual_send_queue WHERE status='pending' ORDER BY next_run_at, id LIMIT 20"
+            ).fetchall()
+            if not rows:
+                await asyncio.sleep(2)
+                continue
+            due_ids = []
+            nearest = None
+            now = _queue_now()
+            for (job_id,) in rows:
+                job = get_manual_queue_job(job_id)
+                if not job:
+                    continue
+                due = _queue_parse_time(job["next_run_at"])
+                if due <= now:
+                    due_ids.append(job_id)
+                elif nearest is None or due < nearest:
+                    nearest = due
+            if not due_ids:
+                wait_for = max(0.25, min(2.0, (nearest - now).total_seconds())) if nearest else 2.0
+                await asyncio.sleep(wait_for)
+                continue
+
+            for job_id in due_ids:
+                job = get_manual_queue_job(job_id)
+                if not job or job["status"] != "pending":
+                    continue
+                # Claim the job briefly so two worker iterations cannot double-send it.
+                claimed = update_manual_queue_job(job_id, job["profile_id"], status="running")
+                if not claimed:
+                    continue
+                try:
+                    sent = await _send_manual_queue_batch(bot, job)
+                    log.info(f"[MANUAL_QUEUE] job={job_id} profile={job['profile_id']} kind={job['kind']} sent={sent}")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    log.exception(f"[MANUAL_QUEUE] job={job_id} failed")
+                    update_manual_queue_job(job_id, job["profile_id"], status="pending", last_error=str(e)[:500])
+                    # Prevent a tight retry loop after an exception.
+                    update_manual_queue_job(
+                        job_id, job["profile_id"],
+                        next_run_at=_queue_iso(_queue_now() + timedelta(seconds=10))
+                    )
+        except asyncio.CancelledError:
+            log.info("🛑 Persistent manual-send scheduler cancelled")
+            break
+        except Exception:
+            log.exception("manual_queue_worker error")
+            await asyncio.sleep(2)
+
 # Normalize missing Ping mode to the new default (Global) without overwriting explicit user choices.
 c.execute("UPDATE profiles SET ping_mode=? WHERE ping_mode IS NULL OR TRIM(ping_mode)=?", ("global", ""))
 conn.commit()
@@ -968,6 +1250,7 @@ def delete_profile(profile_id):
     c.execute("DELETE FROM last_scrape WHERE profile_id=?", (profile_id,))
     c.execute("DELETE FROM source_stream_state WHERE profile_id=?", (profile_id,))
     c.execute("DELETE FROM processed_messages WHERE profile_id=?", (profile_id,))
+    c.execute("DELETE FROM manual_send_queue WHERE profile_id=?", (profile_id,))
     c.execute("DELETE FROM blacklist WHERE profile_id=?", (profile_id,))
     conn.commit()
 
@@ -1982,20 +2265,32 @@ def validate_vmess(url):
         return False, f"decode error: {str(e)}"
 
 def validate_trojan(url):
-    """Validate Trojan URL structure."""
+    """Validate common Trojan URI forms without requiring a literal user:password pair.
+
+    Trojan links are commonly published as:
+        trojan://PASSWORD@HOST:PORT?...#NAME
+    urlparse() exposes PASSWORD as ``username`` in that form, not ``password``.
+    The previous validator incorrectly rejected those perfectly normal links.
+    """
     try:
-        parsed = urlparse(url)
-        if parsed.scheme != "trojan":
+        parsed = urlparse((url or "").strip())
+        if parsed.scheme.lower() != "trojan":
             return False, "not trojan"
-        if not parsed.password:
+        # In trojan://password@host, the credential is parsed as username.
+        credential = parsed.username or parsed.password
+        if not credential:
             return False, "missing password"
         if not parsed.hostname:
             return False, "missing host"
-        if not parsed.port or parsed.port < 1 or parsed.port > 65535:
+        try:
+            port = parsed.port
+        except ValueError:
+            return False, "invalid port"
+        if not port or not (1 <= port <= 65535):
             return False, "invalid port"
         return True, "valid"
-    except Exception:
-        return False, "parse error"
+    except Exception as e:
+        return False, f"parse error: {e}"
 
 def validate_ss(url):
     """Validate Shadowsocks URL structure."""
@@ -4285,7 +4580,8 @@ def profile_admin_kb(profile_id):
         [InlineKeyboardButton(msg("btn_runnow"), callback_data=f"runnow_{profile_id}", style="success"),
          InlineKeyboardButton(msg("btn_instant"), callback_data=f"instant_{profile_id}", style="primary")],
         [InlineKeyboardButton(msg("btn_manual_send"), callback_data=f"manual_{profile_id}", style="primary"),
-         InlineKeyboardButton(msg("btn_blacklist"), callback_data=f"bl_list_{profile_id}", style="danger")],
+         InlineKeyboardButton("📋 صف ارسال دستی", callback_data=f"mq_list_{profile_id}", style="primary")],
+        [InlineKeyboardButton(msg("btn_blacklist"), callback_data=f"bl_list_{profile_id}", style="danger")],
         [InlineKeyboardButton(msg("btn_set_schedule_cron"), callback_data=f"setcron_{profile_id}", style="primary"),
          InlineKeyboardButton(msg("btn_backup"), callback_data=f"backup_{profile_id}", style="success")],
         [InlineKeyboardButton(msg("btn_backup_export"), callback_data=f"backup_export_menu_{profile_id}", style="primary"),
@@ -4390,6 +4686,64 @@ def backup_export_scope_kb(profile_id, backup_type):
         [InlineKeyboardButton(msg("backup_export_scope_custom"), callback_data=f"backup_export_scope_{profile_id}_{backup_type}_custom", style="primary")],
         [InlineKeyboardButton(msg("btn_back"), callback_data=f"backup_export_menu_{profile_id}", style="primary")],
     ])
+
+def manual_schedule_kb(profile_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚡️ همین الان", callback_data=f"mqs_{profile_id}_0_50_0", style="success")],
+        [InlineKeyboardButton("⏱️ هر ۳۰ دقیقه", callback_data=f"mqs_{profile_id}_30_1_0", style="primary"),
+         InlineKeyboardButton("⏱️ هر ۱ ساعت", callback_data=f"mqs_{profile_id}_60_1_0", style="primary")],
+        [InlineKeyboardButton("⏱️ هر ۱۲ ساعت", callback_data=f"mqs_{profile_id}_720_1_0", style="primary"),
+         InlineKeyboardButton("⚙️ دلخواه", callback_data=f"mq_custom_interval_{profile_id}", style="primary")],
+        [InlineKeyboardButton("📦 تقسیم بر اساس تعداد دلخواه", callback_data=f"mq_batch_{profile_id}", style="primary")],
+        [InlineKeyboardButton("📋 صف ارسال‌های دستی", callback_data=f"mq_list_{profile_id}", style="primary")],
+        [InlineKeyboardButton("❌ لغو", callback_data=f"prof_{profile_id}", style="danger")],
+    ])
+
+def manual_queue_list_kb(profile_id):
+    jobs = get_manual_queue(profile_id)
+    btns = []
+    for job in jobs[:20]:
+        kind = "📡" if job["kind"] == "config" else "🌐"
+        count = len(job.get("items") or [])
+        interval = int(job.get("interval_minutes") or 0)
+        interval_text = "فوری" if interval == 0 else f"هر {interval}د"
+        btns.append([InlineKeyboardButton(f"{kind} #{job['id']} • {count} باقی • {interval_text}", callback_data=f"mq_detail_{profile_id}_{job['id']}", style="primary")])
+    if not btns:
+        btns.append([InlineKeyboardButton("صف خالی است", callback_data="dummy", style="primary")])
+    btns.append([InlineKeyboardButton("🔙 بازگشت", callback_data=f"prof_{profile_id}", style="primary")])
+    return InlineKeyboardMarkup(btns)
+
+def manual_queue_detail_kb(profile_id, job_id, items):
+    btns = []
+    for i, item in enumerate(items[:25]):
+        label = str(item)
+        if len(label) > 42:
+            label = label[:39] + "..."
+        btns.append([InlineKeyboardButton(f"🗑 حذف {i+1}: {label}", callback_data=f"mq_rm_{profile_id}_{job_id}_{i}", style="danger")])
+    btns.append([InlineKeyboardButton("✏️ تغییر فاصله زمانی", callback_data=f"mq_edit_interval_{profile_id}_{job_id}", style="primary"),
+                 InlineKeyboardButton("📦 تغییر تعداد در هر پست", callback_data=f"mq_edit_batch_{profile_id}_{job_id}", style="primary")])
+    btns.append([InlineKeyboardButton("⏩ ارسال همین پست الان", callback_data=f"mq_force_{profile_id}_{job_id}", style="success")])
+    btns.append([InlineKeyboardButton("⛔ لغو ارسال", callback_data=f"mq_cancel_{profile_id}_{job_id}", style="danger"),
+                 InlineKeyboardButton("🗑 حذف کامل", callback_data=f"mq_delete_{profile_id}_{job_id}", style="danger")])
+    btns.append([InlineKeyboardButton("🔙 صف", callback_data=f"mq_list_{profile_id}", style="primary")])
+    return InlineKeyboardMarkup(btns)
+
+def manual_queue_text(job):
+    kind = "کانفیگ" if job["kind"] == "config" else "پروکسی"
+    items = job.get("items") or []
+    interval = int(job.get("interval_minutes") or 0)
+    batch = int(job.get("batch_size") or 1)
+    status = job.get("status", "pending")
+    next_run = job.get("next_run_at", "")
+    preview = "\n".join(f"{i+1}. {html.escape(str(x)[:100])}" for i, x in enumerate(items[:12]))
+    if len(items) > 12:
+        preview += f"\n... و {len(items)-12} مورد دیگر"
+    return (f"📋 <b>صف #{job['id']}</b>\n"
+            f"نوع: {kind}\nباقی‌مانده: <b>{len(items)}</b>\n"
+            f"تعداد هر پست: <b>{batch}</b>\n"
+            f"فاصله: <b>{'فوری' if interval == 0 else str(interval) + ' دقیقه'}</b>\n"
+            f"وضعیت: <b>{status}</b>\n"
+            f"اجرای بعدی: <code>{html.escape(next_run)}</code>\n\n{preview}")
 
 def timer_menu_kb(profile_id):
     return InlineKeyboardMarkup([
@@ -5786,6 +6140,7 @@ async def on_callback(u, ctx):
                 c.execute("DELETE FROM last_scrape WHERE profile_id=?", (profile_id,))
                 c.execute("DELETE FROM processed_messages WHERE profile_id=?", (profile_id,))
                 c.execute("DELETE FROM proxies_seen WHERE profile_id=?", (profile_id,))
+                c.execute("DELETE FROM manual_send_queue WHERE profile_id=?", (profile_id,))
                 c.execute("DELETE FROM sponsors WHERE profile_id=?", (profile_id,))
                 c.execute("DELETE FROM blacklist WHERE profile_id=?", (profile_id,))
                 set_profile_last_num(profile_id, 0)
@@ -5795,6 +6150,131 @@ async def on_callback(u, ctx):
             else:
                 await q.answer("⚠️ خطا در داده")
             return
+
+        # Persistent manual queue: scheduling, inspection, editing, deletion and forced send.
+        if d.startswith("mqs_"):
+            parts = d.split("_")
+            try:
+                profile_id = int(parts[1]); interval = max(0, int(parts[2])); batch = max(1, min(50, int(parts[3]))); delay = max(0, int(parts[4]))
+            except (ValueError, IndexError):
+                await q.answer("⚠️ تنظیمات صف نامعتبر است", show_alert=True)
+                return
+            pending = ctx.user_data.get("manual_pending")
+            if not pending or int(pending.get("profile_id", -1)) != profile_id:
+                await q.answer("⚠️ داده ارسال دستی منقضی شده؛ دوباره لینک‌ها را وارد کن.", show_alert=True)
+                return
+            created = []
+            configs = list(pending.get("configs") or [])
+            proxies = list(pending.get("proxies") or [])
+            if configs:
+                created.append(create_manual_queue_job(profile_id, "config", configs, interval, batch, (interval if interval > 0 else 0)))
+            if proxies:
+                created.append(create_manual_queue_job(profile_id, "proxy", proxies, interval, batch, (interval if interval > 0 else 0)))
+            ctx.user_data.pop("manual_pending", None)
+            ctx.user_data.pop("action", None)
+            await q.answer("✅ در صف قرار گرفت")
+            await q.edit_message_text(
+                f"✅ زمان‌بندی ثبت شد.\n\n📋 شناسه صف: {', '.join('#'+str(x) for x in created if x)}\n"
+                f"⏱ فاصله: {'فوری' if interval == 0 else str(interval)+' دقیقه'}\n📦 تعداد هر پست: {batch}",
+                reply_markup=manual_queue_list_kb(profile_id)
+            )
+            return
+
+        if d.startswith("mq_custom_interval_"):
+            try:
+                profile_id = int(d.rsplit("_", 1)[1])
+            except ValueError:
+                await q.answer("⚠️ شناسه نامعتبر"); return
+            ctx.user_data["manual_schedule_custom"] = {"profile_id": profile_id, "step": "interval"}
+            await q.edit_message_text("⏱ فاصله زمانی را فقط به دقیقه وارد کن. مثال: 30 یا 60 یا 720", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data=f"manual_{profile_id}", style="primary")]]))
+            return
+
+        if d.startswith("mq_batch_"):
+            try:
+                profile_id = int(d.rsplit("_", 1)[1])
+            except ValueError:
+                await q.answer("⚠️ شناسه نامعتبر"); return
+            ctx.user_data["manual_schedule_custom"] = {"profile_id": profile_id, "step": "pair"}
+            await q.edit_message_text("⚙️ فرمت را این‌طور وارد کن: دقیقه,تعداد\nمثال: 30,5 یعنی هر ۳۰ دقیقه ۵ سرور؛ 60,2 یعنی هر ۱ ساعت ۲ سرور؛ 0,50 یعنی فوری و تا ۵۰ مورد در هر پست.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data=f"manual_{profile_id}", style="primary")]]))
+            return
+
+        if d.startswith("mq_list_"):
+            try:
+                profile_id = int(d.rsplit("_", 1)[1])
+            except ValueError:
+                await q.answer("⚠️ شناسه نامعتبر"); return
+            jobs = get_manual_queue(profile_id)
+            await q.edit_message_text(f"📋 <b>صف ارسال‌های دستی</b>\nتعداد صف فعال: <b>{len(jobs)}</b>\nفقط موارد در انتظار نمایش داده می‌شوند.", parse_mode="HTML", reply_markup=manual_queue_list_kb(profile_id))
+            return
+
+        if d.startswith("mq_detail_"):
+            parts = d.split("_")
+            try:
+                profile_id = int(parts[2]); job_id = int(parts[3])
+            except (ValueError, IndexError):
+                await q.answer("⚠️ داده نامعتبر"); return
+            job = get_manual_queue_job(job_id, profile_id)
+            if not job or job.get("status") != "pending":
+                await q.answer("این صف دیگر فعال نیست", show_alert=True)
+                await q.edit_message_text("📋 صف فعال", reply_markup=manual_queue_list_kb(profile_id)); return
+            await q.edit_message_text(manual_queue_text(job), parse_mode="HTML", reply_markup=manual_queue_detail_kb(profile_id, job_id, job.get("items") or []))
+            return
+
+        if d.startswith("mq_rm_"):
+            parts = d.split("_")
+            try:
+                profile_id = int(parts[2]); job_id = int(parts[3]); item_index = int(parts[4])
+            except (ValueError, IndexError):
+                await q.answer("⚠️ داده نامعتبر"); return
+            remove_manual_queue_item(job_id, profile_id, item_index)
+            job = get_manual_queue_job(job_id, profile_id)
+            if not job:
+                await q.answer("✅ مورد حذف شد و صف خالی شد")
+                await q.edit_message_text("📋 صف فعال", reply_markup=manual_queue_list_kb(profile_id)); return
+            await q.answer("✅ مورد حذف شد")
+            await q.edit_message_text(manual_queue_text(job), parse_mode="HTML", reply_markup=manual_queue_detail_kb(profile_id, job_id, job.get("items") or []))
+            return
+
+        if d.startswith("mq_cancel_"):
+            parts=d.split("_")
+            try: profile_id=int(parts[2]); job_id=int(parts[3])
+            except (ValueError,IndexError): await q.answer("⚠️ داده نامعتبر"); return
+            cancel_manual_queue_job(job_id, profile_id)
+            await q.answer("⛔ ارسال لغو شد")
+            await q.edit_message_text("📋 صف فعال", reply_markup=manual_queue_list_kb(profile_id)); return
+
+        if d.startswith("mq_delete_"):
+            parts=d.split("_")
+            try: profile_id=int(parts[2]); job_id=int(parts[3])
+            except (ValueError,IndexError): await q.answer("⚠️ داده نامعتبر"); return
+            delete_manual_queue_job(job_id, profile_id)
+            await q.answer("🗑 صف حذف شد")
+            await q.edit_message_text("📋 صف فعال", reply_markup=manual_queue_list_kb(profile_id)); return
+
+        if d.startswith("mq_force_"):
+            parts=d.split("_")
+            try: profile_id=int(parts[2]); job_id=int(parts[3])
+            except (ValueError,IndexError): await q.answer("⚠️ داده نامعتبر"); return
+            job=get_manual_queue_job(job_id, profile_id)
+            if not job or job.get("status") != "pending":
+                await q.answer("صف فعال نیست", show_alert=True); return
+            update_manual_queue_job(job_id, profile_id, next_run_at=_queue_iso(_queue_now()))
+            await q.answer("⏩ برای ارسال فوری علامت‌گذاری شد")
+            return
+
+        if d.startswith("mq_edit_interval_"):
+            parts=d.split("_")
+            try: profile_id=int(parts[3]); job_id=int(parts[4])
+            except (ValueError,IndexError): await q.answer("⚠️ داده نامعتبر"); return
+            ctx.user_data["manual_queue_edit"]={"profile_id":profile_id,"job_id":job_id,"field":"interval"}
+            await q.edit_message_text("⏱ فاصله جدید را به دقیقه وارد کن. 0 یعنی فوری.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data=f"mq_detail_{profile_id}_{job_id}", style="primary")]])); return
+
+        if d.startswith("mq_edit_batch_"):
+            parts=d.split("_")
+            try: profile_id=int(parts[3]); job_id=int(parts[4])
+            except (ValueError,IndexError): await q.answer("⚠️ داده نامعتبر"); return
+            ctx.user_data["manual_queue_edit"]={"profile_id":profile_id,"job_id":job_id,"field":"batch"}
+            await q.edit_message_text("📦 تعداد جدید در هر پست را وارد کن (1 تا 50).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data=f"mq_detail_{profile_id}_{job_id}", style="primary")]])); return
 
         if d.startswith("manual_"):
             parts = d.split("_")
@@ -6375,6 +6855,70 @@ async def on_text(u, ctx):
     if not is_admin(u.effective_user.id):
         return
 
+    # Manual queue custom scheduling input.
+    custom = ctx.user_data.get("manual_schedule_custom")
+    if custom:
+        profile_id = int(custom["profile_id"])
+        pending = ctx.user_data.get("manual_pending")
+        if not pending or int(pending.get("profile_id", -1)) != profile_id:
+            ctx.user_data.pop("manual_schedule_custom", None)
+            await u.message.reply_text("❌ داده ارسال دستی منقضی شده است.")
+            return
+        raw = (u.message.text or "").strip()
+        try:
+            if custom.get("step") == "interval":
+                interval = int(raw)
+                if interval < 0 or interval > 100000:
+                    raise ValueError
+                batch = 1
+            else:
+                parts = re.split(r"[,،\s]+", raw)
+                if len(parts) != 2:
+                    raise ValueError
+                interval, batch = int(parts[0]), int(parts[1])
+                if interval < 0 or interval > 100000 or not (1 <= batch <= 50):
+                    raise ValueError
+        except ValueError:
+            await u.message.reply_text("❌ فرمت نامعتبر. مثال: 30 یا 30,5")
+            return
+        configs = list(pending.get("configs") or [])
+        proxies = list(pending.get("proxies") or [])
+        ids=[]
+        if configs:
+            ids.append(create_manual_queue_job(profile_id,"config",configs,interval,batch,(interval if interval > 0 else 0)))
+        if proxies:
+            ids.append(create_manual_queue_job(profile_id,"proxy",proxies,interval,batch,(interval if interval > 0 else 0)))
+        ctx.user_data.pop("manual_schedule_custom", None)
+        ctx.user_data.pop("manual_pending", None)
+        ctx.user_data.pop("action", None)
+        await u.message.reply_text(f"✅ صف ثبت شد: {', '.join('#'+str(x) for x in ids if x)}\n⏱ فاصله: {'فوری' if interval==0 else str(interval)+' دقیقه'}\n📦 هر پست: {batch}", reply_markup=manual_queue_list_kb(profile_id))
+        return
+
+    edit = ctx.user_data.get("manual_queue_edit")
+    if edit:
+        profile_id = int(edit["profile_id"]); job_id = int(edit["job_id"]); field = edit["field"]
+        try:
+            value = int((u.message.text or "").strip())
+            if field == "interval":
+                if value < 0 or value > 100000: raise ValueError
+                job = get_manual_queue_job(job_id, profile_id)
+                if not job: raise ValueError
+                next_run = _queue_now() if value == 0 else _queue_now() + timedelta(minutes=value)
+                update_manual_queue_job(job_id, profile_id, interval_minutes=value, next_run_at=_queue_iso(next_run), last_error="")
+            else:
+                if not (1 <= value <= 50): raise ValueError
+                update_manual_queue_job(job_id, profile_id, batch_size=value, last_error="")
+        except ValueError:
+            await u.message.reply_text("❌ مقدار نامعتبر است.")
+            return
+        ctx.user_data.pop("manual_queue_edit", None)
+        job = get_manual_queue_job(job_id, profile_id)
+        if job:
+            await u.message.reply_text("✅ تنظیم صف تغییر کرد.", reply_markup=manual_queue_detail_kb(profile_id, job_id, job.get("items") or []))
+        else:
+            await u.message.reply_text("❌ صف پیدا نشد.", reply_markup=manual_queue_list_kb(profile_id))
+        return
+
     if ctx.user_data.get("action", "").startswith("timer_custom_"):
         profile_id = int(ctx.user_data["action"].split("_")[2])
         try:
@@ -6822,7 +7366,7 @@ async def on_text(u, ctx):
 
     if a.startswith("manual_"):
         profile_id = int(a.split("_")[1])
-        await process_manual_text(u, u.message, profile_id, is_document=False)
+        await process_manual_text(u, u.message, profile_id, is_document=False, ctx=ctx)
         del ctx.user_data["action"]
         return
 
@@ -6912,20 +7456,21 @@ async def on_document(u, ctx):
 
     if a.startswith("manual_"):
         profile_id = int(a.split("_")[1])
-        await process_manual_text(u, u.message, profile_id, is_document=True)
+        await process_manual_text(u, u.message, profile_id, is_document=True, ctx=ctx)
         del ctx.user_data["action"]
         return
 
 # ======================================================================
 # ارسال دستی (بدون دانلود فایل)
 # ======================================================================
-async def process_manual_text(u, message, profile_id, is_document=False):
-    p = await message.reply_text(msg("manual_send_processing"))
+async def process_manual_text(u, message, profile_id, is_document=False, ctx=None):
+    """Parse manual input and hand it to the persistent scheduling UI."""
+    pmsg = await message.reply_text(msg("manual_send_processing"))
     try:
         if is_document:
             doc = message.document
             if doc.file_size and doc.file_size > 3 * 1024 * 1024:
-                return await p.edit_text(">3MB")
+                return await pmsg.edit_text(">3MB")
             file = await doc.get_file()
             data = await file.download_as_bytearray()
             text = data.decode('utf-8', errors='ignore')
@@ -6934,83 +7479,69 @@ async def process_manual_text(u, message, profile_id, is_document=False):
                     decoded = base64.b64decode(text.strip(), validate=True).decode('utf-8', errors='ignore')
                     if decoded:
                         text = decoded
-                except:
+                except Exception:
                     pass
         else:
             text = message.text or ""
 
         config_links = extract_links_from_text(text)
         proxy_links = extract_proxy_links_from_text(text)
-
         if not config_links and not proxy_links:
             lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
             for line in lines:
-                if line.startswith("http") and "t.me/proxy" in line:
+                if line.lower().startswith("http") and "t.me/proxy" in line.lower():
                     proxy_links.append(line)
                 else:
                     config_links.extend(extract_links_from_text(line))
-            config_links = list(set(config_links))
-            proxy_links = list(set(proxy_links))
+            # Stable de-duplication; never use set() because input order matters for scheduling.
+            config_links = list(dict.fromkeys(config_links))
+            proxy_links = list(dict.fromkeys(proxy_links))
 
-        if not config_links and not proxy_links:
-            return await p.edit_text("❌ هیچ لینک معتبری یافت نشد.")
-
-        new_configs = [link for link in config_links if not is_already_posted(profile_id, link)]
-        new_proxies = []
+        # Normalize and validate once more at the manual boundary.
+        valid_configs = []
+        for link in config_links:
+            link = clean_config_url(link.strip())
+            ok, _ = validate_config_link(link)
+            if ok and not is_already_posted(profile_id, link):
+                valid_configs.append(link)
+        valid_proxies = []
         for pl in proxy_links:
             norm = normalize_proxy_url(pl)
-            if norm and not is_proxy_posted(profile_id, norm):
-                new_proxies.append(norm)
+            if norm and is_telegram_proxy_url(norm) and not is_proxy_posted(profile_id, norm):
+                valid_proxies.append(norm)
+        valid_configs = list(dict.fromkeys(valid_configs))
+        valid_proxies = list(dict.fromkeys(valid_proxies))
 
-        if not new_configs and not new_proxies:
-            return await p.edit_text("❌ هیچ لینک جدیدی برای ارسال وجود ندارد.")
+        if not valid_configs and not valid_proxies:
+            return await pmsg.edit_text("❌ هیچ لینک معتبر و جدیدی یافت نشد.")
 
-        max_post_cfg = get_profile_max_post_config(profile_id)
-        max_post_prx = get_profile_max_post_proxy(profile_id)
+        if ctx is None:
+            # Compatibility path for old callers: immediate send, without scheduling.
+            for chunk in [valid_configs[i:i+get_profile_max_post_config(profile_id)] for i in range(0, len(valid_configs), get_profile_max_post_config(profile_id))]:
+                await _send_manual_queue_batch(u.get_bot(), {
+                    "id": 0, "profile_id": profile_id, "kind": "config", "items": chunk,
+                    "batch_size": len(chunk), "interval_minutes": 0, "status": "pending", "sent_count": 0
+                })
+            for chunk in [valid_proxies[i:i+get_profile_max_post_proxy(profile_id)] for i in range(0, len(valid_proxies), get_profile_max_post_proxy(profile_id))]:
+                await _send_manual_queue_batch(u.get_bot(), {
+                    "id": 0, "profile_id": profile_id, "kind": "proxy", "items": chunk,
+                    "batch_size": len(chunk), "interval_minutes": 0, "status": "pending", "sent_count": 0
+                })
+            return await pmsg.edit_text(f"✅ ارسال شد: {len(valid_configs)} کانفیگ و {len(valid_proxies)} پروکسی")
 
-        config_chunks = [new_configs[i:i+max_post_cfg] for i in range(0, len(new_configs), max_post_cfg)]
-        proxy_chunks = []
-        if new_proxies:
-            valid_proxies = [p for p in new_proxies if is_telegram_proxy_url(p)]
-            if valid_proxies:
-                proxy_chunks = [valid_proxies[i:i+max_post_prx] for i in range(0, len(valid_proxies), max_post_prx)]
-
-        total_configs_sent = 0
-        total_proxies_sent = 0
-
-        for chunk in config_chunks:
-            working = [(url, 0, 0) for url in chunk]
-            sent = await post_configs(u.get_bot(), profile_id, working, source_for_seen="manual", is_instant=False, max_post_override=len(chunk))
-            if sent > 0:
-                total_configs_sent += sent
-            await asyncio.sleep(1)
-
-        for chunk in proxy_chunks:
-            proxy_with_ping = []
-            for proxy_url in chunk:
-                host, _ = extract_host(proxy_url)
-                flag = "🌐"
-                country_code = ""
-                if host:
-                    ip = await host_to_ip(host)
-                    if ip:
-                        flag, country_code = await get_flag_for_ip(ip)
-                proxy_with_ping.append((proxy_url, 0, flag, country_code))
-            cnt, payload, selected_proxy_urls = await post_proxies(u.get_bot(), profile_id, proxy_with_ping, is_instant=False, max_proxies_override=len(chunk))
-            if cnt > 0 and payload:
-                text_p, buttons = payload
-                sent = await send_to_destination(u.get_bot(), profile_id, text_p, buttons)
-                if sent:
-                    total_proxies_sent += cnt
-                    for proxy_url in selected_proxy_urls:
-                        if not is_proxy_posted(profile_id, proxy_url):
-                            mark_proxy_posted(profile_id, proxy_url)
-            await asyncio.sleep(1)
-
-        await p.edit_text(msg("doc_done", n=total_configs_sent, p=total_proxies_sent))
+        ctx.user_data["manual_pending"] = {
+            "profile_id": int(profile_id),
+            "configs": valid_configs,
+            "proxies": valid_proxies,
+        }
+        await pmsg.edit_text(
+            f"📋 آماده زمان‌بندی\n\n📡 کانفیگ: {len(valid_configs)}\n🌐 پروکسی: {len(valid_proxies)}\n\n"
+            "حالت ارسال را انتخاب کن:",
+            reply_markup=manual_schedule_kb(profile_id)
+        )
     except Exception as e:
-        log.error(f"manual send error: {e}")
-        await p.edit_text(f"❌ {str(e)[:200]}")
+        log.exception("manual send error")
+        await pmsg.edit_text(f"❌ {str(e)[:250]}")
 
 async def post_working_configs(bot, profile_id, working, proxies_with_ping, force=False, skip_duplicate=False):
     total_configs = 0
@@ -7117,6 +7648,13 @@ async def post_init(app):
         log.info(f"📅 Daily report scheduled for {target.strftime('%Y-%m-%d %H:%M:%S')}")
     else:
         log.warning("⚠️ JobQueue not available, daily report disabled.")
+
+    # Recover jobs that were being sent when the process restarted.
+    c.execute("UPDATE manual_send_queue SET status='pending', updated_at=? WHERE status='running'", (get_tehran_time(),))
+    conn.commit()
+    # Persistent manual scheduler is always enabled independently from automatic scraping.
+    app.create_task(manual_queue_worker(app.bot))
+    log.info(f"⏱️ Manual queue scheduler enabled (BOT_VERSION={BOT_VERSION})")
 
     if ENABLE_AUTO:
         for prof in profiles:
