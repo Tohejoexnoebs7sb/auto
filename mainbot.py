@@ -51,26 +51,15 @@ os.makedirs(BACKUP_DIR, exist_ok=True)
 # ======================================================================
 # تنظیم لاگ
 # ======================================================================
-from logging.handlers import RotatingFileHandler
-
-_LOG_FILE = os.path.join(DATA_DIR, "bot.log")
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        RotatingFileHandler(
-            _LOG_FILE,
-            mode='a',
-            maxBytes=2 * 1024 * 1024,
-            backupCount=3,
-            encoding='utf-8'
-        )
+        logging.FileHandler(os.path.join(DATA_DIR, "bot.log"), mode='a', encoding='utf-8')
     ]
 )
 log = logging.getLogger("bot")
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.WARNING)
 
 # ======================================================================
 # منطقه زمانی تهران
@@ -78,7 +67,7 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 TEHRAN_TZ = pytz.timezone('Asia/Tehran')
 
 # Professional semantic version for this build.
-BOT_VERSION = "3.0.0"
+BOT_VERSION = "2.1.1"
 
 
 
@@ -145,9 +134,9 @@ def header_mode_label(mode):
 def detect_proxy_protocol(proxy_url):
     """Return ONLY the two supported Telegram proxy protocol labels."""
     u = (proxy_url or "").strip().lower()
-    if u.startswith(("tg://proxy?", "tg://socks?", "https://t.me/proxy?")):
-        return "MTPROTO" if "proxy?" in u else "SOCKS5"
-    if u.startswith(("socks://", "socks5://")):
+    if u.startswith(("tg://proxy?", "https://t.me/proxy?")):
+        return "MTPROTO"
+    if u.startswith("socks5://"):
         return "SOCKS5"
     return ""
 
@@ -162,7 +151,6 @@ def detect_config_protocol(config_url):
     if u.startswith(("shadowsocks://", "ss://")): return "SHADOWSOCKS"
     if u.startswith(("socks://", "socks4://", "socks5://")): return "SOCKS"
     if u.startswith(("hysteria2://", "hy2://")): return "HYSTERIA2"
-    if u.startswith(("https://t.me/proxy?", "tg://proxy?")): return "MTPROTO"
     return ""
 
 
@@ -201,9 +189,6 @@ def get_tehran_date() -> str:
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 conn.execute("PRAGMA journal_mode=WAL")
 conn.execute("PRAGMA synchronous=NORMAL")
-conn.execute("PRAGMA wal_autocheckpoint=200")
-conn.execute("PRAGMA journal_size_limit=1048576")
-conn.execute("PRAGMA busy_timeout=10000")
 c = conn.cursor()
 
 # مستقل از ترتیب تعریف توابع، تمام عملیات DB از این helper استفاده می‌کنند.
@@ -211,9 +196,6 @@ def get_conn():
     db = sqlite3.connect(DB_PATH, check_same_thread=False)
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=NORMAL")
-    db.execute("PRAGMA wal_autocheckpoint=200")
-    db.execute("PRAGMA journal_size_limit=1048576")
-    db.execute("PRAGMA busy_timeout=10000")
     return db
 
 
@@ -593,8 +575,6 @@ c.execute("""CREATE TABLE IF NOT EXISTS profiles (
     post_configs INTEGER DEFAULT 1,
     post_proxies INTEGER DEFAULT 1,
     ping_mode TEXT DEFAULT 'global',
-    config_ping_mode TEXT DEFAULT 'global',
-    proxy_ping_mode TEXT DEFAULT 'global',
     last_num INTEGER DEFAULT 0,
     created_at TEXT,
     show_numbers INTEGER DEFAULT 1,
@@ -621,18 +601,6 @@ c.execute("""CREATE TABLE IF NOT EXISTS profiles (
 )""")
 conn.commit()
 
-# Performance indexes and lightweight maintenance for long-running Railway workers.
-for _idx in [
-    "CREATE INDEX IF NOT EXISTS idx_seen_full_url ON seen(full_url)",
-    "CREATE INDEX IF NOT EXISTS idx_seen_last_posted ON seen(last_posted)",
-    "CREATE INDEX IF NOT EXISTS idx_proxy_seen_posted ON proxies_seen(last_posted)",
-]:
-    try:
-        c.execute(_idx)
-    except Exception:
-        log.exception("index creation failed")
-conn.commit()
-
 # Add new columns if missing
 ensure_column("profiles", "show_numbers", "INTEGER DEFAULT 1", 1)
 ensure_column("profiles", "custom_query", "TEXT DEFAULT ''", "")
@@ -649,8 +617,6 @@ ensure_column("profiles", "max_post_config", "INTEGER DEFAULT 8", 8)
 ensure_column("profiles", "max_post_proxy", "INTEGER DEFAULT 10", 10)
 ensure_column("profiles", "naming_template", "TEXT DEFAULT '{Flag} | ⚡️Telegram = {CHANNEL_ID}'", "{Flag} | ⚡️Telegram = {CHANNEL_ID}")
 ensure_column("profiles", "channel_link", "TEXT DEFAULT ''", "")
-ensure_column("profiles", "config_ping_mode", "TEXT DEFAULT 'global'", "global")
-ensure_column("profiles", "proxy_ping_mode", "TEXT DEFAULT 'global'", "global")
 ensure_column("profiles", "ping_enabled", "INTEGER DEFAULT 1", 1)
 ensure_column("profiles", "profile_enabled", "INTEGER DEFAULT 1", 1)
 ensure_column("profiles", "country_display", "INTEGER DEFAULT 2", 2)
@@ -696,8 +662,6 @@ def fix_column_types():
                     post_configs INTEGER DEFAULT 1,
                     post_proxies INTEGER DEFAULT 1,
                     ping_mode TEXT DEFAULT 'global',
-                    config_ping_mode TEXT DEFAULT 'global',
-                    proxy_ping_mode TEXT DEFAULT 'global',
                     last_num INTEGER DEFAULT 0,
                     created_at TEXT,
                     show_numbers INTEGER DEFAULT 1,
@@ -726,14 +690,14 @@ def fix_column_types():
             c.execute("""
                 INSERT INTO profiles_new
                     (id, dest_name, sources, banner_config, banner_proxy, interval_min,
-                     max_post, max_proxies, post_configs, post_proxies, ping_mode, config_ping_mode, proxy_ping_mode, last_num,
+                     max_post, max_proxies, post_configs, post_proxies, ping_mode, last_num,
                      created_at, show_numbers, custom_query, show_date_config, show_date_proxy,
                      schedule_cron, last_backup_count, timer_expiry, timer_duration, backup_interval,
                      interval_config, interval_proxy, max_post_config, max_post_proxy,
                      naming_template, channel_link, ping_enabled, profile_enabled,
                      country_display, show_ping, proxy_banner_template, proxy_post_mode, ping_testing)
                 SELECT id, dest_name, sources, banner_config, banner_proxy, interval_min,
-                       max_post, max_proxies, post_configs, post_proxies, ping_mode, config_ping_mode, proxy_ping_mode, last_num,
+                       max_post, max_proxies, post_configs, post_proxies, ping_mode, last_num,
                        created_at, show_numbers, custom_query, show_date_config, show_date_proxy,
                        schedule_cron, last_backup_count, timer_expiry, timer_duration, backup_interval,
                        interval_config, interval_proxy, max_post_config, max_post_proxy,
@@ -924,7 +888,6 @@ c.execute("""CREATE TABLE IF NOT EXISTS manual_send_queue (
 )""")
 ensure_column("manual_send_queue", "last_error", "TEXT DEFAULT ''", "")
 ensure_column("manual_send_queue", "sent_count", "INTEGER DEFAULT 0", 0)
-ensure_column("manual_send_queue", "fail_count", "INTEGER DEFAULT 0", 0)
 c.execute("CREATE INDEX IF NOT EXISTS idx_manual_queue_due ON manual_send_queue(status, next_run_at)")
 c.execute("CREATE INDEX IF NOT EXISTS idx_manual_queue_profile ON manual_send_queue(profile_id, status)")
 conn.commit()
@@ -949,16 +912,6 @@ def create_manual_queue_job(profile_id, kind, items, interval_minutes=0, batch_s
     if not items:
         return None
     kind = str(kind).lower().strip()
-    # Correct classification: Telegram proxy links are NOT configs.
-    # Previous logic forced https://t.me/proxy and tg://proxy into config jobs,
-    # which caused manual MTPROTO sends to go through post_configs().
-    proxy_prefixes = ("https://t.me/proxy?", "tg://proxy?", "socks://", "socks5://")
-    config_prefixes = ("vless://", "vmess://", "trojan://", "ss://", "ssr://", "hy2://", "hysteria://", "hysteria2://", "wg://", "wireguard://")
-    lowered = [str(x).strip().lower() for x in items]
-    if lowered and all(x.startswith(proxy_prefixes) for x in lowered):
-        kind = "proxy"
-    elif any(x.startswith(config_prefixes) for x in lowered):
-        kind = "config"
     if kind not in ("config", "proxy"):
         raise ValueError("invalid queue kind")
     interval_minutes = max(0, int(interval_minutes or 0))
@@ -1016,7 +969,7 @@ def update_manual_queue_job(job_id, profile_id, **changes):
     job = get_manual_queue_job(job_id, profile_id)
     if not job:
         return False
-    allowed = {"interval_minutes", "batch_size", "next_run_at", "status", "last_error", "items_json", "sent_count", "fail_count"}
+    allowed = {"interval_minutes", "batch_size", "next_run_at", "status", "last_error", "items_json"}
     clauses, params = [], []
     for k, v in changes.items():
         if k in allowed:
@@ -1067,23 +1020,7 @@ def _manual_queue_commit_batch(job_id, profile_id, sent_items, error=""):
     remaining = [x for x in remaining if x not in sent_set]
     sent_count = int(job.get("sent_count") or 0) + len(sent_items or [])
     if error and not sent_items:
-        # Permanent failures must never create an infinite hot loop.
-        failures = int(job.get("fail_count") or 0) + 1
-        if failures >= 3:
-            update_manual_queue_job(
-                job_id, profile_id,
-                status="failed",
-                fail_count=failures,
-                last_error=str(error)[:500]
-            )
-        else:
-            update_manual_queue_job(
-                job_id, profile_id,
-                status="pending",
-                fail_count=failures,
-                last_error=str(error)[:500],
-                next_run_at=_queue_iso(_queue_now() + timedelta(seconds=60 * failures))
-            )
+        update_manual_queue_job(job_id, profile_id, status="pending", last_error=str(error)[:500])
         return
     if not remaining:
         update_manual_queue_job(job_id, profile_id, items_json="[]", status="done",
@@ -1153,36 +1090,11 @@ async def _send_manual_queue_batch(bot, job):
     _manual_queue_commit_batch(job["id"], profile_id, selected, "")
     return len(selected)
 
-
-def sqlite_maintenance_cycle():
-    """Controlled SQLite maintenance. Prevent WAL/queue/log database growth."""
-    try:
-        c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        c.execute("DELETE FROM manual_send_queue WHERE status IN ('done','cancelled','failed') AND updated_at < ?",
-                  (_queue_iso(_queue_now()-timedelta(days=3)),))
-        # Keep historical tables bounded. These tables are state tables, not logs.
-        c.execute("DELETE FROM processed_messages WHERE rowid NOT IN (SELECT rowid FROM processed_messages ORDER BY rowid DESC LIMIT 50000)")
-        c.execute("DELETE FROM country_cache WHERE rowid NOT IN (SELECT rowid FROM country_cache ORDER BY rowid DESC LIMIT 10000)")
-        c.execute("PRAGMA optimize")
-        conn.commit()
-        # Only compact when SQLite has a large amount of free pages.
-        free_pages = c.execute("PRAGMA freelist_count").fetchone()[0]
-        if free_pages and free_pages > 1000:
-            c.execute("VACUUM")
-    except Exception:
-        log.exception("sqlite maintenance failed")
-
 async def manual_queue_worker(bot):
     """Persistent scheduler: wakes on the nearest due job, so edits take effect immediately."""
     log.info("⏱️ Persistent manual-send scheduler started")
-    log.info("[WATCHDOG] manual_queue heartbeat online")
-    last_heartbeat = time.time()
     while True:
         try:
-            # Recover jobs left locked by a crashed worker.
-            c.execute("UPDATE manual_send_queue SET status='pending', next_run_at=? WHERE status='running' AND updated_at<?", (_queue_iso(_queue_now()), _queue_iso(_queue_now()-timedelta(minutes=5))))
-            conn.commit()
-            last_heartbeat = time.time()
             rows = c.execute(
                 "SELECT id FROM manual_send_queue WHERE status='pending' ORDER BY next_run_at, id LIMIT 20"
             ).fetchall()
@@ -1236,8 +1148,6 @@ async def manual_queue_worker(bot):
 
 # Normalize missing Ping mode to the new default (Global) without overwriting explicit user choices.
 c.execute("UPDATE profiles SET ping_mode=? WHERE ping_mode IS NULL OR TRIM(ping_mode)=?", ("global", ""))
-c.execute("UPDATE profiles SET config_ping_mode=CASE WHEN LOWER(TRIM(COALESCE(ping_mode, 'global')))='iran' THEN 'iran' ELSE 'global' END WHERE config_ping_mode IS NULL OR TRIM(config_ping_mode)=?", ("",))
-c.execute("UPDATE profiles SET proxy_ping_mode=CASE WHEN LOWER(TRIM(COALESCE(ping_mode, 'global')))='iran' THEN 'iran' ELSE 'global' END WHERE proxy_ping_mode IS NULL OR TRIM(proxy_ping_mode)=?", ("",))
 conn.commit()
 
 # ======================================================================
@@ -1320,7 +1230,7 @@ def create_profile(dest_name, sources="", banner_config=None, banner_proxy=None,
 def update_profile(profile_id, **kwargs):
     allowed = ["dest_name", "sources", "banner_config", "banner_proxy",
                "interval_min", "max_post", "max_proxies", "post_configs",
-               "post_proxies", "ping_mode", "config_ping_mode", "proxy_ping_mode", "last_num",
+               "post_proxies", "ping_mode", "last_num",
                "show_numbers", "custom_query", "show_date_config", "show_date_proxy",
                "schedule_cron", "last_backup_count", "timer_expiry", "timer_duration",
                "backup_interval", "interval_config", "interval_proxy", "max_post_config", "max_post_proxy",
@@ -1408,35 +1318,12 @@ def get_profile_last_num(profile_id):
 def set_profile_last_num(profile_id, num):
     update_profile(profile_id, last_num=num)
 
-def _normalize_ping_mode(mode):
-    return "iran" if str(mode).lower().strip() == "iran" else "global"
-
 def get_profile_ping_mode(profile_id):
-    """Backward-compatible master ping mode; new UI uses per-stream modes."""
     prof = get_profile(profile_id)
-    return _normalize_ping_mode(prof.get("ping_mode", "global")) if prof else "global"
+    return prof["ping_mode"] if prof else "iran"
 
 def set_profile_ping_mode(profile_id, mode):
-    mode = _normalize_ping_mode(mode)
-    update_profile(profile_id, ping_mode=mode, config_ping_mode=mode, proxy_ping_mode=mode)
-
-def get_profile_config_ping_mode(profile_id):
-    prof = get_profile(profile_id)
-    if not prof:
-        return "global"
-    return _normalize_ping_mode(prof.get("config_ping_mode", "global"))
-
-def set_profile_config_ping_mode(profile_id, mode):
-    update_profile(profile_id, config_ping_mode=_normalize_ping_mode(mode))
-
-def get_profile_proxy_ping_mode(profile_id):
-    prof = get_profile(profile_id)
-    if not prof:
-        return "global"
-    return _normalize_ping_mode(prof.get("proxy_ping_mode", "global"))
-
-def set_profile_proxy_ping_mode(profile_id, mode):
-    update_profile(profile_id, proxy_ping_mode=_normalize_ping_mode(mode))
+    update_profile(profile_id, ping_mode=mode)
 
 def get_profile_ping_enabled(profile_id):
     # This now represents the master switch for ping testing
@@ -2365,21 +2252,6 @@ def validate_vless(url):
     except Exception:
         return False, "parse error"
 
-def normalize_vmess_url(url, name=""):
-    """Normalize VMess to standard JSON-base64 form. Name is stored only in ps."""
-    try:
-        raw = url.split("vmess://", 1)[1].strip()
-        raw = raw.split("#", 1)[0]
-        raw += "=" * (-len(raw) % 4)
-        obj = json.loads(base64.b64decode(raw).decode("utf-8", errors="ignore"))
-        if name:
-            obj["ps"] = str(name).strip()
-        payload = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode()
-        return "vmess://" + base64.b64encode(payload).decode()
-    except Exception as e:
-        log.warning(f"VMESS normalize failed: {e}")
-        return None
-
 def validate_vmess(url):
     """Validate VMESS URL structure (base64 encoded JSON)."""
     try:
@@ -2585,7 +2457,7 @@ def validate_config_link(url):
         return False, "empty"
     url = clean_config_url(url.strip())
     if is_telegram_proxy_url(url):
-        return True, "telegram proxy config"
+        return False, "telegram proxy is not a config"
     scheme = urlparse(url).scheme.lower()
     if scheme == "vless": return validate_vless(url)
     if scheme == "vmess": return validate_vmess(url)
@@ -2599,142 +2471,55 @@ def validate_config_link(url):
 # ======================================================================
 # استخراج لینک‌ها با اعتبارسنجی
 # ======================================================================
-
-# ========================= Collector v3 =========================
-SUPPORTED_SCHEMES = (
-    "vless", "vmess", "trojan", "ss", "ssr", "socks", "socks5",
-    "socks5h", "hy2", "hysteria", "hysteria2", "wg", "wireguard", "https://t.me/proxy"
-)
-
-def _link_name(url):
-    try:
-        return unquote(urlparse(url).fragment or "").strip()
-    except Exception:
-        return ""
-
-def _decode_b64(s):
-    try:
-        s = s.strip().replace("-", "+").replace("_", "/")
-        return base64.b64decode(s + "=" * (-len(s) % 4))
-    except Exception:
-        return b""
-
-def parse_vmess(url):
-    try:
-        raw=url.split("vmess://",1)[1].split("#",1)[0]
-        obj=json.loads(_decode_b64(raw).decode("utf-8"))
-        if not obj.get("add") or not obj.get("port") or not obj.get("id"):
-            return {"protocol":"VMESS","url":url,"name":"","valid":False,"metadata":{}}
-        obj["ps"]=obj.get("ps") or _link_name(url)
-        payload=base64.b64encode(json.dumps(obj,ensure_ascii=False,separators=(",",":")).encode()).decode()
-        return {"protocol":"VMESS","url":"vmess://"+payload,"name":obj.get("ps",""),"valid":True,"metadata":obj}
-    except Exception:
-        return {"protocol":"VMESS","url":url,"name":"","valid":False,"metadata":{}}
-
-def parse_vless(url):
-    try:
-        p=urlparse(url)
-        return {"protocol":"VLESS","url":url,"name":_link_name(url),
-                "valid":bool(p.username and p.hostname and p.port),
-                "metadata":parse_qs(p.query)}
-    except Exception:
-        return {"protocol":"VLESS","url":url,"name":"","valid":False,"metadata":{}}
-
-def parse_trojan(url):
-    try:
-        p=urlparse(url)
-        return {"protocol":"TROJAN","url":url,"name":_link_name(url),
-                "valid":bool(p.username and p.hostname and p.port),
-                "metadata":parse_qs(p.query)}
-    except Exception:
-        return {"protocol":"TROJAN","url":url,"name":"","valid":False,"metadata":{}}
-
-def parse_ss(url):
-    try:
-        p=urlparse(url)
-        return {"protocol":"SHADOWSOCKS","url":url,"name":_link_name(url),
-                "valid":bool(p.hostname and p.port),"metadata":{}}
-    except Exception:
-        return {"protocol":"SHADOWSOCKS","url":url,"name":"","valid":False,"metadata":{}}
-
-def parse_socks(url):
-    try:
-        p=urlparse(url)
-        return {"protocol":"SOCKS","url":url,"name":_link_name(url),
-                "valid":bool(p.hostname and p.port),
-                "metadata":{"user":p.username,"password":p.password}}
-    except Exception:
-        return {"protocol":"SOCKS","url":url,"name":"","valid":False,"metadata":{}}
-
-def parse_hysteria(url):
-    try:
-        p=urlparse(url)
-        return {"protocol":"HYSTERIA","url":url,"name":_link_name(url),
-                "valid":bool(p.hostname and p.port),"metadata":parse_qs(p.query)}
-    except Exception:
-        return {"protocol":"HYSTERIA","url":url,"name":"","valid":False,"metadata":{}}
-
-def parse_wireguard(url):
-    try:
-        p=urlparse(url)
-        return {"protocol":"WIREGUARD","url":url,"name":_link_name(url),
-                "valid":bool(p.hostname),"metadata":parse_qs(p.query)}
-    except Exception:
-        return {"protocol":"WIREGUARD","url":url,"name":"","valid":False,"metadata":{}}
-
-def parse_telegram_proxy(url):
-    try:
-        p=urlparse(url)
-        q=parse_qs(p.query)
-        if p.scheme=="tg" and p.netloc=="proxy" or p.path.lower()=="/proxy":
-            ok=bool(q.get("server") and q.get("port") and q.get("secret"))
-            return {"protocol":"MTPROTO","url":url,"name":"","valid":ok,"metadata":q}
-        if p.scheme=="tg" and p.netloc=="socks":
-            ok=bool(q.get("server") and q.get("port"))
-            return {"protocol":"SOCKS5","url":url,"name":"","valid":ok,"metadata":q}
-    except Exception:
-        pass
-    return {"protocol":"TELEGRAM_PROXY","url":url,"name":"","valid":False,"metadata":{}}
-
-def parse_config_url(url):
-    s=url.lower()
-    if s.startswith("vmess://"): return parse_vmess(url)
-    if s.startswith("vless://"): return parse_vless(url)
-    if s.startswith("trojan://"): return parse_trojan(url)
-    if s.startswith(("ss://","ssr://")): return parse_ss(url)
-    if s.startswith(("socks://","socks5://","socks5h://")): return parse_socks(url)
-    if s.startswith(("hy2://","hysteria://","hysteria2://")): return parse_hysteria(url)
-    if s.startswith(("wg://","wireguard://", "https://t.me/proxy?", "tg://proxy?")): return parse_wireguard(url)
-    return {"protocol":"","url":url,"name":"","valid":False,"metadata":{}}
-
 def extract_links_from_text(text):
-    """Extract published configuration links without confusing them with bot proxies."""
+    """Extract ONLY supported configs, preserving source/message order."""
     if not text:
         return []
-    source = html.unescape(text)
-    patterns = [
-        r'(?:vless|vmess|trojan|ss|ssr|socks|socks5|socks5h|hy2|hysteria|hysteria2|wg|wireguard)://[^\s<>"\']+',
-        r'https?://t\.me/proxy\?[^\s<>"\']+'
-    ]
-    out=[]; seen=set()
-    for pat in patterns:
-        for m in re.finditer(pat, source, re.I):
-            u=m.group(0).rstrip('.,;:!؟)]}')
-            # Telegram proxy links are configs too; preserve raw URL
-            if u.lower().startswith(('http://t.me/proxy?', 'https://t.me/proxy?')):
-                ok,_=validate_telegram_proxy_url(u)
-                if ok:
-                    key=hashlib.sha256(u.encode()).hexdigest()
-                    if key not in seen:
-                        seen.add(key); out.append(u)
+    results = []
+    seen = set()
+    pattern = re.compile(
+        # Keep URI punctuation such as (), [], quotes and # inside the
+        # candidate. URL-encoded credentials and fragments may legally contain
+        # those characters. Whitespace/HTML delimiters are the reliable
+        # message-level boundaries.
+        r'(?:vless|vmess|trojan|wireguard|wg|shadowsocks|ss|socks5|socks4|socks|hysteria2|hy2)://[^\s<>]+',
+        re.IGNORECASE
+    )
+
+    def add_candidate(link):
+        link = clean_config_url(link.strip())
+        # Remove only obvious sentence punctuation after a URI. Do not remove
+        # ')' / ']' because those may be part of a Trojan fragment/name.
+        link = re.sub(r'[.,;:!؟\'"`]+$', '', link)
+        ok, reason = validate_config_link(link)
+        if ok:
+            ident = canonical_config_identity(link)
+            if ident not in seen:
+                seen.add(ident)
+                results.append(link)
+        else:
+            log.debug(f"Invalid/unsupported config skipped: {link[:120]} - {reason}")
+
+    for m in pattern.finditer(html.unescape(text)):
+        add_candidate(m.group(0))
+
+    # Preserve the existing base64 extraction capability, but apply the same strict whitelist.
+    if not results:
+        candidates = []
+        text_clean = text.replace('\n', '').replace('\r', '').strip()
+        if text_clean and re.fullmatch(r'[A-Za-z0-9+/=]+', text_clean):
+            candidates.append(text_clean)
+        candidates.extend(line.strip() for line in text.splitlines()
+                         if line.strip() and len(line.strip()) <= 2000 and re.fullmatch(r'[A-Za-z0-9+/=]+', line.strip()))
+        for encoded in candidates:
+            try:
+                decoded = base64.b64decode(encoded + '=' * (-len(encoded) % 4), validate=False).decode('utf-8', errors='ignore')
+                for m in pattern.finditer(decoded):
+                    add_candidate(m.group(0))
+            except Exception:
                 continue
-            item=parse_config_url(u)
-            if item.get('valid'):
-                u=item.get('url',u)
-                key=hashlib.sha256(u.encode()).hexdigest()
-                if key not in seen:
-                    seen.add(key); out.append(u)
-    return out
+
+    return results
 
 def validate_telegram_proxy_url(url):
     """Strict Telegram proxy validation: MTProto or SOCKS5 only."""
@@ -2765,16 +2550,12 @@ def validate_telegram_proxy_url(url):
             if not (1 <= int(port_raw) <= 65535):
                 return False, "invalid port"
             return True, "MTPROTO"
-        if scheme in ("socks", "socks5"):
+        if scheme == "socks5":
             if not p.hostname:
                 return False, "missing host"
             if p.port is None or not (1 <= p.port <= 65535):
                 return False, "invalid port"
             return True, "SOCKS5"
-        if scheme == "tg" and p.netloc.lower() == "socks":
-            q = parse_qs(p.query, keep_blank_values=True)
-            if (q.get("server") or [""])[0] and (q.get("port") or [""])[0].isdigit():
-                return True, "SOCKS5"
     except Exception as e:
         return False, f"parse error: {e}"
     return False, "not a Telegram proxy"
@@ -2812,7 +2593,7 @@ def extract_proxy_links_from_text(text):
     patterns = [
         r'https?://t\.me/proxy\?[^\s<>"\']+',
         r'tg://proxy\?[^\s<>"\']+',
-        r'(?:socks://|socks5://|socks5h://)[^\s<>"\']+',
+        r'socks5://[^\s<>"\']+',
     ]
     for pattern in patterns:
         for m in re.finditer(pattern, source, re.IGNORECASE):
@@ -3496,15 +3277,6 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
     config_blocks = []
     for i, (url, ping, node_count) in enumerate(items, 1):
         n = last_n + i
-
-        # MTProto Telegram proxy links are NOT V2Ray configs.
-        # Keep them raw: no fragment, no custom query, no channel tag injection.
-        # They must stay as https://t.me/proxy?server=...&port=...&secret=...
-        if (url or '').strip().lower().startswith(("https://t.me/proxy?", "tg://proxy?")):
-            header = "<b>MTPROTO</b>"
-            config_blocks.append(header + "\n<pre>" + (url or '').strip() + "</pre>")
-            continue
-
         host, _ = extract_host(url)
         flag = "🌐"
         country_code = ""
@@ -3576,7 +3348,7 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
         modified_url = base_url + "#" + encoded_fragment
 
         protocol = url.split('://')[0].lower() if '://' in url else ''
-        if custom_query and protocol not in ('vmess', 'https', 'tg'):
+        if custom_query and protocol != 'vmess':
             modified_url = add_custom_query_to_url(modified_url, custom_query, protocol)
 
         block = f"<pre>{modified_url}</pre>"
@@ -3642,7 +3414,7 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
         modified_url = base_url + "#" + encoded_fragment
         if custom_query:
             protocol = url.split('://')[0].lower() if '://' in url else ''
-            if custom_query and protocol not in ('vmess', 'https', 'tg'):
+            if custom_query and protocol != 'vmess':
                 modified_url = add_custom_query_to_url(modified_url, custom_query, protocol)
         if not is_already_posted(profile_id, modified_url):
             mark_as_posted(profile_id, modified_url, source_for_seen, full_url=modified_url)
@@ -3746,10 +3518,7 @@ async def post_proxies(bot, profile_id, proxies_with_ping, is_instant=False, max
         # This keeps header country and glass-button country perfectly consistent.
         button_flag = proxy_flag if (country_display != 0 and proxy_flag and proxy_flag != "🌐") else ""
         button_label = f"Proxy {button_flag}".strip()
-        # Telegram URL buttons only support web/tg links. Proxy/VLESS/SOCKS
-        # configs are content, not clickable URLs. Putting them in url= makes
-        # Telegram reject the whole message and keeps the queue stuck.
-        proxy_buttons.append(InlineKeyboardButton(button_label, callback_data=f"copy_proxy_{i}"))
+        proxy_buttons.append(InlineKeyboardButton(button_label, url=norm, style=style))
     rows = [proxy_buttons[i:i+3] for i in range(0, len(proxy_buttons), 3)]
     visible = "\n".join(header for _norm, header, _flag in entries)
     try:
@@ -3817,9 +3586,7 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
             pass
         return 0, "no destination"
 
-    config_ping_mode = get_profile_config_ping_mode(profile_id)
-    proxy_ping_mode = get_profile_proxy_ping_mode(profile_id)
-    ping_mode = config_ping_mode  # backward-compatible local alias for config checks
+    ping_mode = get_profile_ping_mode(profile_id)
     ping_testing = get_profile_ping_enabled(profile_id)
     stream = "combined" if enable_configs and enable_proxies else ("config" if enable_configs else "proxy")
     log.info(f"📡 [profile={profile_id}] Sources: {len(sources)} | 🎯 {dest} | stream={stream} | internal_health_test={ping_testing}")
@@ -3887,7 +3654,7 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
             async with sem:
                 try:
                     if ping_testing:
-                        ping, ok, cnt = await check_full_link_ping(u, config_ping_mode, perform_ping=True)
+                        ping, ok, cnt = await check_full_link_ping(u, ping_mode, perform_ping=True)
                     else:
                         # Ping testing disabled: we still check host resolution and TCP? But we don't filter.
                         # We'll just consider it reachable if we can resolve host.
@@ -3951,15 +3718,6 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
                             log.debug(f"[PROXY] GeoIP lookup failed for {host}: {e}")
                     if not host or not port or not (1 <= int(port) <= 65535):
                         return proxy_url, 0, flag, country_code
-                    if ping_testing:
-                        try:
-                            ping, ok, _ = await check_full_link_ping(proxy_url, proxy_ping_mode, perform_ping=True)
-                            if not ok:
-                                return proxy_url, 0, flag, country_code
-                            return proxy_url, ping, flag, country_code
-                        except Exception as e:
-                            log.debug(f"[PROXY] ping failed for {host}:{port}: {e}")
-                            return proxy_url, 0, flag, country_code
                     return proxy_url, 0, flag, country_code
 
             results = await asyncio.gather(
@@ -4840,9 +4598,7 @@ def profile_admin_kb(profile_id):
         [InlineKeyboardButton(f"🌐 حالت انتشار پروکسی: {'شیشه‌ای' if get_profile_proxy_post_mode(profile_id) == 1 else 'عادی'}", callback_data=f"tgl_prx_mode_{profile_id}", style="primary"),
          InlineKeyboardButton(f"📡 تست Ping: {'✅' if ping_testing else '❌'}", callback_data=f"tgl_ping_test_{profile_id}", style="primary")],
         [InlineKeyboardButton(f"👁 نمایش Ping: {'✅' if prof.get('show_ping', 1) else '❌'}", callback_data=f"tgl_show_ping_{profile_id}", style="primary"),
-         InlineKeyboardButton("📍 تنظیم مناطق Ping", callback_data=f"ping_regions_{profile_id}", style="primary")],
-        [InlineKeyboardButton(f"📍 Ping ویتوری: {'🇮🇷 ایران' if get_profile_config_ping_mode(profile_id) == 'iran' else '🌍 جهانی'}", callback_data=f"ping_region_config_{profile_id}", style="primary"),
-         InlineKeyboardButton(f"📍 Ping پروکسی: {'🇮🇷 ایران' if get_profile_proxy_ping_mode(profile_id) == 'iran' else '🌍 جهانی'}", callback_data=f"ping_region_proxy_{profile_id}", style="primary")],
+         InlineKeyboardButton(f"📍 منطقه Ping: {'🇮🇷 ایران' if ping_mode == 'iran' else '🌍 جهانی'}", callback_data=f"tglping_{profile_id}", style="primary")],
         [InlineKeyboardButton(msg("btn_toggle_profile", status=profile_status), callback_data=f"tgl_profile_{profile_id}", style="danger")],
         [InlineKeyboardButton(cfg_btn, callback_data=f"tglcfg_{profile_id}", style="primary"),
          InlineKeyboardButton(prx_btn, callback_data=f"tglproxy_{profile_id}", style="primary")],
@@ -4871,25 +4627,6 @@ def profile_admin_kb(profile_id):
          InlineKeyboardButton(msg("btn_clear"), callback_data=f"cd1_{profile_id}", style="danger")],
         [InlineKeyboardButton("❌ Delete Profile", callback_data=f"delprof_{profile_id}", style="danger")],
         [InlineKeyboardButton(msg("btn_back"), callback_data="profiles_list", style="primary")],
-    ])
-
-def ping_regions_kb(profile_id):
-    cfg = get_profile_config_ping_mode(profile_id)
-    prx = get_profile_proxy_ping_mode(profile_id)
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🧩 ویتوری: {'🇮🇷 ایران' if cfg == 'iran' else '🌍 جهانی'}", callback_data=f"ping_region_config_{profile_id}", style="primary")],
-        [InlineKeyboardButton(f"🌐 پروکسی: {'🇮🇷 ایران' if prx == 'iran' else '🌍 جهانی'}", callback_data=f"ping_region_proxy_{profile_id}", style="primary")],
-        [InlineKeyboardButton("🌍 هر دو = جهانی", callback_data=f"ping_region_all_global_{profile_id}", style="success")],
-        [InlineKeyboardButton("↩️ بازگشت", callback_data=f"prof_{profile_id}", style="primary")],
-    ])
-
-def ping_region_choice_kb(profile_id, kind):
-    current = get_profile_config_ping_mode(profile_id) if kind == "config" else get_profile_proxy_ping_mode(profile_id)
-    title = "ویتوری/کانفیگ" if kind == "config" else "پروکسی"
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"{'◉' if current == 'global' else '○'} 🌍 جهانی", callback_data=f"set_ping_region_{kind}_global_{profile_id}", style="success" if current == "global" else "primary")],
-        [InlineKeyboardButton(f"{'◉' if current == 'iran' else '○'} 🇮🇷 ایران", callback_data=f"set_ping_region_{kind}_iran_{profile_id}", style="success" if current == "iran" else "primary")],
-        [InlineKeyboardButton("↩️ بازگشت به مناطق Ping", callback_data=f"ping_regions_{profile_id}", style="primary")],
     ])
 
 def destinations_kb(profile_id):
@@ -6234,63 +5971,6 @@ async def on_callback(u, ctx):
             await show_profile_admin(q.message, profile_id)
             return
 
-        if d.startswith("ping_regions_"):
-            try:
-                profile_id = int(d.rsplit("_", 1)[1])
-            except ValueError:
-                await q.answer("⚠️ شناسه نامعتبر"); return
-            await q.edit_message_text("📍 <b>تنظیم مستقل مناطق Ping</b>\n\nبرای ویتوری و پروکسی می‌توانی منطقه جداگانه انتخاب کنی.\nپیش‌فرض هر دو: 🌍 جهانی", parse_mode="HTML", reply_markup=ping_regions_kb(profile_id))
-            return
-
-        if d.startswith("ping_region_config_"):
-            try:
-                profile_id = int(d.rsplit("_", 1)[1])
-            except ValueError:
-                await q.answer("⚠️ شناسه نامعتبر"); return
-            await q.edit_message_text("🧩 منطقه Ping ویتوری/کانفیگ را انتخاب کن:", reply_markup=ping_region_choice_kb(profile_id, "config"))
-            return
-
-        if d.startswith("ping_region_proxy_"):
-            try:
-                profile_id = int(d.rsplit("_", 1)[1])
-            except ValueError:
-                await q.answer("⚠️ شناسه نامعتبر"); return
-            await q.edit_message_text("🌐 منطقه Ping پروکسی را انتخاب کن:", reply_markup=ping_region_choice_kb(profile_id, "proxy"))
-            return
-
-        if d.startswith("set_ping_region_"):
-            parts = d.split("_")
-            if len(parts) != 5:
-                await q.answer("⚠️ داده نامعتبر"); return
-            _, _, kind, mode, profile_raw = parts
-            try:
-                profile_id = int(profile_raw)
-            except ValueError:
-                await q.answer("⚠️ شناسه نامعتبر"); return
-            mode = _normalize_ping_mode(mode)
-            if kind == "config":
-                set_profile_config_ping_mode(profile_id, mode)
-                label = "ویتوری/کانفیگ"
-            elif kind == "proxy":
-                set_profile_proxy_ping_mode(profile_id, mode)
-                label = "پروکسی"
-            else:
-                await q.answer("⚠️ نوع نامعتبر"); return
-            await q.answer(f"✅ منطقه Ping {label}: {'جهانی' if mode == 'global' else 'ایران'}")
-            await q.edit_message_text(f"🧩 منطقه Ping {label} تنظیم شد.", reply_markup=ping_region_choice_kb(profile_id, kind))
-            return
-
-        if d.startswith("ping_region_all_global_"):
-            try:
-                profile_id = int(d.rsplit("_", 1)[1])
-            except ValueError:
-                await q.answer("⚠️ شناسه نامعتبر"); return
-            set_profile_config_ping_mode(profile_id, "global")
-            set_profile_proxy_ping_mode(profile_id, "global")
-            await q.answer("🌍 هر دو منطقه Ping روی جهانی قرار گرفت")
-            await q.edit_message_text("🌍 منطقه Ping ویتوری و پروکسی هر دو روی جهانی تنظیم شدند.", reply_markup=ping_regions_kb(profile_id))
-            return
-
         if d.startswith("tglping_"):
             parts = d.split("_")
             if len(parts) >= 2:
@@ -7278,7 +6958,7 @@ async def show_profile_admin(msg_or_q, profile_id):
     sponsors = get_sponsors(profile_id)
     sponsor_st = f"{len(sponsors)} اسپانسر" if sponsors else "خالی"
     ping_mode = prof["ping_mode"]
-    ping_display = f"ویتوری:{get_profile_config_ping_mode(profile_id)} / پروکسی:{get_profile_proxy_ping_mode(profile_id)}"
+    ping_display = "ایران" if ping_mode == "iran" else "جهانی"
     ping_testing = get_profile_ping_enabled(profile_id)
     ping_status = "✅" if ping_testing else "❌"
     profile_enabled = get_profile_enabled(profile_id)
@@ -8115,52 +7795,6 @@ async def export_backup(update, context, profile_id, backup_type, count=None):
         log.error(f"Backup export error: {e}")
         await update.message.reply_text(f"❌ خطا در بک‌آپ: {str(e)[:100]}")
 
-
-# ======================================================================
-# Worker stability layer (v2.2.1)
-# ======================================================================
-_WORKER_TASKS = {}
-_WORKER_HEARTBEATS = {}
-
-async def _worker_guard(name, coro_factory, restart_delay=5):
-    """Run long lived workers forever without allowing one exception to kill them."""
-    while True:
-        try:
-            _WORKER_HEARTBEATS[name] = time.time()
-            await coro_factory()
-            _WORKER_HEARTBEATS[name] = time.time()
-        except asyncio.CancelledError:
-            log.info(f"[WATCHDOG] cancelled: {name}")
-            raise
-        except Exception:
-            log.exception(f"[WATCHDOG] worker crashed: {name}; restarting")
-            await asyncio.sleep(restart_delay)
-
-
-def start_worker(app, name, coro_factory):
-    if name in _WORKER_TASKS and not _WORKER_TASKS[name].done():
-        return _WORKER_TASKS[name]
-    task = app.create_task(_worker_guard(name, coro_factory))
-    _WORKER_TASKS[name] = task
-    log.info(f"[BOOT] Worker started: {name}")
-    return task
-
-async def worker_watchdog():
-    while True:
-        try:
-            now=time.time()
-            for name, task in list(_WORKER_TASKS.items()):
-                if task.done():
-                    log.warning(f"[WATCHDOG] dead worker detected: {name}")
-                elif now - _WORKER_HEARTBEATS.get(name, now) > 300:
-                    log.warning(f"[WATCHDOG] stale worker heartbeat: {name}")
-            await asyncio.sleep(60)
-        except asyncio.CancelledError:
-            break
-        except Exception:
-            log.exception("[WATCHDOG] monitor error")
-            await asyncio.sleep(60)
-
 # ======================================================================
 # راه‌اندازی
 # ======================================================================
@@ -8206,19 +7840,18 @@ async def post_init(app):
     c.execute("UPDATE manual_send_queue SET status='pending', updated_at=? WHERE status='running'", (get_tehran_time(),))
     conn.commit()
     # Persistent manual scheduler is always enabled independently from automatic scraping.
-    start_worker(app, "manual_queue", lambda: manual_queue_worker(app.bot))
+    app.create_task(manual_queue_worker(app.bot))
     log.info(f"⏱️ Manual queue scheduler enabled (BOT_VERSION={BOT_VERSION})")
 
     if ENABLE_AUTO:
         for prof in profiles:
             log.info(f"⏰ Creating config loop for profile {prof['id']} ({prof['dest_name']})")
-            start_worker(app, f"config_{prof["id"]}", lambda pid=prof["id"]: profile_loop_config(app.bot, pid))
+            app.create_task(profile_loop_config(app.bot, prof["id"]))
             log.info(f"⏰ Creating proxy loop for profile {prof['id']} ({prof['dest_name']})")
-            start_worker(app, f"proxy_{prof["id"]}", lambda pid=prof["id"]: profile_loop_proxy(app.bot, pid))
+            app.create_task(profile_loop_proxy(app.bot, prof["id"]))
         log.info("⏰ Scheduler started for all profiles (config and proxy loops)")
 
-    start_worker(app, "cleanup", lambda: periodic_cleanup())
-    start_worker(app, "watchdog", lambda: worker_watchdog())
+    app.create_task(periodic_cleanup())
     log.info("🧹 Periodic cleanup task started")
 
 
@@ -8242,81 +7875,3 @@ if __name__ == "__main__":
     log.info("=" * 50)
     log.info("🚀 Starting bot...")
     main()
-
-
-# ======================================================================
-# v3.2.0 Database optimizer
-# - duplicate post protection
-# - automatic 48h cleanup
-# - sqlite size control
-# ======================================================================
-
-DB_OPTIMIZER_VERSION = "3.2.1"
-
-def optimize_database():
-    """Low disk SQLite maintenance. Never runs huge vacuum/write operations."""
-    db = None
-    try:
-        db = get_conn()
-        cur = db.cursor()
-
-        # keep WAL and temporary files small
-        cur.execute("PRAGMA journal_size_limit=262144")
-        cur.execute("PRAGMA wal_autocheckpoint=50")
-        cur.execute("PRAGMA temp_store=MEMORY")
-
-        # indexes
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_processed_message ON processed_messages(source,message_id,profile_id)")
-
-        cutoff = (datetime.now() - timedelta(hours=48)).isoformat()
-        # delete old duplicate trackers, not actual configs
-        cur.execute("DELETE FROM posts WHERE created_at < ?", (cutoff,))
-        cur.execute("DELETE FROM seen WHERE last_posted IS NOT NULL AND last_posted < ?", (cutoff,))
-        cur.execute("DELETE FROM proxies_seen WHERE last_posted IS NOT NULL AND last_posted < ?", (cutoff,))
-        cur.execute("DELETE FROM processed_messages WHERE rowid NOT IN (SELECT MIN(rowid) FROM processed_messages GROUP BY source,message_id,profile_id)")
-
-        db.commit()
-
-        # checkpoint after commit
-        try:
-            cur.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except Exception:
-            pass
-
-        # small incremental reclaim only
-        try:
-            cur.execute("PRAGMA incremental_vacuum(100)")
-        except Exception:
-            pass
-
-        db.commit()
-    except Exception as e:
-        log.error(f"database optimizer failed: {e}")
-    finally:
-        if db:
-            db.close()
-
-def post_fingerprint(text):
-    return hashlib.sha256((text or "").encode("utf-8", errors="ignore")).hexdigest()
-
-def is_duplicate_post(text):
-    fp = post_fingerprint(text)
-    db = get_conn()
-    try:
-        row = db.execute("SELECT 1 FROM posts WHERE content=? LIMIT 1", (fp,)).fetchone()
-        return bool(row)
-    finally:
-        db.close()
-
-def save_unique_post(text, count=0):
-    fp = post_fingerprint(text)
-    db = get_conn()
-    try:
-        db.execute("INSERT OR IGNORE INTO posts(content,count,created_at) VALUES(?,?,?)", (fp,count,datetime.now().isoformat()))
-        db.commit()
-    finally:
-        db.close()
-
-BOT_VERSION = "3.2.0"
-
