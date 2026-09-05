@@ -2752,9 +2752,9 @@ def extract_links_from_text(text):
             if u.lower().startswith(('http://t.me/proxy?', 'https://t.me/proxy?')):
                 continue
             key=hashlib.sha256(u.encode()).hexdigest()
-                    if key not in seen:
-                        seen.add(key); out.append(u)
-                continue
+            if key not in seen:
+                seen.add(key); out.append(u)
+            continue
             item=parse_config_url(u)
             if item.get('valid'):
                 u=item.get('url',u)
