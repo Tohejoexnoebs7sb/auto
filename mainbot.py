@@ -948,6 +948,11 @@ def create_manual_queue_job(profile_id, kind, items, interval_minutes=0, batch_s
     if not items:
         return None
     kind = str(kind).lower().strip()
+    # Config URLs are content, even when the protocol is socks://.
+    # Never classify published configs as Telegram/proxy jobs.
+    config_prefixes = ("vless://", "vmess://", "trojan://", "ss://", "ssr://", "socks://", "socks5://", "hy2://", "hysteria://", "hysteria2://", "wg://", "wireguard://", "https://t.me/proxy?", "tg://proxy?")
+    if any(str(x).strip().lower().startswith(config_prefixes) for x in items):
+        kind = "config"
     if kind not in ("config", "proxy"):
         raise ValueError("invalid queue kind")
     interval_minutes = max(0, int(interval_minutes or 0))
@@ -1144,12 +1149,16 @@ async def _send_manual_queue_batch(bot, job):
 
 
 def sqlite_maintenance_cycle():
-    """Controlled SQLite maintenance; never destructive."""
+    """Controlled SQLite maintenance. Prevent WAL/queue/log database growth."""
     try:
-        c.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         c.execute("DELETE FROM manual_send_queue WHERE status IN ('done','cancelled') AND updated_at < ?",
-                  (_queue_iso(_queue_now()-timedelta(days=14)),))
+                  (_queue_iso(_queue_now()-timedelta(days=3)),))
         conn.commit()
+        # Only compact when SQLite has a large amount of free pages.
+        free_pages = c.execute("PRAGMA freelist_count").fetchone()[0]
+        if free_pages and free_pages > 1000:
+            c.execute("VACUUM")
     except Exception:
         log.exception("sqlite maintenance failed")
 
@@ -2566,7 +2575,7 @@ def validate_config_link(url):
         return False, "empty"
     url = clean_config_url(url.strip())
     if is_telegram_proxy_url(url):
-        return False, "telegram proxy is not a config"
+        return True, "telegram proxy config"
     scheme = urlparse(url).scheme.lower()
     if scheme == "vless": return validate_vless(url)
     if scheme == "vmess": return validate_vmess(url)
@@ -2584,7 +2593,7 @@ def validate_config_link(url):
 # ========================= Collector v3 =========================
 SUPPORTED_SCHEMES = (
     "vless", "vmess", "trojan", "ss", "ssr", "socks", "socks5",
-    "socks5h", "hy2", "hysteria", "hysteria2", "wg", "wireguard"
+    "socks5h", "hy2", "hysteria", "hysteria2", "wg", "wireguard", "https://t.me/proxy"
 )
 
 def _link_name(url):
@@ -2685,24 +2694,36 @@ def parse_config_url(url):
     if s.startswith(("ss://","ssr://")): return parse_ss(url)
     if s.startswith(("socks://","socks5://","socks5h://")): return parse_socks(url)
     if s.startswith(("hy2://","hysteria://","hysteria2://")): return parse_hysteria(url)
-    if s.startswith(("wg://","wireguard://")): return parse_wireguard(url)
+    if s.startswith(("wg://","wireguard://", "https://t.me/proxy?", "tg://proxy?")): return parse_wireguard(url)
     return {"protocol":"","url":url,"name":"","valid":False,"metadata":{}}
 
 def extract_links_from_text(text):
+    """Extract published configuration links without confusing them with bot proxies."""
     if not text:
         return []
-    pattern=re.compile(r'(?:'+"|".join(SUPPORTED_SCHEMES)+r')://[^\s<>]+',re.I)
+    source = html.unescape(text)
+    patterns = [
+        r'(?:vless|vmess|trojan|ss|ssr|socks|socks5|socks5h|hy2|hysteria|hysteria2|wg|wireguard)://[^\s<>"\']+',
+        r'https?://t\.me/proxy\?[^\s<>"\']+'
+    ]
     out=[]; seen=set()
-    for m in pattern.finditer(html.unescape(text)):
-        u=clean_config_url(m.group(0)).rstrip('.,;:!؟')
-        item=parse_config_url(u)
-        if item["valid"]:
-            u=item["url"]
-            if item["protocol"]=="VMESS":
-                u=item["url"]
-            h=hashlib.sha256(u.encode()).hexdigest()
-            if h not in seen:
-                seen.add(h); out.append(u)
+    for pat in patterns:
+        for m in re.finditer(pat, source, re.I):
+            u=m.group(0).rstrip('.,;:!؟)]}')
+            # Telegram proxy links are configs too; preserve raw URL
+            if u.lower().startswith(('http://t.me/proxy?', 'https://t.me/proxy?')):
+                ok,_=validate_telegram_proxy_url(u)
+                if ok:
+                    key=hashlib.sha256(u.encode()).hexdigest()
+                    if key not in seen:
+                        seen.add(key); out.append(u)
+                continue
+            item=parse_config_url(u)
+            if item.get('valid'):
+                u=item.get('url',u)
+                key=hashlib.sha256(u.encode()).hexdigest()
+                if key not in seen:
+                    seen.add(key); out.append(u)
     return out
 
 def validate_telegram_proxy_url(url):
