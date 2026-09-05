@@ -168,7 +168,6 @@ def detect_config_protocol(config_url):
     if u.startswith("socks://"): return "SOCKS"
     if u.startswith(("hysteria://", "hysteria2://", "hy2://")): return "HYSTERIA2"
     if u.startswith(("wireguard://", "wg://")): return "WIREGUARD"
-    if u.startswith(("https://t.me/proxy?", "tg://proxy?")): return "MTPROTO"
     return ""
 
 
@@ -1038,7 +1037,7 @@ def extract_supported_links_from_message(message):
             if getattr(obj, "caption", None): parts.append(obj.caption)
 
     blob="\n".join(str(x) for x in parts)
-    pattern=r"(?:vmess|vless|trojan|ss|shadowsocks|socks|hy2|hysteria2?|wireguard|wg|tg://proxy|https://t\.me/proxy)[^\s<>\"']+"
+    pattern=r"(?:vmess|vless|trojan|ss|shadowsocks|socks|hy2|hysteria2?|wireguard|wg)://[^\s<>"']+|(?:tg://proxy\?[^\s<>"']+|https://t\.me/proxy\?[^\s<>"']+)"
     for item in re.findall(pattern, blob, re.I):
         item=item.strip(".,);]}")
         if detect_config_protocol(item) or detect_proxy_protocol(item):
