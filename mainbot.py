@@ -3487,6 +3487,15 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
     config_blocks = []
     for i, (url, ping, node_count) in enumerate(items, 1):
         n = last_n + i
+
+        # MTProto Telegram proxy links are NOT V2Ray configs.
+        # Keep them raw: no fragment, no custom query, no channel tag injection.
+        # They must stay as https://t.me/proxy?server=...&port=...&secret=...
+        if (url or '').strip().lower().startswith(("https://t.me/proxy?", "tg://proxy?")):
+            header = "<b>MTPROTO</b>"
+            config_blocks.append(header + "\n<pre>" + (url or '').strip() + "</pre>")
+            continue
+
         host, _ = extract_host(url)
         flag = "🌐"
         country_code = ""
@@ -3558,7 +3567,7 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
         modified_url = base_url + "#" + encoded_fragment
 
         protocol = url.split('://')[0].lower() if '://' in url else ''
-        if custom_query and protocol != 'vmess':
+        if custom_query and protocol not in ('vmess', 'https', 'tg'):
             modified_url = add_custom_query_to_url(modified_url, custom_query, protocol)
 
         block = f"<pre>{modified_url}</pre>"
@@ -3624,7 +3633,7 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
         modified_url = base_url + "#" + encoded_fragment
         if custom_query:
             protocol = url.split('://')[0].lower() if '://' in url else ''
-            if custom_query and protocol != 'vmess':
+            if custom_query and protocol not in ('vmess', 'https', 'tg'):
                 modified_url = add_custom_query_to_url(modified_url, custom_query, protocol)
         if not is_already_posted(profile_id, modified_url):
             mark_as_posted(profile_id, modified_url, source_for_seen, full_url=modified_url)
