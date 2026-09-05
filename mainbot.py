@@ -1,4 +1,3 @@
-# Professional build 0.1.2
 import os
 import re
 import asyncio
@@ -169,7 +168,8 @@ def detect_config_protocol(config_url):
     if u.startswith("trojan://"): return "TROJAN"
     if u.startswith(("shadowsocks://", "ss://")): return "SHADOWSOCKS"
     if u.startswith("socks://"): return "SOCKS"
-    if u.startswith(("hysteria2://", "hy2://")): return "HYSTERIA2"
+    if u.startswith(("hysteria://", "hysteria2://", "hy2://")): return "HYSTERIA2"
+    if u.startswith(("wireguard://", "wg://")): return "WIREGUARD"
     if u.startswith(("https://t.me/proxy?", "tg://proxy?")): return "MTPROTO"
     return ""
 
@@ -998,6 +998,29 @@ def _queue_parse_time(value):
         return dt.astimezone(TEHRAN_TZ)
     except Exception:
         return _queue_now()
+
+
+def extract_supported_links_from_message(message):
+    """Extract visible and hidden telegram entity URLs from forwarded/manual posts."""
+    found=[]
+    text_parts=[]
+    if getattr(message, "text", None):
+        text_parts.append(message.text)
+    if getattr(message, "caption", None):
+        text_parts.append(message.caption)
+    for ent in list(getattr(message, "entities", None) or []) + list(getattr(message, "caption_entities", None) or []):
+        try:
+            if getattr(ent, "type", "") == "text_link" and getattr(ent, "url", None):
+                text_parts.append(ent.url)
+        except Exception:
+            pass
+    blob="\n".join(text_parts)
+    patterns=r"(?:vmess|vless|trojan|ss|shadowsocks|socks|tg|https://t\.me/proxy)[^\\s<>]+"
+    for x in re.findall(patterns, blob, re.I):
+        x=x.strip('.,);]')
+        if detect_config_protocol(x) or detect_proxy_protocol(x):
+            found.append(x)
+    return list(dict.fromkeys(found))
 
 def create_manual_queue_job(profile_id, kind, items, interval_minutes=0, batch_size=1, first_delay_minutes=0):
     items = [str(x).strip() for x in (items or []) if str(x).strip()]
@@ -2668,7 +2691,8 @@ def detect_protocol_name(url):
     if u.startswith("vmess://"): return "VMESS"
     if u.startswith("trojan://"): return "TROJAN"
     if u.startswith(("wireguard://", "wg://")): return "WIREGUARD"
-    if u.startswith(("hysteria2://", "hy2://")): return "HYSTERIA2"
+    if u.startswith(("hysteria://", "hysteria2://", "hy2://")): return "HYSTERIA2"
+    if u.startswith(("wireguard://", "wg://")): return "WIREGUARD"
     if u.startswith(("shadowsocks://", "ss://")): return "SHADOWSOCKS"
     if u.startswith("socks://"): return "SOCKS"
     if is_telegram_proxy_url(u):
@@ -6832,7 +6856,7 @@ async def on_callback(u, ctx):
                 await q.answer("⚠️ داده نامعتبر"); return
             ctx.user_data["manual_queue_add"] = {"profile_id": profile_id, "job_id": job_id}
             await q.answer("ارسال سرور جدید را بفرست")
-            await q.edit_message_text("➕ سرور جدید را به صورت متن یا فایل TXT ارسال کن.")
+            await q.edit_message_text("➕ سرور جدید را به صورت متن یا فایل TXT ارسال کن.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data=f"mq_detail_{profile_id}_{job_id}", style="primary")]]))
             return
 
         if d.startswith("mq_force_"):
@@ -7531,6 +7555,9 @@ async def on_text(u, ctx):
                 line=line.strip()
                 if detect_config_protocol(line) or detect_proxy_protocol(line):
                     items.append(line)
+            # support forwarded posts with hidden telegram links/entities
+            if not items:
+                items.extend(extract_supported_links_from_message(u.message))
             if items:
                 add_manual_queue_items(add_state["job_id"], add_state["profile_id"], items)
                 await u.message.reply_text(f"✅ {len(items)} سرور به صف اضافه شد")
