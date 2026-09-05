@@ -53,41 +53,17 @@ os.makedirs(BACKUP_DIR, exist_ok=True)
 # ======================================================================
 from logging.handlers import RotatingFileHandler
 
-class ThirtyMinuteLogHandler(RotatingFileHandler):
-    """Keep only the last 30 minutes of logs to prevent disk exhaustion."""
-    def emit(self, record):
-        try:
-            self._cleanup_old_logs()
-        except Exception:
-            pass
-        super().emit(record)
-
-    def _cleanup_old_logs(self):
-        import time
-        cutoff = time.time() - 1800
-        try:
-            if os.path.exists(self.baseFilename):
-                if os.path.getmtime(self.baseFilename) < cutoff:
-                    open(self.baseFilename, 'w').close()
-            for f in os.listdir(os.path.dirname(self.baseFilename)):
-                if f.startswith(os.path.basename(self.baseFilename)) and f != os.path.basename(self.baseFilename):
-                    fp = os.path.join(os.path.dirname(self.baseFilename), f)
-                    if os.path.getmtime(fp) < cutoff:
-                        os.remove(fp)
-        except Exception:
-            pass
-
 _LOG_FILE = os.path.join(DATA_DIR, "bot.log")
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        ThirtyMinuteLogHandler(
+        RotatingFileHandler(
             _LOG_FILE,
             mode='a',
-            maxBytes=512 * 1024,
-            backupCount=2,
+            maxBytes=2 * 1024 * 1024,
+            backupCount=3,
             encoding='utf-8'
         )
     ]
@@ -304,28 +280,12 @@ def _prepare_sql_dump(path):
             pass
         return None, str(e)
 
-def _cleanup_database_backups(max_files=5, max_age_hours=24):
-    """Prevent backups from filling the disk."""
-    try:
-        now = datetime.now().timestamp()
-        files = [os.path.join(BACKUP_DIR, x) for x in os.listdir(BACKUP_DIR) if x.endswith('.db')]
-        files.sort(key=os.path.getmtime, reverse=True)
-        for f in files[max_files:]:
-            os.remove(f)
-        for f in files[:max_files]:
-            if now - os.path.getmtime(f) > max_age_hours * 3600:
-                os.remove(f)
-    except Exception:
-        pass
-
 def _backup_current_database():
     if not os.path.exists(DB_PATH):
         return None
-    _cleanup_database_backups()
     stamp = datetime.now(TEHRAN_TZ).strftime("%Y%m%d_%H%M%S")
     backup_path = os.path.join(BACKUP_DIR, f"before_replace_{stamp}.db")
     shutil.copy2(DB_PATH, backup_path)
-    _cleanup_database_backups()
     return backup_path
 
 def _reopen_database_after_replace():
@@ -3746,7 +3706,10 @@ async def post_proxies(bot, profile_id, proxies_with_ping, is_instant=False, max
         # This keeps header country and glass-button country perfectly consistent.
         button_flag = proxy_flag if (country_display != 0 and proxy_flag and proxy_flag != "🌐") else ""
         button_label = f"Proxy {button_flag}".strip()
-        proxy_buttons.append(InlineKeyboardButton(button_label, url=norm, style=style))
+        # Telegram URL buttons only support web/tg links. Proxy/VLESS/SOCKS
+        # configs are content, not clickable URLs. Putting them in url= makes
+        # Telegram reject the whole message and keeps the queue stuck.
+        proxy_buttons.append(InlineKeyboardButton(button_label, callback_data=f"copy_proxy_{i}"))
     rows = [proxy_buttons[i:i+3] for i in range(0, len(proxy_buttons), 3)]
     visible = "\n".join(header for _norm, header, _flag in entries)
     try:
@@ -8260,7 +8223,6 @@ def optimize_database():
         # keep WAL and temporary files small
         cur.execute("PRAGMA journal_size_limit=262144")
         cur.execute("PRAGMA wal_autocheckpoint=50")
-        cur.execute("PRAGMA busy_timeout=5000")
         cur.execute("PRAGMA temp_store=MEMORY")
 
         # indexes
