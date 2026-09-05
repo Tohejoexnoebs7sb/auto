@@ -78,7 +78,7 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 TEHRAN_TZ = pytz.timezone('Asia/Tehran')
 
 # Professional semantic version for this build.
-BOT_VERSION = "1.1.2-MANUAL-QUEUE-FIX"
+BOT_VERSION = "1.1.7-PROXY-ENGINE-MERGED-FINAL"
 
 
 
@@ -158,9 +158,8 @@ def detect_config_protocol(config_url):
     if u.startswith("vless://"): return "VLESS"
     if u.startswith("vmess://"): return "VMESS"
     if u.startswith("trojan://"): return "TROJAN"
-    if u.startswith(("wireguard://", "wg://")): return "WIREGUARD"
     if u.startswith(("shadowsocks://", "ss://")): return "SHADOWSOCKS"
-    if u.startswith(("socks://", "socks4://", "socks5://")): return "SOCKS"
+    if u.startswith("socks://"): return "SOCKS"
     if u.startswith(("hysteria2://", "hy2://")): return "HYSTERIA2"
     if u.startswith(("https://t.me/proxy?", "tg://proxy?")): return "MTPROTO"
     return ""
@@ -2499,7 +2498,7 @@ def validate_socks(url):
     """Validate SOCKS URL structure (simple)."""
     try:
         parsed = urlparse(url)
-        if parsed.scheme not in ['socks', 'socks5', 'socks4']:
+        if parsed.scheme != 'socks':
             return False, "not socks"
         if not parsed.hostname:
             return False, "missing host"
@@ -2588,7 +2587,7 @@ def is_telegram_proxy_url(url):
     u = html.unescape(str(url)).strip()
     if u.lower().startswith(("tg://proxy?", "https://t.me/proxy?")):
         return validate_telegram_proxy_url(u)[0]
-    if u.lower().startswith("socks5://"):
+    if u.lower().startswith("socks://"):
         return validate_telegram_proxy_url(u)[0]
     return False
 
@@ -2730,7 +2729,7 @@ def parse_config_url(url):
     if s.startswith("vless://"): return parse_vless(url)
     if s.startswith("trojan://"): return parse_trojan(url)
     if s.startswith(("ss://","ssr://")): return parse_ss(url)
-    if s.startswith(("socks://","socks5://","socks5h://")): return parse_socks(url)
+    if s.startswith("socks://"): return parse_socks(url)
     if s.startswith(("hy2://","hysteria://","hysteria2://")): return parse_hysteria(url)
     if s.startswith(("wg://","wireguard://", "https://t.me/proxy?", "tg://proxy?")): return parse_wireguard(url)
     return {"protocol":"","url":url,"name":"","valid":False,"metadata":{}}
@@ -8426,5 +8425,5 @@ def save_unique_post(text, count=0):
     finally:
         db.close()
 
-BOT_VERSION = "1.1.2-MANUAL-QUEUE-FIX"
+BOT_VERSION = "1.1.7-PROXY-ENGINE-MERGED-FINAL"
 
