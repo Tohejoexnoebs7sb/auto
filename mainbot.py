@@ -67,7 +67,7 @@ log = logging.getLogger("bot")
 TEHRAN_TZ = pytz.timezone('Asia/Tehran')
 
 # Professional semantic version for this build.
-BOT_VERSION = "2.1.2"
+BOT_VERSION = "2.2.0"
 
 
 
@@ -189,6 +189,9 @@ def get_tehran_date() -> str:
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 conn.execute("PRAGMA journal_mode=WAL")
 conn.execute("PRAGMA synchronous=NORMAL")
+conn.execute("PRAGMA wal_autocheckpoint=200")
+conn.execute("PRAGMA journal_size_limit=1048576")
+conn.execute("PRAGMA busy_timeout=10000")
 c = conn.cursor()
 
 # مستقل از ترتیب تعریف توابع، تمام عملیات DB از این helper استفاده می‌کنند.
@@ -196,6 +199,9 @@ def get_conn():
     db = sqlite3.connect(DB_PATH, check_same_thread=False)
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=NORMAL")
+    db.execute("PRAGMA wal_autocheckpoint=200")
+    db.execute("PRAGMA journal_size_limit=1048576")
+    db.execute("PRAGMA busy_timeout=10000")
     return db
 
 
@@ -601,6 +607,18 @@ c.execute("""CREATE TABLE IF NOT EXISTS profiles (
     proxy_banner_template TEXT DEFAULT '',
     ping_testing INTEGER DEFAULT 1
 )""")
+conn.commit()
+
+# Performance indexes and lightweight maintenance for long-running Railway workers.
+for _idx in [
+    "CREATE INDEX IF NOT EXISTS idx_seen_full_url ON seen(full_url)",
+    "CREATE INDEX IF NOT EXISTS idx_seen_last_posted ON seen(last_posted)",
+    "CREATE INDEX IF NOT EXISTS idx_proxy_seen_posted ON proxies_seen(last_posted)",
+]:
+    try:
+        c.execute(_idx)
+    except Exception:
+        log.exception("index creation failed")
 conn.commit()
 
 # Add new columns if missing
@@ -2283,6 +2301,21 @@ def validate_vless(url):
     except Exception:
         return False, "parse error"
 
+def normalize_vmess_url(url, name=""):
+    """Normalize VMess to standard JSON-base64 form. Name is stored only in ps."""
+    try:
+        raw = url.split("vmess://", 1)[1].strip()
+        raw = raw.split("#", 1)[0]
+        raw += "=" * (-len(raw) % 4)
+        obj = json.loads(base64.b64decode(raw).decode("utf-8", errors="ignore"))
+        if name:
+            obj["ps"] = str(name).strip()
+        payload = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode()
+        return "vmess://" + base64.b64encode(payload).decode()
+    except Exception as e:
+        log.warning(f"VMESS normalize failed: {e}")
+        return None
+
 def validate_vmess(url):
     """Validate VMESS URL structure (base64 encoded JSON)."""
     try:
@@ -2519,6 +2552,12 @@ def extract_links_from_text(text):
 
     def add_candidate(link):
         link = clean_config_url(link.strip())
+        if link.lower().startswith("vmess://"):
+            normalized = normalize_vmess_url(link)
+            if not normalized:
+                log.debug("Invalid VMESS skipped")
+                return
+            link = normalized
         # Remove only obvious sentence punctuation after a URI. Do not remove
         # ')' / ']' because those may be part of a Trojan fragment/name.
         link = re.sub(r'[.,;:!؟\'"`]+$', '', link)
@@ -7915,6 +7954,51 @@ async def export_backup(update, context, profile_id, backup_type, count=None):
         log.error(f"Backup export error: {e}")
         await update.message.reply_text(f"❌ خطا در بک‌آپ: {str(e)[:100]}")
 
+
+# ======================================================================
+# Worker stability layer (v2.2.1)
+# ======================================================================
+_WORKER_TASKS = {}
+_WORKER_HEARTBEATS = {}
+
+async def _worker_guard(name, coro_factory, restart_delay=5):
+    """Run long lived workers forever without allowing one exception to kill them."""
+    while True:
+        try:
+            _WORKER_HEARTBEATS[name] = time.time()
+            await coro_factory()
+        except asyncio.CancelledError:
+            log.info(f"[WATCHDOG] cancelled: {name}")
+            raise
+        except Exception:
+            log.exception(f"[WATCHDOG] worker crashed: {name}; restarting")
+            await asyncio.sleep(restart_delay)
+
+
+def start_worker(app, name, coro_factory):
+    if name in _WORKER_TASKS and not _WORKER_TASKS[name].done():
+        return _WORKER_TASKS[name]
+    task = app.create_task(_worker_guard(name, coro_factory))
+    _WORKER_TASKS[name] = task
+    log.info(f"[BOOT] Worker started: {name}")
+    return task
+
+async def worker_watchdog():
+    while True:
+        try:
+            now=time.time()
+            for name, task in list(_WORKER_TASKS.items()):
+                if task.done():
+                    log.warning(f"[WATCHDOG] dead worker detected: {name}")
+                elif now - _WORKER_HEARTBEATS.get(name, now) > 900:
+                    log.warning(f"[WATCHDOG] stale worker heartbeat: {name}")
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            log.exception("[WATCHDOG] monitor error")
+            await asyncio.sleep(60)
+
 # ======================================================================
 # راه‌اندازی
 # ======================================================================
@@ -7960,18 +8044,19 @@ async def post_init(app):
     c.execute("UPDATE manual_send_queue SET status='pending', updated_at=? WHERE status='running'", (get_tehran_time(),))
     conn.commit()
     # Persistent manual scheduler is always enabled independently from automatic scraping.
-    app.create_task(manual_queue_worker(app.bot))
+    start_worker(app, "manual_queue", lambda: manual_queue_worker(app.bot))
     log.info(f"⏱️ Manual queue scheduler enabled (BOT_VERSION={BOT_VERSION})")
 
     if ENABLE_AUTO:
         for prof in profiles:
             log.info(f"⏰ Creating config loop for profile {prof['id']} ({prof['dest_name']})")
-            app.create_task(profile_loop_config(app.bot, prof["id"]))
+            start_worker(app, f"config_{prof["id"]}", lambda pid=prof["id"]: profile_loop_config(app.bot, pid))
             log.info(f"⏰ Creating proxy loop for profile {prof['id']} ({prof['dest_name']})")
-            app.create_task(profile_loop_proxy(app.bot, prof["id"]))
+            start_worker(app, f"proxy_{prof["id"]}", lambda pid=prof["id"]: profile_loop_proxy(app.bot, pid))
         log.info("⏰ Scheduler started for all profiles (config and proxy loops)")
 
-    app.create_task(periodic_cleanup())
+    start_worker(app, "cleanup", lambda: periodic_cleanup())
+    start_worker(app, "watchdog", lambda: worker_watchdog())
     log.info("🧹 Periodic cleanup task started")
 
 
