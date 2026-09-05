@@ -67,7 +67,7 @@ log = logging.getLogger("bot")
 TEHRAN_TZ = pytz.timezone('Asia/Tehran')
 
 # Professional semantic version for this build.
-BOT_VERSION = "2.2.0"
+BOT_VERSION = "2.3.0"
 
 
 
@@ -912,6 +912,7 @@ c.execute("""CREATE TABLE IF NOT EXISTS manual_send_queue (
 )""")
 ensure_column("manual_send_queue", "last_error", "TEXT DEFAULT ''", "")
 ensure_column("manual_send_queue", "sent_count", "INTEGER DEFAULT 0", 0)
+ensure_column("manual_send_queue", "fail_count", "INTEGER DEFAULT 0", 0)
 c.execute("CREATE INDEX IF NOT EXISTS idx_manual_queue_due ON manual_send_queue(status, next_run_at)")
 c.execute("CREATE INDEX IF NOT EXISTS idx_manual_queue_profile ON manual_send_queue(profile_id, status)")
 conn.commit()
@@ -993,7 +994,7 @@ def update_manual_queue_job(job_id, profile_id, **changes):
     job = get_manual_queue_job(job_id, profile_id)
     if not job:
         return False
-    allowed = {"interval_minutes", "batch_size", "next_run_at", "status", "last_error", "items_json"}
+    allowed = {"interval_minutes", "batch_size", "next_run_at", "status", "last_error", "items_json", "sent_count", "fail_count"}
     clauses, params = [], []
     for k, v in changes.items():
         if k in allowed:
@@ -1044,7 +1045,23 @@ def _manual_queue_commit_batch(job_id, profile_id, sent_items, error=""):
     remaining = [x for x in remaining if x not in sent_set]
     sent_count = int(job.get("sent_count") or 0) + len(sent_items or [])
     if error and not sent_items:
-        update_manual_queue_job(job_id, profile_id, status="pending", last_error=str(error)[:500])
+        # Permanent failures must never create an infinite hot loop.
+        failures = int(job.get("fail_count") or 0) + 1
+        if failures >= 3:
+            update_manual_queue_job(
+                job_id, profile_id,
+                status="failed",
+                fail_count=failures,
+                last_error=str(error)[:500]
+            )
+        else:
+            update_manual_queue_job(
+                job_id, profile_id,
+                status="pending",
+                fail_count=failures,
+                last_error=str(error)[:500],
+                next_run_at=_queue_iso(_queue_now() + timedelta(seconds=60 * failures))
+            )
         return
     if not remaining:
         update_manual_queue_job(job_id, profile_id, items_json="[]", status="done",
@@ -1114,11 +1131,28 @@ async def _send_manual_queue_batch(bot, job):
     _manual_queue_commit_batch(job["id"], profile_id, selected, "")
     return len(selected)
 
+
+def sqlite_maintenance_cycle():
+    """Controlled SQLite maintenance; never destructive."""
+    try:
+        c.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        c.execute("DELETE FROM manual_send_queue WHERE status IN ('done','cancelled') AND updated_at < ?",
+                  (_queue_iso(_queue_now()-timedelta(days=14)),))
+        conn.commit()
+    except Exception:
+        log.exception("sqlite maintenance failed")
+
 async def manual_queue_worker(bot):
     """Persistent scheduler: wakes on the nearest due job, so edits take effect immediately."""
     log.info("⏱️ Persistent manual-send scheduler started")
+    log.info("[WATCHDOG] manual_queue heartbeat online")
+    last_heartbeat = time.time()
     while True:
         try:
+            # Recover jobs left locked by a crashed worker.
+            c.execute("UPDATE manual_send_queue SET status='pending', next_run_at=? WHERE status='running' AND updated_at<?", (_queue_iso(_queue_now()), _queue_iso(_queue_now()-timedelta(minutes=5))))
+            conn.commit()
+            last_heartbeat = time.time()
             rows = c.execute(
                 "SELECT id FROM manual_send_queue WHERE status='pending' ORDER BY next_run_at, id LIMIT 20"
             ).fetchall()
