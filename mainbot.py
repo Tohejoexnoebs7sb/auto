@@ -1,3 +1,4 @@
+# Professional build 0.1.2
 import os
 import re
 import asyncio
@@ -77,8 +78,6 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 # ======================================================================
 TEHRAN_TZ = pytz.timezone('Asia/Tehran')
 
-# Professional semantic version for this build.
-BOT_VERSION = "1.1.8-PROXY-ENGINE-MERGED-FINAL-FIXED"
 
 
 
@@ -140,6 +139,16 @@ def set_header_mode(profile_id, kind, mode):
 
 def header_mode_label(mode):
     return "نام کانال" if mode == "channel" else "پروتکل"
+
+
+def proxy_button_style(proxy_url):
+    """Telegram button color for proxy types."""
+    p = detect_proxy_protocol(proxy_url)
+    if p == "SOCKS":
+        return "success"
+    if p == "MTPROTO":
+        return "primary"
+    return "danger"
 
 
 def detect_proxy_protocol(proxy_url):
@@ -2746,10 +2755,13 @@ def parse_ss(url):
 
 def parse_socks(url):
     try:
-        p=urlparse(url)
-        return {"protocol":"SOCKS","url":url,"name":_link_name(url),
+        raw = str(url).strip()
+        # Telegram SOCKS links commonly contain a human name after #. Keep it as
+        # part of the display name and never let it break the actual URL parser.
+        p=urlparse(raw)
+        return {"protocol":"SOCKS","url":raw,"name":_link_name(raw),
                 "valid":bool(p.hostname and p.port),
-                "metadata":{"user":p.username,"password":p.password}}
+                "metadata":{"user":p.username or "","password":p.password or ""}}
     except Exception:
         return {"protocol":"SOCKS","url":url,"name":"","valid":False,"metadata":{}}
 
@@ -3836,12 +3848,15 @@ async def post_proxies(bot, profile_id, proxies_with_ping, is_instant=False, max
         style = ("primary", "success", "danger")[(i) % 3]
         # The button MUST reuse the exact flag already resolved for this proxy.
         # This keeps header country and glass-button country perfectly consistent.
-        button_flag = proxy_flag if (country_display != 0 and proxy_flag and proxy_flag != "🌐") else ""
-        button_label = f"Proxy {button_flag}".strip()
-        # Telegram URL buttons only support web/tg links. Proxy/VLESS/SOCKS
-        # configs are content, not clickable URLs. Putting them in url= makes
-        # Telegram reject the whole message and keeps the queue stuck.
-        proxy_buttons.append(InlineKeyboardButton(button_label, url=norm))
+        raw_lower = str(norm).lower()
+        if "cloudflare" in header.lower() or "cloudflare" in raw_lower:
+            button_label = "☁️ Proxy"
+        elif proxy_flag and proxy_flag not in ("🌐", ""):
+            button_label = f"Proxy {proxy_flag}"
+        else:
+            button_label = "🌐 Proxy"
+        # Keep URL buttons clickable for real proxy links.
+        proxy_buttons.append(InlineKeyboardButton(button_label, url=norm, style=style))
     rows = [proxy_buttons[i:i+3] for i in range(0, len(proxy_buttons), 3)]
     visible = "\n".join(header for _norm, header, _flag in entries)
     try:
@@ -5126,6 +5141,7 @@ def manual_queue_detail_kb(profile_id, job_id, items):
         btns.append([InlineKeyboardButton(f"🗑 حذف {i+1}: {label}", callback_data=f"mq_rm_{profile_id}_{job_id}_{i}", style="danger")])
     btns.append([InlineKeyboardButton("✏️ تغییر فاصله زمانی", callback_data=f"mq_edit_interval_{profile_id}_{job_id}", style="primary"),
                  InlineKeyboardButton("📦 تغییر تعداد در هر پست", callback_data=f"mq_edit_batch_{profile_id}_{job_id}", style="primary")])
+    btns.append([InlineKeyboardButton("➕ افزودن سرور به این صف", callback_data=f"mq_add_{profile_id}_{job_id}", style="success")])
     btns.append([InlineKeyboardButton("⏩ ارسال همین پست الان", callback_data=f"mq_force_{profile_id}_{job_id}", style="success")])
     btns.append([InlineKeyboardButton("⛔ لغو ارسال", callback_data=f"mq_cancel_{profile_id}_{job_id}", style="danger"),
                  InlineKeyboardButton("🗑 حذف کامل", callback_data=f"mq_delete_{profile_id}_{job_id}", style="danger")])
@@ -6808,6 +6824,17 @@ async def on_callback(u, ctx):
             await q.answer("🗑 صف حذف شد")
             await q.edit_message_text("📋 صف فعال", reply_markup=manual_queue_list_kb(profile_id)); return
 
+        if d.startswith("mq_add_"):
+            parts = d.split("_")
+            try:
+                profile_id = int(parts[2]); job_id = int(parts[3])
+            except (ValueError, IndexError):
+                await q.answer("⚠️ داده نامعتبر"); return
+            ctx.user_data["manual_queue_add"] = {"profile_id": profile_id, "job_id": job_id}
+            await q.answer("ارسال سرور جدید را بفرست")
+            await q.edit_message_text("➕ سرور جدید را به صورت متن یا فایل TXT ارسال کن.")
+            return
+
         if d.startswith("mq_force_"):
             parts=d.split("_")
             try: profile_id=int(parts[2]); job_id=int(parts[3])
@@ -7488,6 +7515,29 @@ async def on_text(u, ctx):
             "می‌توانی تنظیم دیگری را هم تغییر بدهی و بعد «ثبت» را بزن.",
             reply_markup=manual_schedule_kb_with_draft(profile_id, draft)
         )
+        return
+
+    add_state = ctx.user_data.get("manual_queue_add")
+    if add_state and (u.message.text or u.message.document):
+        items = []
+        try:
+            if u.message.document:
+                f = await u.message.document.get_file()
+                data = await f.download_as_bytearray()
+                text = data.decode("utf-8", errors="ignore")
+            else:
+                text = u.message.text or ""
+            for line in text.splitlines():
+                line=line.strip()
+                if detect_config_protocol(line) or detect_proxy_protocol(line):
+                    items.append(line)
+            if items:
+                add_manual_queue_items(add_state["job_id"], add_state["profile_id"], items)
+                await u.message.reply_text(f"✅ {len(items)} سرور به صف اضافه شد")
+            else:
+                await u.message.reply_text("❌ کانفیگ یا پروکسی پیدا نشد")
+        finally:
+            ctx.user_data.pop("manual_queue_add", None)
         return
 
     edit = ctx.user_data.get("manual_queue_edit")
@@ -8376,7 +8426,7 @@ async def post_init(app):
     conn.commit()
     # Persistent manual scheduler is always enabled independently from automatic scraping.
     start_worker(app, "manual_queue", lambda: manual_queue_worker(app.bot))
-    log.info(f"⏱️ Manual queue scheduler enabled (BOT_VERSION={BOT_VERSION})")
+    log.info("⏱️ Manual queue scheduler enabled")
 
     if ENABLE_AUTO:
         for prof in profiles:
@@ -8492,6 +8542,4 @@ def save_unique_post(text, count=0):
         db.commit()
     finally:
         db.close()
-
-BOT_VERSION = "1.1.8-PROXY-ENGINE-MERGED-FINAL-FIXED"
 
