@@ -972,7 +972,7 @@ def migrate_protocol_settings():
         PRIMARY KEY(profile_id, protocol_name))""")
     for prof in cur.execute("SELECT id FROM profiles").fetchall():
         for proto in PROXY_PROTOCOLS+CONFIG_PROTOCOLS:
-            cur.execute("INSERT OR IGNORE INTO profile_protocol_settings VALUES(?,?,?,?,?)",(prof[0],proto,1,get_tehran_time(),get_tehran_time()))
+            cur.execute("INSERT OR IGNORE INTO profile_protocol_settings (profile_id, protocol_name, enabled, created_at, updated_at) VALUES(?,?,?,?,?)",(prof[0],proto,1,get_tehran_time(),get_tehran_time()))
     db.commit(); db.close()
 
 def is_protocol_enabled(profile_id, protocol):
@@ -980,7 +980,7 @@ def is_protocol_enabled(profile_id, protocol):
     return True if not row else bool(row[0])
 
 def set_protocol_enabled(profile_id, protocol, enabled):
-    db=get_conn(); db.execute("INSERT INTO profile_protocol_settings VALUES(?,?,?,?,?) ON CONFLICT(profile_id,protocol_name) DO UPDATE SET enabled=excluded.enabled,updated_at=excluded.updated_at",(profile_id,protocol,int(enabled),get_tehran_time(),get_tehran_time())); db.commit(); db.close()
+    db=get_conn(); db.execute("INSERT INTO profile_protocol_settings (profile_id, protocol_name, enabled, created_at, updated_at) VALUES(?,?,?,?,?) ON CONFLICT(profile_id,protocol_name) DO UPDATE SET enabled=excluded.enabled,updated_at=excluded.updated_at",(profile_id,protocol,int(enabled),get_tehran_time(),get_tehran_time())); db.commit(); db.close()
 
 def _queue_now():
     return datetime.now(TEHRAN_TZ)
@@ -8232,8 +8232,17 @@ async def process_manual_text(u, message, profile_id, is_document=False, ctx=Non
         else:
             text = message.text or ""
 
+        # Include hidden Telegram URLs (buttons/entities) before parsing text.
+        extracted_message_links = extract_supported_links_from_message(message)
         config_links = extract_links_from_text(text)
         proxy_links = extract_proxy_links_from_text(text)
+        for _url in extracted_message_links:
+            if detect_config_protocol(_url):
+                config_links.append(_url)
+            elif detect_proxy_protocol(_url):
+                proxy_links.append(_url)
+        config_links = list(dict.fromkeys(config_links))
+        proxy_links = list(dict.fromkeys(proxy_links))
         if not config_links and not proxy_links:
             lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
             for line in lines:
