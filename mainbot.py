@@ -2741,7 +2741,7 @@ def extract_links_from_text(text):
         return []
     source = html.unescape(text)
     patterns = [
-        r'(?:vless|vmess|trojan|ss|ssr|socks|socks5|socks5h|hy2|hysteria|hysteria2|wg|wireguard)://[^\s<>"\']+'
+        r'(?:vless|vmess|trojan|ss|ssr|shadowsocks|socks|socks4|socks5|socks5h|hy2|hysteria|hysteria2|wg|wireguard)://[^\s<>"\']+'
     ]
     out=[]; seen=set()
     for pat in patterns:
@@ -2751,16 +2751,13 @@ def extract_links_from_text(text):
             # Never count MTProto proxies as VPN configs.
             if u.lower().startswith(('http://t.me/proxy?', 'https://t.me/proxy?')):
                 continue
-            key=hashlib.sha256(u.encode()).hexdigest()
-            if key not in seen:
-                seen.add(key); out.append(u)
-            continue
             item=parse_config_url(u)
             if item.get('valid'):
                 u=item.get('url',u)
                 key=hashlib.sha256(u.encode()).hexdigest()
                 if key not in seen:
-                    seen.add(key); out.append(u)
+                    seen.add(key)
+                    out.append(u)
     return out
 
 def validate_telegram_proxy_url(url):
@@ -3430,7 +3427,10 @@ async def send_to_destination(bot, profile_id, text, buttons=None):
     chunks = split_text(text, 4096)
     success = True
     for idx, chunk in enumerate(chunks):
-        reply_markup = InlineKeyboardMarkup(buttons) if buttons and idx == 0 else None
+        # Telegram proxy URLs must remain raw. Do not wrap them in inline buttons or
+        # HTML anchors; otherwise Telegram may open the bot/admin callback instead.
+        contains_tg_proxy = "t.me/proxy?" in chunk.lower() or "tg://proxy?" in chunk.lower()
+        reply_markup = None if contains_tg_proxy else (InlineKeyboardMarkup(buttons) if buttons and idx == 0 else None)
         ok = await send_with_retry(
             bot, dest, chunk,
             parse_mode="HTML",
