@@ -155,8 +155,6 @@ def detect_proxy_protocol(proxy_url):
     u = (proxy_url or "").strip().lower()
     if u.startswith(("tg://proxy?", "https://t.me/proxy?")):
         return "MTPROTO"
-    if u.startswith("socks://"):
-        return "SOCKS"
     return ""
 
 
@@ -960,7 +958,7 @@ conn.commit()
 # ======================================================================
 # Protocol control isolation v1.0
 # ======================================================================
-PROXY_PROTOCOLS = ("MTPROTO", "SOCKS5")
+PROXY_PROTOCOLS = ("MTPROTO",)
 CONFIG_PROTOCOLS = ("VLESS", "VMESS", "TROJAN", "SHADOWSOCKS", "SOCKS", "SOCKS4", "SOCKS5", "HYSTERIA", "HYSTERIA2", "HY2", "WIREGUARD", "WG")
 
 def migrate_protocol_settings():
@@ -1014,8 +1012,18 @@ def extract_supported_links_from_message(message):
                 text_parts.append(ent.url)
         except Exception:
             pass
+    # Extract URLs hidden behind inline keyboard buttons in forwarded posts
+    try:
+        markup = getattr(message, "reply_markup", None)
+        for row in getattr(markup, "inline_keyboard", []) or []:
+            for btn in row:
+                url = getattr(btn, "url", None)
+                if url:
+                    text_parts.append(url)
+    except Exception:
+        pass
     blob="\n".join(text_parts)
-    patterns=r"(?:vmess|vless|trojan|ss|shadowsocks|socks|tg|https://t\.me/proxy)[^\\s<>]+"
+    patterns=r"(?:vmess|vless|trojan|ss|shadowsocks|socks|hy2|hysteria2?|wireguard|wg|tg|https://t\.me/proxy)[^\s<>]+"
     for x in re.findall(patterns, blob, re.I):
         x=x.strip('.,);]')
         if detect_config_protocol(x) or detect_proxy_protocol(x):
