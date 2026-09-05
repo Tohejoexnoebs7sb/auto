@@ -51,15 +51,26 @@ os.makedirs(BACKUP_DIR, exist_ok=True)
 # ======================================================================
 # تنظیم لاگ
 # ======================================================================
+from logging.handlers import RotatingFileHandler
+
+_LOG_FILE = os.path.join(DATA_DIR, "bot.log")
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler(os.path.join(DATA_DIR, "bot.log"), mode='a', encoding='utf-8')
+        RotatingFileHandler(
+            _LOG_FILE,
+            mode='a',
+            maxBytes=2 * 1024 * 1024,
+            backupCount=3,
+            encoding='utf-8'
+        )
     ]
 )
 log = logging.getLogger("bot")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 
 # ======================================================================
 # منطقه زمانی تهران
@@ -67,7 +78,7 @@ log = logging.getLogger("bot")
 TEHRAN_TZ = pytz.timezone('Asia/Tehran')
 
 # Professional semantic version for this build.
-BOT_VERSION = "2.1.2"
+BOT_VERSION = "3.1.0"
 
 
 
@@ -134,9 +145,9 @@ def header_mode_label(mode):
 def detect_proxy_protocol(proxy_url):
     """Return ONLY the two supported Telegram proxy protocol labels."""
     u = (proxy_url or "").strip().lower()
-    if u.startswith(("tg://proxy?", "https://t.me/proxy?")):
-        return "MTPROTO"
-    if u.startswith("socks5://"):
+    if u.startswith(("tg://proxy?", "tg://socks?", "https://t.me/proxy?")):
+        return "MTPROTO" if "proxy?" in u else "SOCKS5"
+    if u.startswith(("socks://", "socks5://")):
         return "SOCKS5"
     return ""
 
@@ -189,6 +200,12 @@ def get_tehran_date() -> str:
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 conn.execute("PRAGMA journal_mode=WAL")
 conn.execute("PRAGMA synchronous=NORMAL")
+conn.execute("PRAGMA wal_autocheckpoint=200")
+conn.execute("PRAGMA journal_size_limit=1048576")
+conn.execute("PRAGMA busy_timeout=10000")
+conn.execute("PRAGMA temp_store=MEMORY")
+conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+conn.execute("PRAGMA cache_size=-20000")
 c = conn.cursor()
 
 # مستقل از ترتیب تعریف توابع، تمام عملیات DB از این helper استفاده می‌کنند.
@@ -196,6 +213,11 @@ def get_conn():
     db = sqlite3.connect(DB_PATH, check_same_thread=False)
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=NORMAL")
+    db.execute("PRAGMA wal_autocheckpoint=200")
+    db.execute("PRAGMA journal_size_limit=1048576")
+    db.execute("PRAGMA busy_timeout=10000")
+db.execute("PRAGMA temp_store=MEMORY")
+db.execute("PRAGMA cache_size=-20000")
     return db
 
 
@@ -603,6 +625,18 @@ c.execute("""CREATE TABLE IF NOT EXISTS profiles (
 )""")
 conn.commit()
 
+# Performance indexes and lightweight maintenance for long-running Railway workers.
+for _idx in [
+    "CREATE INDEX IF NOT EXISTS idx_seen_full_url ON seen(full_url)",
+    "CREATE INDEX IF NOT EXISTS idx_seen_last_posted ON seen(last_posted)",
+    "CREATE INDEX IF NOT EXISTS idx_proxy_seen_posted ON proxies_seen(last_posted)",
+]:
+    try:
+        c.execute(_idx)
+    except Exception:
+        log.exception("index creation failed")
+conn.commit()
+
 # Add new columns if missing
 ensure_column("profiles", "show_numbers", "INTEGER DEFAULT 1", 1)
 ensure_column("profiles", "custom_query", "TEXT DEFAULT ''", "")
@@ -894,6 +928,7 @@ c.execute("""CREATE TABLE IF NOT EXISTS manual_send_queue (
 )""")
 ensure_column("manual_send_queue", "last_error", "TEXT DEFAULT ''", "")
 ensure_column("manual_send_queue", "sent_count", "INTEGER DEFAULT 0", 0)
+ensure_column("manual_send_queue", "fail_count", "INTEGER DEFAULT 0", 0)
 c.execute("CREATE INDEX IF NOT EXISTS idx_manual_queue_due ON manual_send_queue(status, next_run_at)")
 c.execute("CREATE INDEX IF NOT EXISTS idx_manual_queue_profile ON manual_send_queue(profile_id, status)")
 conn.commit()
@@ -975,7 +1010,7 @@ def update_manual_queue_job(job_id, profile_id, **changes):
     job = get_manual_queue_job(job_id, profile_id)
     if not job:
         return False
-    allowed = {"interval_minutes", "batch_size", "next_run_at", "status", "last_error", "items_json"}
+    allowed = {"interval_minutes", "batch_size", "next_run_at", "status", "last_error", "items_json", "sent_count", "fail_count"}
     clauses, params = [], []
     for k, v in changes.items():
         if k in allowed:
@@ -1026,7 +1061,23 @@ def _manual_queue_commit_batch(job_id, profile_id, sent_items, error=""):
     remaining = [x for x in remaining if x not in sent_set]
     sent_count = int(job.get("sent_count") or 0) + len(sent_items or [])
     if error and not sent_items:
-        update_manual_queue_job(job_id, profile_id, status="pending", last_error=str(error)[:500])
+        # Permanent failures must never create an infinite hot loop.
+        failures = int(job.get("fail_count") or 0) + 1
+        if failures >= 3:
+            update_manual_queue_job(
+                job_id, profile_id,
+                status="failed",
+                fail_count=failures,
+                last_error=str(error)[:500]
+            )
+        else:
+            update_manual_queue_job(
+                job_id, profile_id,
+                status="pending",
+                fail_count=failures,
+                last_error=str(error)[:500],
+                next_run_at=_queue_iso(_queue_now() + timedelta(seconds=60 * failures))
+            )
         return
     if not remaining:
         update_manual_queue_job(job_id, profile_id, items_json="[]", status="done",
@@ -1096,11 +1147,32 @@ async def _send_manual_queue_batch(bot, job):
     _manual_queue_commit_batch(job["id"], profile_id, selected, "")
     return len(selected)
 
+
+def sqlite_maintenance_cycle():
+    """Controlled SQLite maintenance; never destructive."""
+    try:
+        c.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        c.execute("DELETE FROM manual_send_queue WHERE status IN ('done','cancelled') AND updated_at < ?",
+                  (_queue_iso(_queue_now()-timedelta(days=14)),))
+        # Keep history but remove oversized duplicates and stale scrape state.
+        c.execute("DELETE FROM processed_messages WHERE rowid NOT IN (SELECT MAX(rowid) FROM processed_messages GROUP BY source,message_id,profile_id)")
+        c.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        c.execute("PRAGMA incremental_vacuum(200)")
+        conn.commit()
+    except Exception:
+        log.exception("sqlite maintenance failed")
+
 async def manual_queue_worker(bot):
     """Persistent scheduler: wakes on the nearest due job, so edits take effect immediately."""
     log.info("⏱️ Persistent manual-send scheduler started")
+    log.info("[WATCHDOG] manual_queue heartbeat online")
+    last_heartbeat = time.time()
     while True:
         try:
+            # Recover jobs left locked by a crashed worker.
+            c.execute("UPDATE manual_send_queue SET status='pending', next_run_at=? WHERE status='running' AND updated_at<?", (_queue_iso(_queue_now()), _queue_iso(_queue_now()-timedelta(minutes=5))))
+            conn.commit()
+            last_heartbeat = time.time()
             rows = c.execute(
                 "SELECT id FROM manual_send_queue WHERE status='pending' ORDER BY next_run_at, id LIMIT 20"
             ).fetchall()
@@ -2283,6 +2355,21 @@ def validate_vless(url):
     except Exception:
         return False, "parse error"
 
+def normalize_vmess_url(url, name=""):
+    """Normalize VMess to standard JSON-base64 form. Name is stored only in ps."""
+    try:
+        raw = url.split("vmess://", 1)[1].strip()
+        raw = raw.split("#", 1)[0]
+        raw += "=" * (-len(raw) % 4)
+        obj = json.loads(base64.b64decode(raw).decode("utf-8", errors="ignore"))
+        if name:
+            obj["ps"] = str(name).strip()
+        payload = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode()
+        return "vmess://" + base64.b64encode(payload).decode()
+    except Exception as e:
+        log.warning(f"VMESS normalize failed: {e}")
+        return None
+
 def validate_vmess(url):
     """Validate VMESS URL structure (base64 encoded JSON)."""
     try:
@@ -2502,55 +2589,130 @@ def validate_config_link(url):
 # ======================================================================
 # استخراج لینک‌ها با اعتبارسنجی
 # ======================================================================
+
+# ========================= Collector v3 =========================
+SUPPORTED_SCHEMES = (
+    "vless", "vmess", "trojan", "ss", "ssr", "socks", "socks5",
+    "socks5h", "hy2", "hysteria", "hysteria2", "wg", "wireguard"
+)
+
+def _link_name(url):
+    try:
+        return unquote(urlparse(url).fragment or "").strip()
+    except Exception:
+        return ""
+
+def _decode_b64(s):
+    try:
+        s = s.strip().replace("-", "+").replace("_", "/")
+        return base64.b64decode(s + "=" * (-len(s) % 4))
+    except Exception:
+        return b""
+
+def parse_vmess(url):
+    try:
+        raw=url.split("vmess://",1)[1].split("#",1)[0]
+        obj=json.loads(_decode_b64(raw).decode("utf-8"))
+        if not obj.get("add") or not obj.get("port") or not obj.get("id"):
+            return {"protocol":"VMESS","url":url,"name":"","valid":False,"metadata":{}}
+        obj["ps"]=obj.get("ps") or _link_name(url)
+        payload=base64.b64encode(json.dumps(obj,ensure_ascii=False,separators=(",",":")).encode()).decode()
+        return {"protocol":"VMESS","url":"vmess://"+payload,"name":obj.get("ps",""),"valid":True,"metadata":obj}
+    except Exception:
+        return {"protocol":"VMESS","url":url,"name":"","valid":False,"metadata":{}}
+
+def parse_vless(url):
+    try:
+        p=urlparse(url)
+        return {"protocol":"VLESS","url":url,"name":_link_name(url),
+                "valid":bool(p.username and p.hostname and p.port),
+                "metadata":parse_qs(p.query)}
+    except Exception:
+        return {"protocol":"VLESS","url":url,"name":"","valid":False,"metadata":{}}
+
+def parse_trojan(url):
+    try:
+        p=urlparse(url)
+        return {"protocol":"TROJAN","url":url,"name":_link_name(url),
+                "valid":bool(p.username and p.hostname and p.port),
+                "metadata":parse_qs(p.query)}
+    except Exception:
+        return {"protocol":"TROJAN","url":url,"name":"","valid":False,"metadata":{}}
+
+def parse_ss(url):
+    try:
+        p=urlparse(url)
+        return {"protocol":"SHADOWSOCKS","url":url,"name":_link_name(url),
+                "valid":bool(p.hostname and p.port),"metadata":{}}
+    except Exception:
+        return {"protocol":"SHADOWSOCKS","url":url,"name":"","valid":False,"metadata":{}}
+
+def parse_socks(url):
+    try:
+        p=urlparse(url)
+        return {"protocol":"SOCKS","url":url,"name":_link_name(url),
+                "valid":bool(p.hostname and p.port),
+                "metadata":{"user":p.username,"password":p.password}}
+    except Exception:
+        return {"protocol":"SOCKS","url":url,"name":"","valid":False,"metadata":{}}
+
+def parse_hysteria(url):
+    try:
+        p=urlparse(url)
+        return {"protocol":"HYSTERIA","url":url,"name":_link_name(url),
+                "valid":bool(p.hostname and p.port),"metadata":parse_qs(p.query)}
+    except Exception:
+        return {"protocol":"HYSTERIA","url":url,"name":"","valid":False,"metadata":{}}
+
+def parse_wireguard(url):
+    try:
+        p=urlparse(url)
+        return {"protocol":"WIREGUARD","url":url,"name":_link_name(url),
+                "valid":bool(p.hostname),"metadata":parse_qs(p.query)}
+    except Exception:
+        return {"protocol":"WIREGUARD","url":url,"name":"","valid":False,"metadata":{}}
+
+def parse_telegram_proxy(url):
+    try:
+        p=urlparse(url)
+        q=parse_qs(p.query)
+        if p.scheme=="tg" and p.netloc=="proxy" or p.path.lower()=="/proxy":
+            ok=bool(q.get("server") and q.get("port") and q.get("secret"))
+            return {"protocol":"MTPROTO","url":url,"name":"","valid":ok,"metadata":q}
+        if p.scheme=="tg" and p.netloc=="socks":
+            ok=bool(q.get("server") and q.get("port"))
+            return {"protocol":"SOCKS5","url":url,"name":"","valid":ok,"metadata":q}
+    except Exception:
+        pass
+    return {"protocol":"TELEGRAM_PROXY","url":url,"name":"","valid":False,"metadata":{}}
+
+def parse_config_url(url):
+    s=url.lower()
+    if s.startswith("vmess://"): return parse_vmess(url)
+    if s.startswith("vless://"): return parse_vless(url)
+    if s.startswith("trojan://"): return parse_trojan(url)
+    if s.startswith(("ss://","ssr://")): return parse_ss(url)
+    if s.startswith(("socks://","socks5://","socks5h://")): return parse_socks(url)
+    if s.startswith(("hy2://","hysteria://","hysteria2://")): return parse_hysteria(url)
+    if s.startswith(("wg://","wireguard://")): return parse_wireguard(url)
+    return {"protocol":"","url":url,"name":"","valid":False,"metadata":{}}
+
 def extract_links_from_text(text):
-    """Extract ONLY supported configs, preserving source/message order."""
     if not text:
         return []
-    results = []
-    seen = set()
-    pattern = re.compile(
-        # Keep URI punctuation such as (), [], quotes and # inside the
-        # candidate. URL-encoded credentials and fragments may legally contain
-        # those characters. Whitespace/HTML delimiters are the reliable
-        # message-level boundaries.
-        r'(?:vless|vmess|trojan|wireguard|wg|shadowsocks|ss|socks5|socks4|socks|hysteria2|hy2)://[^\s<>]+',
-        re.IGNORECASE
-    )
-
-    def add_candidate(link):
-        link = clean_config_url(link.strip())
-        # Remove only obvious sentence punctuation after a URI. Do not remove
-        # ')' / ']' because those may be part of a Trojan fragment/name.
-        link = re.sub(r'[.,;:!؟\'"`]+$', '', link)
-        ok, reason = validate_config_link(link)
-        if ok:
-            ident = canonical_config_identity(link)
-            if ident not in seen:
-                seen.add(ident)
-                results.append(link)
-        else:
-            log.debug(f"Invalid/unsupported config skipped: {link[:120]} - {reason}")
-
+    pattern=re.compile(r'(?:'+"|".join(SUPPORTED_SCHEMES)+r')://[^\s<>]+',re.I)
+    out=[]; seen=set()
     for m in pattern.finditer(html.unescape(text)):
-        add_candidate(m.group(0))
-
-    # Preserve the existing base64 extraction capability, but apply the same strict whitelist.
-    if not results:
-        candidates = []
-        text_clean = text.replace('\n', '').replace('\r', '').strip()
-        if text_clean and re.fullmatch(r'[A-Za-z0-9+/=]+', text_clean):
-            candidates.append(text_clean)
-        candidates.extend(line.strip() for line in text.splitlines()
-                         if line.strip() and len(line.strip()) <= 2000 and re.fullmatch(r'[A-Za-z0-9+/=]+', line.strip()))
-        for encoded in candidates:
-            try:
-                decoded = base64.b64decode(encoded + '=' * (-len(encoded) % 4), validate=False).decode('utf-8', errors='ignore')
-                for m in pattern.finditer(decoded):
-                    add_candidate(m.group(0))
-            except Exception:
-                continue
-
-    return results
+        u=clean_config_url(m.group(0)).rstrip('.,;:!؟')
+        item=parse_config_url(u)
+        if item["valid"]:
+            u=item["url"]
+            if item["protocol"]=="VMESS":
+                u=item["url"]
+            h=hashlib.sha256(u.encode()).hexdigest()
+            if h not in seen:
+                seen.add(h); out.append(u)
+    return out
 
 def validate_telegram_proxy_url(url):
     """Strict Telegram proxy validation: MTProto or SOCKS5 only."""
@@ -2581,12 +2743,16 @@ def validate_telegram_proxy_url(url):
             if not (1 <= int(port_raw) <= 65535):
                 return False, "invalid port"
             return True, "MTPROTO"
-        if scheme == "socks5":
+        if scheme in ("socks", "socks5"):
             if not p.hostname:
                 return False, "missing host"
             if p.port is None or not (1 <= p.port <= 65535):
                 return False, "invalid port"
             return True, "SOCKS5"
+        if scheme == "tg" and p.netloc.lower() == "socks":
+            q = parse_qs(p.query, keep_blank_values=True)
+            if (q.get("server") or [""])[0] and (q.get("port") or [""])[0].isdigit():
+                return True, "SOCKS5"
     except Exception as e:
         return False, f"parse error: {e}"
     return False, "not a Telegram proxy"
@@ -2624,7 +2790,7 @@ def extract_proxy_links_from_text(text):
     patterns = [
         r'https?://t\.me/proxy\?[^\s<>"\']+',
         r'tg://proxy\?[^\s<>"\']+',
-        r'socks5://[^\s<>"\']+',
+        r'(?:socks://|socks5://|socks5h://)[^\s<>"\']+',
     ]
     for pattern in patterns:
         for m in re.finditer(pattern, source, re.IGNORECASE):
@@ -7915,6 +8081,52 @@ async def export_backup(update, context, profile_id, backup_type, count=None):
         log.error(f"Backup export error: {e}")
         await update.message.reply_text(f"❌ خطا در بک‌آپ: {str(e)[:100]}")
 
+
+# ======================================================================
+# Worker stability layer (v2.2.1)
+# ======================================================================
+_WORKER_TASKS = {}
+_WORKER_HEARTBEATS = {}
+
+async def _worker_guard(name, coro_factory, restart_delay=5):
+    """Run long lived workers forever without allowing one exception to kill them."""
+    while True:
+        try:
+            _WORKER_HEARTBEATS[name] = time.time()
+            await coro_factory()
+            _WORKER_HEARTBEATS[name] = time.time()
+        except asyncio.CancelledError:
+            log.info(f"[WATCHDOG] cancelled: {name}")
+            raise
+        except Exception:
+            log.exception(f"[WATCHDOG] worker crashed: {name}; restarting")
+            await asyncio.sleep(restart_delay)
+
+
+def start_worker(app, name, coro_factory):
+    if name in _WORKER_TASKS and not _WORKER_TASKS[name].done():
+        return _WORKER_TASKS[name]
+    task = app.create_task(_worker_guard(name, coro_factory))
+    _WORKER_TASKS[name] = task
+    log.info(f"[BOOT] Worker started: {name}")
+    return task
+
+async def worker_watchdog():
+    while True:
+        try:
+            now=time.time()
+            for name, task in list(_WORKER_TASKS.items()):
+                if task.done():
+                    log.warning(f"[WATCHDOG] dead worker detected: {name}")
+                elif now - _WORKER_HEARTBEATS.get(name, now) > 300:
+                    log.warning(f"[WATCHDOG] stale worker heartbeat: {name}")
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            log.exception("[WATCHDOG] monitor error")
+            await asyncio.sleep(60)
+
 # ======================================================================
 # راه‌اندازی
 # ======================================================================
@@ -7960,18 +8172,19 @@ async def post_init(app):
     c.execute("UPDATE manual_send_queue SET status='pending', updated_at=? WHERE status='running'", (get_tehran_time(),))
     conn.commit()
     # Persistent manual scheduler is always enabled independently from automatic scraping.
-    app.create_task(manual_queue_worker(app.bot))
+    start_worker(app, "manual_queue", lambda: manual_queue_worker(app.bot))
     log.info(f"⏱️ Manual queue scheduler enabled (BOT_VERSION={BOT_VERSION})")
 
     if ENABLE_AUTO:
         for prof in profiles:
             log.info(f"⏰ Creating config loop for profile {prof['id']} ({prof['dest_name']})")
-            app.create_task(profile_loop_config(app.bot, prof["id"]))
+            start_worker(app, f"config_{prof["id"]}", lambda pid=prof["id"]: profile_loop_config(app.bot, pid))
             log.info(f"⏰ Creating proxy loop for profile {prof['id']} ({prof['dest_name']})")
-            app.create_task(profile_loop_proxy(app.bot, prof["id"]))
+            start_worker(app, f"proxy_{prof["id"]}", lambda pid=prof["id"]: profile_loop_proxy(app.bot, pid))
         log.info("⏰ Scheduler started for all profiles (config and proxy loops)")
 
-    app.create_task(periodic_cleanup())
+    start_worker(app, "cleanup", lambda: periodic_cleanup())
+    start_worker(app, "watchdog", lambda: worker_watchdog())
     log.info("🧹 Periodic cleanup task started")
 
 
