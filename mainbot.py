@@ -949,10 +949,15 @@ def create_manual_queue_job(profile_id, kind, items, interval_minutes=0, batch_s
     if not items:
         return None
     kind = str(kind).lower().strip()
-    # Config URLs are content, even when the protocol is socks://.
-    # Never classify published configs as Telegram/proxy jobs.
-    config_prefixes = ("vless://", "vmess://", "trojan://", "ss://", "ssr://", "socks://", "socks5://", "hy2://", "hysteria://", "hysteria2://", "wg://", "wireguard://", "https://t.me/proxy?", "tg://proxy?")
-    if any(str(x).strip().lower().startswith(config_prefixes) for x in items):
+    # Correct classification: Telegram proxy links are NOT configs.
+    # Previous logic forced https://t.me/proxy and tg://proxy into config jobs,
+    # which caused manual MTPROTO sends to go through post_configs().
+    proxy_prefixes = ("https://t.me/proxy?", "tg://proxy?", "socks://", "socks5://")
+    config_prefixes = ("vless://", "vmess://", "trojan://", "ss://", "ssr://", "hy2://", "hysteria://", "hysteria2://", "wg://", "wireguard://")
+    lowered = [str(x).strip().lower() for x in items]
+    if lowered and all(x.startswith(proxy_prefixes) for x in lowered):
+        kind = "proxy"
+    elif any(x.startswith(config_prefixes) for x in lowered):
         kind = "config"
     if kind not in ("config", "proxy"):
         raise ValueError("invalid queue kind")
@@ -1153,8 +1158,12 @@ def sqlite_maintenance_cycle():
     """Controlled SQLite maintenance. Prevent WAL/queue/log database growth."""
     try:
         c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        c.execute("DELETE FROM manual_send_queue WHERE status IN ('done','cancelled') AND updated_at < ?",
+        c.execute("DELETE FROM manual_send_queue WHERE status IN ('done','cancelled','failed') AND updated_at < ?",
                   (_queue_iso(_queue_now()-timedelta(days=3)),))
+        # Keep historical tables bounded. These tables are state tables, not logs.
+        c.execute("DELETE FROM processed_messages WHERE rowid NOT IN (SELECT rowid FROM processed_messages ORDER BY rowid DESC LIMIT 50000)")
+        c.execute("DELETE FROM country_cache WHERE rowid NOT IN (SELECT rowid FROM country_cache ORDER BY rowid DESC LIMIT 10000)")
+        c.execute("PRAGMA optimize")
         conn.commit()
         # Only compact when SQLite has a large amount of free pages.
         free_pages = c.execute("PRAGMA freelist_count").fetchone()[0]
