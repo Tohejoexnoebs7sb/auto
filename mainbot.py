@@ -1037,22 +1037,43 @@ def extract_supported_links_from_message(message):
             if getattr(obj, "caption", None): parts.append(obj.caption)
 
     blob="\n".join(str(x) for x in parts)
-    pattern=r"(?:vmess|vless|trojan|ss|shadowsocks|socks|hy2|hysteria2?|wireguard|wg)://[^\s<>"']+|(?:tg://proxy\?[^\s<>"']+|https://t\.me/proxy\?[^\s<>"']+)"
+    pattern=r'''(?:vmess|vless|trojan|ss|shadowsocks|socks|hy2|hysteria2?|wireguard|wg)://[^\s<>"']+|(?:tg://proxy\?[^\s<>"']+|https://t\.me/proxy\?[^\s<>"']+)'''
     for item in re.findall(pattern, blob, re.I):
         item=item.strip(".,);]}")
         if detect_config_protocol(item) or detect_proxy_protocol(item):
             found.append(item)
     return list(dict.fromkeys(found))
 
+def filter_enabled_protocols(profile_id, items):
+    """Remove disabled protocols before manual/automatic processing."""
+    result=[]
+    for item in items or []:
+        proto = detect_proxy_protocol(item) or detect_config_protocol(item)
+        if proto and is_protocol_enabled(profile_id, proto):
+            result.append(item)
+    return list(dict.fromkeys(result))
+
+
 def create_manual_queue_job(profile_id, kind, items, interval_minutes=0, batch_size=1, first_delay_minutes=0):
     items = [str(x).strip() for x in (items or []) if str(x).strip()]
+    items = filter_enabled_protocols(profile_id, items)
     if not items:
         return None
     kind = str(kind).lower().strip()
     detected=[]
+    allowed_items=[]
     for item in items:
+        proto = detect_proxy_protocol(item) or detect_config_protocol(item)
+        if not proto:
+            continue
+        if not is_protocol_enabled(profile_id, proto):
+            continue
+        allowed_items.append(item)
         if detect_proxy_protocol(item): detected.append("proxy")
         elif detect_config_protocol(item): detected.append("config")
+    items = allowed_items
+    if not items:
+        raise ValueError("all protocols disabled for this profile")
     if detected and all(x=="proxy" for x in detected):
         kind="proxy"
     elif detected and all(x=="config" for x in detected):
@@ -1225,6 +1246,8 @@ async def _send_manual_queue_batch(bot, job):
     profile_id = int(job["profile_id"])
     kind = job["kind"]
     batch = _manual_queue_take_batch(job)
+    # Hard protocol gate: queued items are rechecked at send time too.
+    batch = filter_enabled_protocols(profile_id, batch)
     if not batch:
         delete_manual_queue_job(job["id"], profile_id)
         return 0
