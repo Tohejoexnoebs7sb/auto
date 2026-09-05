@@ -8208,28 +8208,51 @@ if __name__ == "__main__":
 # - sqlite size control
 # ======================================================================
 
-DB_OPTIMIZER_VERSION = "3.2.0"
+DB_OPTIMIZER_VERSION = "3.2.1"
 
 def optimize_database():
+    """Low disk SQLite maintenance. Never runs huge vacuum/write operations."""
+    db = None
     try:
         db = get_conn()
         cur = db.cursor()
-        cur.execute("PRAGMA auto_vacuum=INCREMENTAL")
-        cur.execute("PRAGMA journal_size_limit=524288")
+
+        # keep WAL and temporary files small
+        cur.execute("PRAGMA journal_size_limit=262144")
+        cur.execute("PRAGMA wal_autocheckpoint=50")
+        cur.execute("PRAGMA temp_store=MEMORY")
+
+        # indexes
         cur.execute("CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_processed_created ON processed_messages(message_id)")
-        # remove duplicate old posts and messages after 48 hours
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_processed_message ON processed_messages(source,message_id,profile_id)")
+
         cutoff = (datetime.now() - timedelta(hours=48)).isoformat()
+        # delete old duplicate trackers, not actual configs
         cur.execute("DELETE FROM posts WHERE created_at < ?", (cutoff,))
-        cur.execute("DELETE FROM seen WHERE last_posted < ?", (cutoff,))
-        cur.execute("DELETE FROM proxies_seen WHERE last_posted < ?", (cutoff,))
-        cur.execute("DELETE FROM processed_messages WHERE message_id < 0")
-        cur.execute("PRAGMA incremental_vacuum")
+        cur.execute("DELETE FROM seen WHERE last_posted IS NOT NULL AND last_posted < ?", (cutoff,))
+        cur.execute("DELETE FROM proxies_seen WHERE last_posted IS NOT NULL AND last_posted < ?", (cutoff,))
+        cur.execute("DELETE FROM processed_messages WHERE rowid NOT IN (SELECT MIN(rowid) FROM processed_messages GROUP BY source,message_id,profile_id)")
+
         db.commit()
-        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        db.close()
-    except Exception:
-        log.exception("database optimizer failed")
+
+        # checkpoint after commit
+        try:
+            cur.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            pass
+
+        # small incremental reclaim only
+        try:
+            cur.execute("PRAGMA incremental_vacuum(100)")
+        except Exception:
+            pass
+
+        db.commit()
+    except Exception as e:
+        log.error(f"database optimizer failed: {e}")
+    finally:
+        if db:
+            db.close()
 
 def post_fingerprint(text):
     return hashlib.sha256((text or "").encode("utf-8", errors="ignore")).hexdigest()
