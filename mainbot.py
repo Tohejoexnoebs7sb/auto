@@ -999,35 +999,50 @@ def _queue_parse_time(value):
 
 
 def extract_supported_links_from_message(message):
-    """Extract visible and hidden telegram entity URLs from forwarded/manual posts."""
+    """Extract configs/proxies from text, entities and inline buttons."""
     found=[]
-    text_parts=[]
-    if getattr(message, "text", None):
-        text_parts.append(message.text)
-    if getattr(message, "caption", None):
-        text_parts.append(message.caption)
+    parts=[]
+
+    for attr in ("text", "caption"):
+        value=getattr(message, attr, None)
+        if value:
+            parts.append(value)
+
     for ent in list(getattr(message, "entities", None) or []) + list(getattr(message, "caption_entities", None) or []):
         try:
-            if getattr(ent, "type", "") == "text_link" and getattr(ent, "url", None):
-                text_parts.append(ent.url)
+            if getattr(ent, "url", None):
+                parts.append(ent.url)
         except Exception:
             pass
-    # Extract URLs hidden behind inline keyboard buttons in forwarded posts
-    try:
-        markup = getattr(message, "reply_markup", None)
-        for row in getattr(markup, "inline_keyboard", []) or []:
-            for btn in row:
-                url = getattr(btn, "url", None)
-                if url:
-                    text_parts.append(url)
-    except Exception:
-        pass
-    blob="\n".join(text_parts)
-    patterns=r"(?:vmess|vless|trojan|ss|shadowsocks|socks|hy2|hysteria2?|wireguard|wg|tg|https://t\.me/proxy)[^\s<>]+"
-    for x in re.findall(patterns, blob, re.I):
-        x=x.strip('.,);]')
-        if detect_config_protocol(x) or detect_proxy_protocol(x):
-            found.append(x)
+
+    def collect_buttons(markup):
+        try:
+            for row in getattr(markup, "inline_keyboard", []) or []:
+                for btn in row:
+                    if getattr(btn, "url", None):
+                        parts.append(btn.url)
+        except Exception:
+            pass
+
+    collect_buttons(getattr(message, "reply_markup", None))
+
+    # Some Telegram clients expose forwarded message markup separately
+    for attr in ("forward_origin", "forward_from_message", "forwarded_message"):
+        obj=getattr(message, attr, None)
+        if obj:
+            collect_buttons(getattr(obj, "reply_markup", None))
+            for ent in list(getattr(obj, "entities", None) or []) + list(getattr(obj, "caption_entities", None) or []):
+                if getattr(ent, "url", None):
+                    parts.append(ent.url)
+            if getattr(obj, "text", None): parts.append(obj.text)
+            if getattr(obj, "caption", None): parts.append(obj.caption)
+
+    blob="\n".join(str(x) for x in parts)
+    pattern=r"(?:vmess|vless|trojan|ss|shadowsocks|socks|hy2|hysteria2?|wireguard|wg|tg://proxy|https://t\.me/proxy)[^\s<>\"']+"
+    for item in re.findall(pattern, blob, re.I):
+        item=item.strip(".,);]}")
+        if detect_config_protocol(item) or detect_proxy_protocol(item):
+            found.append(item)
     return list(dict.fromkeys(found))
 
 def create_manual_queue_job(profile_id, kind, items, interval_minutes=0, batch_size=1, first_delay_minutes=0):
@@ -4919,6 +4934,24 @@ def profiles_kb():
     btns.append([InlineKeyboardButton(msg("btn_back"), callback_data="back_home", style="primary")])
     return InlineKeyboardMarkup(btns)
 
+
+
+def protocol_settings_kb(profile_id):
+    rows=[]
+    rows.append([InlineKeyboardButton("📡 پروتکل‌های کانفیگ", callback_data=f"proto_cfg_{profile_id}", style="primary")])
+    rows.append([InlineKeyboardButton("🌐 پروتکل‌های پروکسی", callback_data=f"proto_prx_{profile_id}", style="primary")])
+    rows.append([InlineKeyboardButton("↩️ بازگشت", callback_data=f"prof_{profile_id}", style="primary")])
+    return InlineKeyboardMarkup(rows)
+
+def protocol_toggle_kb(profile_id, kind):
+    protos = CONFIG_PROTOCOLS if kind == "cfg" else PROXY_PROTOCOLS
+    rows=[]
+    for proto in protos:
+        enabled=is_protocol_enabled(profile_id, proto)
+        rows.append([InlineKeyboardButton(f"{'✅' if enabled else '❌'} {proto}", callback_data=f"proto_toggle_{profile_id}_{kind}_{proto}", style="success" if enabled else "danger")])
+    rows.append([InlineKeyboardButton("↩️ بازگشت", callback_data=f"proto_menu_{profile_id}", style="primary")])
+    return InlineKeyboardMarkup(rows)
+
 def profile_admin_kb(profile_id):
     prof = get_profile(profile_id)
     if not prof:
@@ -4964,6 +4997,7 @@ def profile_admin_kb(profile_id):
          InlineKeyboardButton(msg("btn_dest_list"), callback_data=f"dl_{profile_id}", style="primary")],
         [InlineKeyboardButton(f"📢 اسپانسر: {sponsor_status}", callback_data=f"sponsor_list_{profile_id}", style="primary"),
          InlineKeyboardButton(msg("btn_set_name"), callback_data=f"ac_{profile_id}", style="primary")],
+        [InlineKeyboardButton("⚙️ مدیریت پروتکل‌ها", callback_data=f"proto_menu_{profile_id}", style="primary")],
         [InlineKeyboardButton(msg("btn_set_banner_config"), callback_data=f"ab_config_{profile_id}", style="primary"),
          InlineKeyboardButton(msg("btn_set_banner_proxy"), callback_data=f"ab_proxy_{profile_id}", style="primary")],
         [InlineKeyboardButton("⏰ بازه کانفیگ", callback_data=f"set_cfg_interval_{profile_id}", style="primary"),
@@ -5575,6 +5609,35 @@ async def on_callback(u, ctx):
                 await show_profile_admin(q.message, profile_id)
             else:
                 await q.answer("⚠️ خطا در داده")
+            return
+
+        if d.startswith("proto_menu_"):
+            try:
+                profile_id=int(d.split("_")[-1])
+            except:
+                return
+            await q.edit_message_text("⚙️ مدیریت پروتکل‌ها", reply_markup=protocol_settings_kb(profile_id))
+            return
+
+        if d.startswith("proto_cfg_") or d.startswith("proto_prx_"):
+            try:
+                profile_id=int(d.split("_")[-1])
+            except:
+                return
+            kind="cfg" if d.startswith("proto_cfg_") else "prx"
+            title="کانفیگ" if kind=="cfg" else "پروکسی"
+            await q.edit_message_text(f"{'📡' if kind=='cfg' else '🌐'} پروتکل‌های {title}", reply_markup=protocol_toggle_kb(profile_id, kind))
+            return
+
+        if d.startswith("proto_toggle_"):
+            parts=d.split("_")
+            try:
+                profile_id=int(parts[2]); kind=parts[3]; proto="_".join(parts[4:])
+            except:
+                return
+            current=is_protocol_enabled(profile_id, proto)
+            set_protocol_enabled(profile_id, proto, not current)
+            await q.edit_message_text("⚙️ مدیریت پروتکل‌ها", reply_markup=protocol_settings_kb(profile_id))
             return
 
         # ===================== INDEPENDENT HEADER DISPLAY MODES =====================
