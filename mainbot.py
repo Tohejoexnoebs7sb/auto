@@ -903,6 +903,88 @@ def migrate_old_config():
 migrate_old_config()
 # Header display modes are per-profile and migrated safely after profiles exists.
 migrate_header_modes()
+def migrate_protocol_settings():
+    """
+    Safe migration for profile protocol settings.
+    Does not delete existing data.
+    """
+
+    db = None
+
+    try:
+        db = get_conn()
+        cur = db.cursor()
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS profile_protocol_settings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id INTEGER NOT NULL,
+                protocol_name TEXT NOT NULL,
+                enabled INTEGER DEFAULT 1,
+                created_at TEXT,
+                updated_at TEXT,
+                UNIQUE(profile_id, protocol_name)
+            )
+        """)
+
+        protocols = [
+            "MTPROTO",
+            "SOCKS5",
+            "VLESS",
+            "VMESS",
+            "TROJAN",
+            "SHADOWSOCKS",
+            "SOCKS",
+            "SOCKS4",
+            "HYSTERIA",
+            "HYSTERIA2",
+            "HY2",
+            "WIREGUARD",
+            "WG"
+        ]
+
+        profiles = cur.execute(
+            "SELECT id FROM profiles"
+        ).fetchall()
+
+        now = datetime.now(TEHRAN_TZ).isoformat()
+
+        for profile in profiles:
+            profile_id = profile["id"]
+
+            for protocol in protocols:
+                cur.execute("""
+                    INSERT OR IGNORE INTO profile_protocol_settings
+                    (
+                        profile_id,
+                        protocol_name,
+                        enabled,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (?,?,?,?,?)
+                """, (
+                    profile_id,
+                    protocol,
+                    1,
+                    now,
+                    now
+                ))
+
+        db.commit()
+
+        log.info(
+            "✅ protocol settings migration completed"
+        )
+
+    except Exception:
+        log.exception(
+            "❌ protocol migration failed"
+        )
+
+    finally:
+        if db:
+            db.close()
 migrate_protocol_settings()
 
 # ======================================================================
