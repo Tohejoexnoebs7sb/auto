@@ -78,7 +78,7 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 TEHRAN_TZ = pytz.timezone('Asia/Tehran')
 
 # Professional semantic version for this build.
-BOT_VERSION = "2.4.0"
+BOT_VERSION = "2.5.0"
 
 
 
@@ -145,9 +145,9 @@ def header_mode_label(mode):
 def detect_proxy_protocol(proxy_url):
     """Return ONLY the two supported Telegram proxy protocol labels."""
     u = (proxy_url or "").strip().lower()
-    if u.startswith(("tg://proxy?", "https://t.me/proxy?")):
-        return "MTPROTO"
-    if u.startswith("socks5://"):
+    if u.startswith(("tg://proxy?", "tg://socks?", "https://t.me/proxy?")):
+        return "MTPROTO" if "proxy?" in u else "SOCKS5"
+    if u.startswith(("socks://", "socks5://")):
         return "SOCKS5"
     return ""
 
@@ -2665,12 +2665,16 @@ def validate_telegram_proxy_url(url):
             if not (1 <= int(port_raw) <= 65535):
                 return False, "invalid port"
             return True, "MTPROTO"
-        if scheme == "socks5":
+        if scheme in ("socks", "socks5"):
             if not p.hostname:
                 return False, "missing host"
             if p.port is None or not (1 <= p.port <= 65535):
                 return False, "invalid port"
             return True, "SOCKS5"
+        if scheme == "tg" and p.netloc.lower() == "socks":
+            q = parse_qs(p.query, keep_blank_values=True)
+            if (q.get("server") or [""])[0] and (q.get("port") or [""])[0].isdigit():
+                return True, "SOCKS5"
     except Exception as e:
         return False, f"parse error: {e}"
     return False, "not a Telegram proxy"
