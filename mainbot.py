@@ -145,10 +145,10 @@ def header_mode_label(mode):
 def detect_proxy_protocol(proxy_url):
     """Return ONLY the two supported Telegram proxy protocol labels."""
     u = (proxy_url or "").strip().lower()
-    if u.startswith(("tg://proxy?", "tg://socks?", "https://t.me/proxy?")):
-        return "MTPROTO" if "proxy?" in u else "SOCKS5"
-    if u.startswith(("socks://", "socks5://")):
-        return "SOCKS5"
+    if u.startswith(("tg://proxy?", "https://t.me/proxy?")):
+        return "MTPROTO"
+    if u.startswith("socks://"):
+        return "SOCKS"
     return ""
 
 
@@ -193,6 +193,25 @@ def get_tehran_time() -> str:
 
 def get_tehran_date() -> str:
     return datetime.now(TEHRAN_TZ).strftime('%Y-%m-%d')
+
+
+def normalize_datetime_value(value):
+    """Convert mixed naive/aware datetimes safely before comparison."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z"):
+            try:
+                value = datetime.strptime(value, fmt)
+                break
+            except Exception:
+                pass
+        else:
+            return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=TEHRAN_TZ)
+    return value.astimezone(TEHRAN_TZ)
+
 
 # ======================================================================
 # اتصال به دیتابیس
@@ -3775,7 +3794,7 @@ async def post_proxies(bot, profile_id, proxies_with_ping, is_instant=False, max
         # Telegram URL buttons only support web/tg links. Proxy/VLESS/SOCKS
         # configs are content, not clickable URLs. Putting them in url= makes
         # Telegram reject the whole message and keeps the queue stuck.
-        proxy_buttons.append(InlineKeyboardButton(button_label, callback_data=f"copy_proxy_{i}"))
+        proxy_buttons.append(InlineKeyboardButton(button_label, url=_norm))
     rows = [proxy_buttons[i:i+3] for i in range(0, len(proxy_buttons), 3)]
     visible = "\n".join(header for _norm, header, _flag in entries)
     try:
@@ -4333,7 +4352,7 @@ async def get_logs(update, context, profile_id, log_type="full", time_range_minu
             continue
         ts_str = match.group(1)
         try:
-            ts = datetime.strptime(ts_str, '%Y-%m-%d %H:%M:%S')
+            ts = normalize_datetime_value(ts_str)
         except:
             continue
         if ts < start_cutoff or ts < cutoff_utc:
@@ -4417,7 +4436,7 @@ async def periodic_cleanup():
                         if match:
                             ts_str = match.group(1)
                             try:
-                                ts = datetime.strptime(ts_str, '%Y-%m-%d %H:%M:%S')
+                                ts = normalize_datetime_value(ts_str)
                                 if ts >= cutoff_utc:
                                     lines_to_keep.append(line)
                             except:
