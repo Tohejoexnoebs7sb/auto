@@ -78,7 +78,7 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 TEHRAN_TZ = pytz.timezone('Asia/Tehran')
 
 # Professional semantic version for this build.
-BOT_VERSION = "2.5.0"
+BOT_VERSION = "3.0.0"
 
 
 
@@ -2580,61 +2580,130 @@ def validate_config_link(url):
 # ======================================================================
 # استخراج لینک‌ها با اعتبارسنجی
 # ======================================================================
+
+# ========================= Collector v3 =========================
+SUPPORTED_SCHEMES = (
+    "vless", "vmess", "trojan", "ss", "ssr", "socks", "socks5",
+    "socks5h", "hy2", "hysteria", "hysteria2", "wg", "wireguard"
+)
+
+def _link_name(url):
+    try:
+        return unquote(urlparse(url).fragment or "").strip()
+    except Exception:
+        return ""
+
+def _decode_b64(s):
+    try:
+        s = s.strip().replace("-", "+").replace("_", "/")
+        return base64.b64decode(s + "=" * (-len(s) % 4))
+    except Exception:
+        return b""
+
+def parse_vmess(url):
+    try:
+        raw=url.split("vmess://",1)[1].split("#",1)[0]
+        obj=json.loads(_decode_b64(raw).decode("utf-8"))
+        if not obj.get("add") or not obj.get("port") or not obj.get("id"):
+            return {"protocol":"VMESS","url":url,"name":"","valid":False,"metadata":{}}
+        obj["ps"]=obj.get("ps") or _link_name(url)
+        payload=base64.b64encode(json.dumps(obj,ensure_ascii=False,separators=(",",":")).encode()).decode()
+        return {"protocol":"VMESS","url":"vmess://"+payload,"name":obj.get("ps",""),"valid":True,"metadata":obj}
+    except Exception:
+        return {"protocol":"VMESS","url":url,"name":"","valid":False,"metadata":{}}
+
+def parse_vless(url):
+    try:
+        p=urlparse(url)
+        return {"protocol":"VLESS","url":url,"name":_link_name(url),
+                "valid":bool(p.username and p.hostname and p.port),
+                "metadata":parse_qs(p.query)}
+    except Exception:
+        return {"protocol":"VLESS","url":url,"name":"","valid":False,"metadata":{}}
+
+def parse_trojan(url):
+    try:
+        p=urlparse(url)
+        return {"protocol":"TROJAN","url":url,"name":_link_name(url),
+                "valid":bool(p.username and p.hostname and p.port),
+                "metadata":parse_qs(p.query)}
+    except Exception:
+        return {"protocol":"TROJAN","url":url,"name":"","valid":False,"metadata":{}}
+
+def parse_ss(url):
+    try:
+        p=urlparse(url)
+        return {"protocol":"SHADOWSOCKS","url":url,"name":_link_name(url),
+                "valid":bool(p.hostname and p.port),"metadata":{}}
+    except Exception:
+        return {"protocol":"SHADOWSOCKS","url":url,"name":"","valid":False,"metadata":{}}
+
+def parse_socks(url):
+    try:
+        p=urlparse(url)
+        return {"protocol":"SOCKS","url":url,"name":_link_name(url),
+                "valid":bool(p.hostname and p.port),
+                "metadata":{"user":p.username,"password":p.password}}
+    except Exception:
+        return {"protocol":"SOCKS","url":url,"name":"","valid":False,"metadata":{}}
+
+def parse_hysteria(url):
+    try:
+        p=urlparse(url)
+        return {"protocol":"HYSTERIA","url":url,"name":_link_name(url),
+                "valid":bool(p.hostname and p.port),"metadata":parse_qs(p.query)}
+    except Exception:
+        return {"protocol":"HYSTERIA","url":url,"name":"","valid":False,"metadata":{}}
+
+def parse_wireguard(url):
+    try:
+        p=urlparse(url)
+        return {"protocol":"WIREGUARD","url":url,"name":_link_name(url),
+                "valid":bool(p.hostname),"metadata":parse_qs(p.query)}
+    except Exception:
+        return {"protocol":"WIREGUARD","url":url,"name":"","valid":False,"metadata":{}}
+
+def parse_telegram_proxy(url):
+    try:
+        p=urlparse(url)
+        q=parse_qs(p.query)
+        if p.scheme=="tg" and p.netloc=="proxy" or p.path.lower()=="/proxy":
+            ok=bool(q.get("server") and q.get("port") and q.get("secret"))
+            return {"protocol":"MTPROTO","url":url,"name":"","valid":ok,"metadata":q}
+        if p.scheme=="tg" and p.netloc=="socks":
+            ok=bool(q.get("server") and q.get("port"))
+            return {"protocol":"SOCKS5","url":url,"name":"","valid":ok,"metadata":q}
+    except Exception:
+        pass
+    return {"protocol":"TELEGRAM_PROXY","url":url,"name":"","valid":False,"metadata":{}}
+
+def parse_config_url(url):
+    s=url.lower()
+    if s.startswith("vmess://"): return parse_vmess(url)
+    if s.startswith("vless://"): return parse_vless(url)
+    if s.startswith("trojan://"): return parse_trojan(url)
+    if s.startswith(("ss://","ssr://")): return parse_ss(url)
+    if s.startswith(("socks://","socks5://","socks5h://")): return parse_socks(url)
+    if s.startswith(("hy2://","hysteria://","hysteria2://")): return parse_hysteria(url)
+    if s.startswith(("wg://","wireguard://")): return parse_wireguard(url)
+    return {"protocol":"","url":url,"name":"","valid":False,"metadata":{}}
+
 def extract_links_from_text(text):
-    """Extract ONLY supported configs, preserving source/message order."""
     if not text:
         return []
-    results = []
-    seen = set()
-    pattern = re.compile(
-        # Keep URI punctuation such as (), [], quotes and # inside the
-        # candidate. URL-encoded credentials and fragments may legally contain
-        # those characters. Whitespace/HTML delimiters are the reliable
-        # message-level boundaries.
-        r'(?:vless|vmess|trojan|wireguard|wg|shadowsocks|ss|socks5|socks4|socks|hysteria2|hy2)://[^\s<>]+',
-        re.IGNORECASE
-    )
-
-    def add_candidate(link):
-        link = clean_config_url(link.strip())
-        if link.lower().startswith("vmess://"):
-            normalized = normalize_vmess_url(link)
-            if not normalized:
-                log.debug("Invalid VMESS skipped")
-                return
-            link = normalized
-        # Remove only obvious sentence punctuation after a URI. Do not remove
-        # ')' / ']' because those may be part of a Trojan fragment/name.
-        link = re.sub(r'[.,;:!؟\'"`]+$', '', link)
-        ok, reason = validate_config_link(link)
-        if ok:
-            ident = canonical_config_identity(link)
-            if ident not in seen:
-                seen.add(ident)
-                results.append(link)
-        else:
-            log.debug(f"Invalid/unsupported config skipped: {link[:120]} - {reason}")
-
+    pattern=re.compile(r'(?:'+"|".join(SUPPORTED_SCHEMES)+r')://[^\s<>]+',re.I)
+    out=[]; seen=set()
     for m in pattern.finditer(html.unescape(text)):
-        add_candidate(m.group(0))
-
-    # Preserve the existing base64 extraction capability, but apply the same strict whitelist.
-    if not results:
-        candidates = []
-        text_clean = text.replace('\n', '').replace('\r', '').strip()
-        if text_clean and re.fullmatch(r'[A-Za-z0-9+/=]+', text_clean):
-            candidates.append(text_clean)
-        candidates.extend(line.strip() for line in text.splitlines()
-                         if line.strip() and len(line.strip()) <= 2000 and re.fullmatch(r'[A-Za-z0-9+/=]+', line.strip()))
-        for encoded in candidates:
-            try:
-                decoded = base64.b64decode(encoded + '=' * (-len(encoded) % 4), validate=False).decode('utf-8', errors='ignore')
-                for m in pattern.finditer(decoded):
-                    add_candidate(m.group(0))
-            except Exception:
-                continue
-
-    return results
+        u=clean_config_url(m.group(0)).rstrip('.,;:!؟')
+        item=parse_config_url(u)
+        if item["valid"]:
+            u=item["url"]
+            if item["protocol"]=="VMESS":
+                u=item["url"]
+            h=hashlib.sha256(u.encode()).hexdigest()
+            if h not in seen:
+                seen.add(h); out.append(u)
+    return out
 
 def validate_telegram_proxy_url(url):
     """Strict Telegram proxy validation: MTProto or SOCKS5 only."""
@@ -2712,7 +2781,7 @@ def extract_proxy_links_from_text(text):
     patterns = [
         r'https?://t\.me/proxy\?[^\s<>"\']+',
         r'tg://proxy\?[^\s<>"\']+',
-        r'socks5://[^\s<>"\']+',
+        r'(?:socks://|socks5://|socks5h://)[^\s<>"\']+',
     ]
     for pattern in patterns:
         for m in re.finditer(pattern, source, re.IGNORECASE):
