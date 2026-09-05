@@ -78,7 +78,7 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 TEHRAN_TZ = pytz.timezone('Asia/Tehran')
 
 # Professional semantic version for this build.
-BOT_VERSION = "3.1.0"
+BOT_VERSION = "3.0.0"
 
 
 
@@ -203,9 +203,6 @@ conn.execute("PRAGMA synchronous=NORMAL")
 conn.execute("PRAGMA wal_autocheckpoint=200")
 conn.execute("PRAGMA journal_size_limit=1048576")
 conn.execute("PRAGMA busy_timeout=10000")
-conn.execute("PRAGMA temp_store=MEMORY")
-conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
-conn.execute("PRAGMA cache_size=-20000")
 c = conn.cursor()
 
 # مستقل از ترتیب تعریف توابع، تمام عملیات DB از این helper استفاده می‌کنند.
@@ -216,8 +213,6 @@ def get_conn():
     db.execute("PRAGMA wal_autocheckpoint=200")
     db.execute("PRAGMA journal_size_limit=1048576")
     db.execute("PRAGMA busy_timeout=10000")
-db.execute("PRAGMA temp_store=MEMORY")
-db.execute("PRAGMA cache_size=-20000")
     return db
 
 
@@ -1154,10 +1149,6 @@ def sqlite_maintenance_cycle():
         c.execute("PRAGMA wal_checkpoint(PASSIVE)")
         c.execute("DELETE FROM manual_send_queue WHERE status IN ('done','cancelled') AND updated_at < ?",
                   (_queue_iso(_queue_now()-timedelta(days=14)),))
-        # Keep history but remove oversized duplicates and stale scrape state.
-        c.execute("DELETE FROM processed_messages WHERE rowid NOT IN (SELECT MAX(rowid) FROM processed_messages GROUP BY source,message_id,profile_id)")
-        c.execute("PRAGMA wal_checkpoint(PASSIVE)")
-        c.execute("PRAGMA incremental_vacuum(200)")
         conn.commit()
     except Exception:
         log.exception("sqlite maintenance failed")
@@ -8208,3 +8199,58 @@ if __name__ == "__main__":
     log.info("=" * 50)
     log.info("🚀 Starting bot...")
     main()
+
+
+# ======================================================================
+# v3.2.0 Database optimizer
+# - duplicate post protection
+# - automatic 48h cleanup
+# - sqlite size control
+# ======================================================================
+
+DB_OPTIMIZER_VERSION = "3.2.0"
+
+def optimize_database():
+    try:
+        db = get_conn()
+        cur = db.cursor()
+        cur.execute("PRAGMA auto_vacuum=INCREMENTAL")
+        cur.execute("PRAGMA journal_size_limit=524288")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_processed_created ON processed_messages(message_id)")
+        # remove duplicate old posts and messages after 48 hours
+        cutoff = (datetime.now() - timedelta(hours=48)).isoformat()
+        cur.execute("DELETE FROM posts WHERE created_at < ?", (cutoff,))
+        cur.execute("DELETE FROM seen WHERE last_posted < ?", (cutoff,))
+        cur.execute("DELETE FROM proxies_seen WHERE last_posted < ?", (cutoff,))
+        cur.execute("DELETE FROM processed_messages WHERE message_id < 0")
+        cur.execute("PRAGMA incremental_vacuum")
+        db.commit()
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        db.close()
+    except Exception:
+        log.exception("database optimizer failed")
+
+def post_fingerprint(text):
+    return hashlib.sha256((text or "").encode("utf-8", errors="ignore")).hexdigest()
+
+def is_duplicate_post(text):
+    fp = post_fingerprint(text)
+    db = get_conn()
+    try:
+        row = db.execute("SELECT 1 FROM posts WHERE content=? LIMIT 1", (fp,)).fetchone()
+        return bool(row)
+    finally:
+        db.close()
+
+def save_unique_post(text, count=0):
+    fp = post_fingerprint(text)
+    db = get_conn()
+    try:
+        db.execute("INSERT OR IGNORE INTO posts(content,count,created_at) VALUES(?,?,?)", (fp,count,datetime.now().isoformat()))
+        db.commit()
+    finally:
+        db.close()
+
+BOT_VERSION = "3.2.0"
+
