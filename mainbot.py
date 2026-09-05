@@ -78,7 +78,7 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 TEHRAN_TZ = pytz.timezone('Asia/Tehran')
 
 # Professional semantic version for this build.
-BOT_VERSION = "1.1.7-PROXY-ENGINE-MERGED-FINAL"
+BOT_VERSION = "1.1.8-PROXY-ENGINE-MERGED-FINAL-FIXED"
 
 
 
@@ -2416,6 +2416,7 @@ def normalize_vmess_url(url, name=""):
     try:
         raw = url.split("vmess://", 1)[1].strip()
         raw = raw.split("#", 1)[0]
+        raw = raw.strip()
         raw += "=" * (-len(raw) % 4)
         obj = json.loads(base64.b64decode(raw).decode("utf-8", errors="ignore"))
         if name:
@@ -2620,7 +2621,7 @@ def detect_protocol_name(url):
     if u.startswith(("wireguard://", "wg://")): return "WIREGUARD"
     if u.startswith(("hysteria2://", "hy2://")): return "HYSTERIA2"
     if u.startswith(("shadowsocks://", "ss://")): return "SHADOWSOCKS"
-    if u.startswith(("socks://", "socks4://", "socks5://")): return "SOCKS"
+    if u.startswith("socks://"): return "SOCKS"
     if is_telegram_proxy_url(u):
         return "MTPROTO" if u.startswith(("tg://proxy", "https://t.me/proxy")) else "SOCKS5"
     return "Unknown"
@@ -2638,7 +2639,7 @@ def validate_config_link(url):
     if scheme == "trojan": return validate_trojan(url)
     if scheme in ("wireguard", "wg"): return validate_wireguard(url.replace("wg://", "wireguard://", 1))
     if scheme in ("shadowsocks", "ss"): return validate_ss(url.replace("shadowsocks://", "ss://", 1))
-    if scheme in ("socks", "socks4", "socks5"): return validate_socks(url)
+    if scheme == "socks": return validate_socks(url)
     if scheme in ("hysteria2", "hy2"): return validate_hy2(url.replace("hysteria2://", "hy2://", 1))
     return False, "unsupported protocol"
 
@@ -2667,7 +2668,7 @@ def _decode_b64(s):
 
 def parse_vmess(url):
     try:
-        raw=url.split("vmess://",1)[1].split("#",1)[0]
+        raw=url.split("vmess://",1)[1].split("#",1)[0].strip()
         obj=json.loads(_decode_b64(raw).decode("utf-8"))
         if not obj.get("add") or not obj.get("port") or not obj.get("id"):
             return {"protocol":"VMESS","url":url,"name":"","valid":False,"metadata":{}}
@@ -2854,7 +2855,7 @@ def extract_proxy_links_from_text(text):
     patterns = [
         r'https?://t\.me/proxy\?[^\s<>"\']+',
         r'tg://proxy\?[^\s<>"\']+',
-        r'(?:socks://|socks5://|socks5h://)[^\s<>"\']+',
+        r'(?:socks://)[^\s<>"\']+',
     ]
     for pattern in patterns:
         for m in re.finditer(pattern, source, re.IGNORECASE):
@@ -3794,7 +3795,7 @@ async def post_proxies(bot, profile_id, proxies_with_ping, is_instant=False, max
         # Telegram URL buttons only support web/tg links. Proxy/VLESS/SOCKS
         # configs are content, not clickable URLs. Putting them in url= makes
         # Telegram reject the whole message and keeps the queue stuck.
-        proxy_buttons.append(InlineKeyboardButton(button_label, url=_norm))
+        proxy_buttons.append(InlineKeyboardButton(button_label, url=norm))
     rows = [proxy_buttons[i:i+3] for i in range(0, len(proxy_buttons), 3)]
     visible = "\n".join(header for _norm, header, _flag in entries)
     try:
@@ -8444,5 +8445,5 @@ def save_unique_post(text, count=0):
     finally:
         db.close()
 
-BOT_VERSION = "1.1.7-PROXY-ENGINE-MERGED-FINAL"
+BOT_VERSION = "1.1.8-PROXY-ENGINE-MERGED-FINAL-FIXED"
 
