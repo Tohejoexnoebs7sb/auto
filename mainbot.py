@@ -1085,6 +1085,19 @@ def delete_manual_queue_job(job_id, profile_id):
     conn.commit()
     return c.rowcount > 0
 
+def add_manual_queue_items(job_id, profile_id, items):
+    """Append configs/proxies to an existing manual queue job without crossing profiles."""
+    job = get_manual_queue_job(job_id, profile_id)
+    if not job or job.get("status") != "pending":
+        return False
+    new_items = [str(x).strip() for x in (items or []) if str(x).strip()]
+    if not new_items:
+        return False
+    current = list(job.get("items") or [])
+    merged = current + [x for x in new_items if x not in current]
+    return update_manual_queue_job(job_id, profile_id, items_json=json.dumps(merged, ensure_ascii=False))
+
+
 def remove_manual_queue_item(job_id, profile_id, index):
     job = get_manual_queue_job(job_id, profile_id)
     if not job or job["status"] != "pending":
@@ -2312,6 +2325,13 @@ COUNTRY_NAMES_EN = {
     'ZW': 'Zimbabwe',
 }
 
+def location_flag(host="", ip=None, cloudflare=False):
+    """Emoji used when country is unknown or host belongs to Cloudflare."""
+    if cloudflare:
+        return "☁️"
+    return "🌐"
+
+
 def get_country_info(code):
     """Return (flag, english_name, persian_name) for a country code."""
     if not code or len(code) != 2:
@@ -2353,6 +2373,10 @@ async def get_flag_for_ip(ip):
         log.warning(f"flag API fail for {ip}: {e}")
 
     return "🌐", ""
+
+def is_cloudflare_host(host):
+    h=(host or "").lower().strip()
+    return any(x in h for x in ("cloudflare", "cloudflare-dns", "cf-ray"))
 
 def clean_proxy_link(url):
     if not url:
@@ -2412,17 +2436,17 @@ def validate_vless(url):
         return False, "parse error"
 
 def normalize_vmess_url(url, name=""):
-    """Normalize VMess to standard JSON-base64 form. Name is stored only in ps."""
+    """Normalize VMess safely. VMess names MUST live inside JSON ps only.
+    Never append #fragment because many clients treat it as part of payload.
+    """
     try:
-        raw = url.split("vmess://", 1)[1].strip()
-        raw = raw.split("#", 1)[0]
-        raw = raw.strip()
+        raw = str(url).strip().split("vmess://", 1)[1].split("#", 1)[0].strip()
         raw += "=" * (-len(raw) % 4)
         obj = json.loads(base64.b64decode(raw).decode("utf-8", errors="ignore"))
         if name:
             obj["ps"] = str(name).strip()
-        payload = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode()
-        return "vmess://" + base64.b64encode(payload).decode()
+        payload = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        return "vmess://" + base64.b64encode(payload).decode("ascii")
     except Exception as e:
         log.warning(f"VMESS normalize failed: {e}")
         return None
