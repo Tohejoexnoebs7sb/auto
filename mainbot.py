@@ -14,7 +14,7 @@ import sys
 import html
 import random
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, unquote, urlparse, parse_qs, urlencode, urlunparse
 import httpx
 import pytz
@@ -78,7 +78,7 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 TEHRAN_TZ = pytz.timezone('Asia/Tehran')
 
 # Professional semantic version for this build.
-BOT_VERSION = "1.1.0"
+BOT_VERSION = "1.1.1-STABLE"
 
 
 
@@ -4308,7 +4308,7 @@ async def delete_file_after_delay(filepath, delay_seconds):
     except Exception as e:
         log.error(f"Error deleting file {filepath}: {e}")
 
-BOT_START_TIME = datetime.utcnow()
+BOT_START_TIME = datetime.now(timezone.utc)
 
 async def get_logs(update, context, profile_id, log_type="full", time_range_minutes=30):
     log_file_path = os.path.join(DATA_DIR, "bot.log")
@@ -4316,7 +4316,7 @@ async def get_logs(update, context, profile_id, log_type="full", time_range_minu
         await update.message.reply_text("❌ فایل لاگ وجود ندارد.")
         return
 
-    now_utc = datetime.utcnow()
+    now_utc = datetime.now(timezone.utc)
     cutoff_utc = now_utc - timedelta(minutes=time_range_minutes)
     start_cutoff = BOT_START_TIME
 
@@ -4410,7 +4410,7 @@ async def periodic_cleanup():
         try:
             log_file_path = os.path.join(DATA_DIR, "bot.log")
             if os.path.exists(log_file_path):
-                now_utc = datetime.utcnow()
+                now_utc = datetime.now(timezone.utc)
                 cutoff_utc = now_utc - timedelta(minutes=30)
                 lines_to_keep = []
                 with open(log_file_path, 'r', encoding='utf-8') as f:
@@ -8273,7 +8273,7 @@ ENABLE_AUTO = True
 async def post_init(app):
     global BOT_REF, BOT_START_TIME
     BOT_REF = app.bot
-    BOT_START_TIME = datetime.utcnow()
+    BOT_START_TIME = datetime.now(timezone.utc)
     # پاکسازی تایمرهای منقضی‌شده در ابتدا
     for prof in get_profiles():
         expiry_str = prof.get("timer_expiry")
@@ -8326,42 +8326,6 @@ async def post_init(app):
     log.info("🧹 Periodic cleanup task started")
 
 
-def main():
-    optimize_database()
-    try:
-        optimize_database()
-    except Exception:
-        log.exception("startup database optimization failed")
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("admin", cmd_admin))
-    app.add_handler(CommandHandler("runnow", cmd_runnow))
-    app.add_handler(CommandHandler("runall", cmd_runall))
-    app.add_handler(CommandHandler("sendtest", cmd_sendtest))
-    app.add_handler(CommandHandler("diag", cmd_diag))
-    app.add_handler(CommandHandler("balance", cmd_balance))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(MessageHandler(filters.Document.ALL, on_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    log.info("✅ Bot is ready, polling...")
-    app.run_polling()
-
-if __name__ == "__main__":
-    log.info("=" * 50)
-    log.info("🚀 Starting bot...")
-    main()
-
-
-# ======================================================================
-# v3.2.0 Database optimizer
-# - duplicate post protection
-# - automatic 48h cleanup
-# - sqlite size control
-# ======================================================================
-
-DB_OPTIMIZER_VERSION = "3.2.1"
-
 def optimize_database():
     """Low disk SQLite maintenance. Never runs huge vacuum/write operations."""
     db = None
@@ -8406,6 +8370,42 @@ def optimize_database():
         if db:
             db.close()
 
+def main():
+    optimize_database()
+    try:
+        optimize_database()
+    except Exception:
+        log.exception("startup database optimization failed")
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("runnow", cmd_runnow))
+    app.add_handler(CommandHandler("runall", cmd_runall))
+    app.add_handler(CommandHandler("sendtest", cmd_sendtest))
+    app.add_handler(CommandHandler("diag", cmd_diag))
+    app.add_handler(CommandHandler("balance", cmd_balance))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.Document.ALL, on_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    log.info("✅ Bot is ready, polling...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    log.info("=" * 50)
+    log.info("🚀 Starting bot...")
+    main()
+
+
+# ======================================================================
+# v3.2.0 Database optimizer
+# - duplicate post protection
+# - automatic 48h cleanup
+# - sqlite size control
+# ======================================================================
+
+DB_OPTIMIZER_VERSION = "3.2.1"
+
 def post_fingerprint(text):
     return hashlib.sha256((text or "").encode("utf-8", errors="ignore")).hexdigest()
 
@@ -8427,5 +8427,5 @@ def save_unique_post(text, count=0):
     finally:
         db.close()
 
-BOT_VERSION = "1.1.0"
+BOT_VERSION = "1.1.1-STABLE"
 
