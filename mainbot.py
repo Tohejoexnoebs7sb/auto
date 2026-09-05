@@ -1085,19 +1085,6 @@ def delete_manual_queue_job(job_id, profile_id):
     conn.commit()
     return c.rowcount > 0
 
-def add_manual_queue_items(job_id, profile_id, items):
-    """Append configs/proxies to an existing manual queue job without crossing profiles."""
-    job = get_manual_queue_job(job_id, profile_id)
-    if not job or job.get("status") != "pending":
-        return False
-    new_items = [str(x).strip() for x in (items or []) if str(x).strip()]
-    if not new_items:
-        return False
-    current = list(job.get("items") or [])
-    merged = current + [x for x in new_items if x not in current]
-    return update_manual_queue_job(job_id, profile_id, items_json=json.dumps(merged, ensure_ascii=False))
-
-
 def remove_manual_queue_item(job_id, profile_id, index):
     job = get_manual_queue_job(job_id, profile_id)
     if not job or job["status"] != "pending":
@@ -1109,6 +1096,28 @@ def remove_manual_queue_item(job_id, profile_id, index):
     if not items:
         return delete_manual_queue_job(job_id, profile_id)
     return update_manual_queue_job(job_id, profile_id, items_json=json.dumps(items, ensure_ascii=False))
+
+
+def add_manual_queue_items(job_id, profile_id, items):
+    """Append configs/proxies to an existing profile-owned queue job."""
+    job = get_manual_queue_job(job_id, profile_id)
+    if not job or job.get("status") != "pending":
+        return False
+    new_items = [str(x).strip() for x in (items or []) if str(x).strip()]
+    if not new_items:
+        return False
+    current = list(job.get("items") or [])
+    kind = str(job.get("kind") or "")
+    for item in new_items:
+        detected = "proxy" if detect_proxy_protocol(item) else "config" if detect_config_protocol(item) else ""
+        if detected and kind and detected != kind:
+            return False
+    current.extend(new_items)
+    return update_manual_queue_job(
+        job_id, profile_id,
+        items_json=json.dumps(current, ensure_ascii=False),
+        status="pending"
+    )
 
 def _manual_queue_take_batch(job):
     items = list(job.get("items") or [])
@@ -2325,13 +2334,6 @@ COUNTRY_NAMES_EN = {
     'ZW': 'Zimbabwe',
 }
 
-def location_flag(host="", ip=None, cloudflare=False):
-    """Emoji used when country is unknown or host belongs to Cloudflare."""
-    if cloudflare:
-        return "☁️"
-    return "🌐"
-
-
 def get_country_info(code):
     """Return (flag, english_name, persian_name) for a country code."""
     if not code or len(code) != 2:
@@ -2373,10 +2375,6 @@ async def get_flag_for_ip(ip):
         log.warning(f"flag API fail for {ip}: {e}")
 
     return "🌐", ""
-
-def is_cloudflare_host(host):
-    h=(host or "").lower().strip()
-    return any(x in h for x in ("cloudflare", "cloudflare-dns", "cf-ray"))
 
 def clean_proxy_link(url):
     if not url:
@@ -2436,20 +2434,38 @@ def validate_vless(url):
         return False, "parse error"
 
 def normalize_vmess_url(url, name=""):
-    """Normalize VMess safely. VMess names MUST live inside JSON ps only.
-    Never append #fragment because many clients treat it as part of payload.
-    """
+    """Normalize VMess to standard JSON-base64 form. Name is stored only in ps."""
     try:
-        raw = str(url).strip().split("vmess://", 1)[1].split("#", 1)[0].strip()
+        raw = url.split("vmess://", 1)[1].strip()
+        raw = raw.split("#", 1)[0]
+        raw = raw.strip()
         raw += "=" * (-len(raw) % 4)
         obj = json.loads(base64.b64decode(raw).decode("utf-8", errors="ignore"))
         if name:
             obj["ps"] = str(name).strip()
-        payload = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        return "vmess://" + base64.b64encode(payload).decode("ascii")
+        payload = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode()
+        return "vmess://" + base64.b64encode(payload).decode()
     except Exception as e:
         log.warning(f"VMESS normalize failed: {e}")
         return None
+
+
+def apply_display_name_to_config(url, name):
+    """
+    Change display name safely.
+    VMess has no URI fragment name in many clients; the name must be written
+    into JSON field ps and the vmess payload must be rebuilt.
+    Other protocols keep their normal #fragment behaviour.
+    """
+    if not name:
+        return url
+    try:
+        if (url or "").lower().startswith("vmess://"):
+            fixed = normalize_vmess_url(url, name)
+            return fixed or url
+    except Exception:
+        pass
+    return url
 
 def validate_vmess(url):
     """Validate VMESS URL structure (base64 encoded JSON)."""
@@ -2864,7 +2880,7 @@ def canonical_telegram_proxy_url(url):
         return "https://t.me/proxy?" + query
     p = urlparse(norm)
     q = urlencode(sorted((k.lower(), v) for k, vals in parse_qs(p.query, keep_blank_values=True).items() for v in vals), doseq=True)
-    return urlunparse(("socks5", p.netloc, p.path, p.params, q, ""))
+    return urlunparse(("socks", p.netloc, p.path, p.params, q, ""))
 
 def normalize_proxy_url(url):
     return canonical_telegram_proxy_url(url)
@@ -3642,12 +3658,18 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
         fragment_text = fragment_text.replace("{PING}", "")
         fragment_text = fragment_text.replace("{COUNT}", str(n))
         encoded_fragment = quote(fragment_text, safe='')
-        base_url = strip_url_fragment(url)
-        modified_url = base_url + "#" + encoded_fragment
-
         protocol = url.split('://')[0].lower() if '://' in url else ''
-        if custom_query and protocol not in ('vmess', 'https', 'tg'):
-            modified_url = add_custom_query_to_url(modified_url, custom_query, protocol)
+
+        # VMess fix: never append #name to vmess://.
+        # Most clients expect the name inside JSON ps. A fragment after base64
+        # makes the payload invalid for strict clients.
+        if protocol == "vmess":
+            modified_url = apply_display_name_to_config(url, fragment_text)
+        else:
+            base_url = strip_url_fragment(url)
+            modified_url = base_url + "#" + encoded_fragment
+            if custom_query and protocol not in ('https', 'tg'):
+                modified_url = add_custom_query_to_url(modified_url, custom_query, protocol)
 
         block = f"<pre>{modified_url}</pre>"
         config_blocks.append(header + "\n" + block)
@@ -4380,7 +4402,9 @@ async def get_logs(update, context, profile_id, log_type="full", time_range_minu
             ts = normalize_datetime_value(ts_str)
         except:
             continue
-        if ts < start_cutoff or ts < cutoff_utc:
+        # bot.log timestamps are local Tehran time; compare only against the
+        # requested range after normalizing the timestamp.
+        if ts < normalize_datetime_value((datetime.now(TEHRAN_TZ) - timedelta(minutes=time_range_minutes)).strftime("%Y-%m-%d %H:%M:%S")):
             continue
 
         if log_type == "errors":
