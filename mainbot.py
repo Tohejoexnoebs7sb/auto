@@ -162,6 +162,7 @@ def detect_config_protocol(config_url):
     if u.startswith(("shadowsocks://", "ss://")): return "SHADOWSOCKS"
     if u.startswith(("socks://", "socks4://", "socks5://")): return "SOCKS"
     if u.startswith(("hysteria2://", "hy2://")): return "HYSTERIA2"
+    if u.startswith(("https://t.me/proxy?", "tg://proxy?")): return "MTPROTO"
     return ""
 
 
