@@ -51,15 +51,26 @@ os.makedirs(BACKUP_DIR, exist_ok=True)
 # ======================================================================
 # تنظیم لاگ
 # ======================================================================
+from logging.handlers import RotatingFileHandler
+
+_LOG_FILE = os.path.join(DATA_DIR, "bot.log")
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler(os.path.join(DATA_DIR, "bot.log"), mode='a', encoding='utf-8')
+        RotatingFileHandler(
+            _LOG_FILE,
+            mode='a',
+            maxBytes=2 * 1024 * 1024,
+            backupCount=3,
+            encoding='utf-8'
+        )
     ]
 )
 log = logging.getLogger("bot")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 
 # ======================================================================
 # منطقه زمانی تهران
@@ -67,7 +78,7 @@ log = logging.getLogger("bot")
 TEHRAN_TZ = pytz.timezone('Asia/Tehran')
 
 # Professional semantic version for this build.
-BOT_VERSION = "2.3.0"
+BOT_VERSION = "2.4.0"
 
 
 
@@ -8001,6 +8012,7 @@ async def _worker_guard(name, coro_factory, restart_delay=5):
         try:
             _WORKER_HEARTBEATS[name] = time.time()
             await coro_factory()
+            _WORKER_HEARTBEATS[name] = time.time()
         except asyncio.CancelledError:
             log.info(f"[WATCHDOG] cancelled: {name}")
             raise
@@ -8024,7 +8036,7 @@ async def worker_watchdog():
             for name, task in list(_WORKER_TASKS.items()):
                 if task.done():
                     log.warning(f"[WATCHDOG] dead worker detected: {name}")
-                elif now - _WORKER_HEARTBEATS.get(name, now) > 900:
+                elif now - _WORKER_HEARTBEATS.get(name, now) > 300:
                     log.warning(f"[WATCHDOG] stale worker heartbeat: {name}")
             await asyncio.sleep(60)
         except asyncio.CancelledError:
