@@ -78,7 +78,7 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 TEHRAN_TZ = pytz.timezone('Asia/Tehran')
 
 # Professional semantic version for this build.
-BOT_VERSION = "1.1.1-STABLE"
+BOT_VERSION = "1.1.2-MANUAL-QUEUE-FIX"
 
 
 
@@ -2741,18 +2741,17 @@ def extract_links_from_text(text):
         return []
     source = html.unescape(text)
     patterns = [
-        r'(?:vless|vmess|trojan|ss|ssr|socks|socks5|socks5h|hy2|hysteria|hysteria2|wg|wireguard)://[^\s<>"\']+',
-        r'https?://t\.me/proxy\?[^\s<>"\']+'
+        r'(?:vless|vmess|trojan|ss|ssr|socks|socks5|socks5h|hy2|hysteria|hysteria2|wg|wireguard)://[^\s<>"\']+'
     ]
     out=[]; seen=set()
     for pat in patterns:
         for m in re.finditer(pat, source, re.I):
             u=m.group(0).rstrip('.,;:!؟)]}')
-            # Telegram proxy links are configs too; preserve raw URL
+            # Telegram proxy links are handled only by extract_proxy_links_from_text()
+            # Never count MTProto proxies as VPN configs.
             if u.lower().startswith(('http://t.me/proxy?', 'https://t.me/proxy?')):
-                ok,_=validate_telegram_proxy_url(u)
-                if ok:
-                    key=hashlib.sha256(u.encode()).hexdigest()
+                continue
+            key=hashlib.sha256(u.encode()).hexdigest()
                     if key not in seen:
                         seen.add(key); out.append(u)
                 continue
@@ -8427,5 +8426,5 @@ def save_unique_post(text, count=0):
     finally:
         db.close()
 
-BOT_VERSION = "1.1.1-STABLE"
+BOT_VERSION = "1.1.2-MANUAL-QUEUE-FIX"
 
