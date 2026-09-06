@@ -69,6 +69,14 @@ logging.basicConfig(
     ]
 )
 log = logging.getLogger("bot")
+
+def safe_debug_exception(context=""):
+    """Compact admin-safe debug helper. Keeps traceback available without noisy loops."""
+    try:
+        log.exception("[DEBUG] %s", context)
+    except Exception:
+        pass
+
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 
@@ -5290,7 +5298,7 @@ def manual_schedule_kb_with_draft(profile_id, draft=None):
     return InlineKeyboardMarkup(buttons)
 
 
-def manual_queue_list_kb(profile_id):
+def manual_queue_list_kb(profile_id, page=1):
     jobs = get_manual_queue(profile_id)
     btns = []
     for job in paginate_items(jobs, page, 20):
@@ -5304,7 +5312,7 @@ def manual_queue_list_kb(profile_id):
     btns.append([InlineKeyboardButton("🔙 بازگشت", callback_data=f"prof_{profile_id}", style="primary")])
     return InlineKeyboardMarkup(btns)
 
-def manual_queue_detail_kb(profile_id, job_id, items):
+def manual_queue_detail_kb(profile_id, job_id, items, item_page=1):
     btns = []
     for i, item in enumerate(paginate_items(items, item_page, 25)):
         label = str(item)
