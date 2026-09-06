@@ -151,23 +151,30 @@ def proxy_button_style(proxy_url):
 
 
 def detect_proxy_protocol(proxy_url):
-    """Return ONLY the two supported Telegram proxy protocol labels."""
+    """Detect real proxy URLs only. SOCKS config links are not proxies here."""
     u = (proxy_url or "").strip().lower()
-    if u.startswith(("tg://proxy?", "https://t.me/proxy?")):
+    if u.startswith(("socks5://", "socks5h://")):
+        return "SOCKS5"
+    if u.startswith(("http://", "https://")):
+        return "HTTP"
+    if u.startswith("tg://proxy?") or u.startswith("https://t.me/proxy?"):
         return "MTPROTO"
     return ""
 
 
 def detect_config_protocol(config_url):
-    """Return ONLY one of the exact config protocol families requested."""
+    """Detect subscription/config protocols. socks:// is a valid config type."""
     u = (config_url or "").strip().lower()
-    if u.startswith("vless://"): return "VLESS"
-    if u.startswith("vmess://"): return "VMESS"
-    if u.startswith("trojan://"): return "TROJAN"
-    if u.startswith(("shadowsocks://", "ss://")): return "SHADOWSOCKS"
-    if u.startswith("socks://"): return "SOCKS"
-    if u.startswith(("hysteria://", "hysteria2://", "hy2://")): return "HYSTERIA2"
-    if u.startswith(("wireguard://", "wg://")): return "WIREGUARD"
+    if u.startswith("socks://"):
+        return "SOCKS"
+    if u.startswith("vless://"):
+        return "VLESS"
+    if u.startswith("vmess://"):
+        return "VMESS"
+    if u.startswith("trojan://"):
+        return "TROJAN"
+    if u.startswith(("ss://", "ssr://")):
+        return "SHADOWSOCKS"
     return ""
 
 
@@ -957,8 +964,8 @@ conn.commit()
 # ======================================================================
 # Protocol control isolation v1.0
 # ======================================================================
-PROXY_PROTOCOLS = ("MTPROTO",)
-CONFIG_PROTOCOLS = ("VLESS", "VMESS", "TROJAN", "SHADOWSOCKS", "SOCKS", "SOCKS4", "SOCKS5", "HYSTERIA", "HYSTERIA2", "HY2", "WIREGUARD", "WG")
+PROXY_PROTOCOLS = ("MTPROTO", "SOCKS5")
+CONFIG_PROTOCOLS = ("VLESS", "VMESS", "TROJAN", "SHADOWSOCKS", "SOCKS", "HYSTERIA", "HYSTERIA2", "HY2", "WIREGUARD", "WG")
 
 def migrate_protocol_settings():
     db=get_conn(); cur=db.cursor()
@@ -1048,10 +1055,23 @@ def filter_enabled_protocols(profile_id, items):
     """Remove disabled protocols before manual/automatic processing."""
     result=[]
     for item in items or []:
-        proto = detect_proxy_protocol(item) or detect_config_protocol(item)
+        proto = detect_config_protocol(item) or detect_proxy_protocol(item)
         if proto and is_protocol_enabled(profile_id, proto):
             result.append(item)
     return list(dict.fromkeys(result))
+
+
+def paginate_items(items, page=1, per_page=20):
+    try:
+        page=max(1,int(page))
+    except Exception:
+        page=1
+    try:
+        per_page=max(1,int(per_page))
+    except Exception:
+        per_page=20
+    start=(page-1)*per_page
+    return list(items or [])[start:start+per_page]
 
 
 def create_manual_queue_job(profile_id, kind, items, interval_minutes=0, batch_size=1, first_delay_minutes=0):
@@ -1063,14 +1083,14 @@ def create_manual_queue_job(profile_id, kind, items, interval_minutes=0, batch_s
     detected=[]
     allowed_items=[]
     for item in items:
-        proto = detect_proxy_protocol(item) or detect_config_protocol(item)
+        proto = detect_config_protocol(item) or detect_proxy_protocol(item)
         if not proto:
             continue
         if not is_protocol_enabled(profile_id, proto):
             continue
         allowed_items.append(item)
-        if detect_proxy_protocol(item): detected.append("proxy")
-        elif detect_config_protocol(item): detected.append("config")
+        if detect_config_protocol(item): detected.append("config")
+        elif detect_proxy_protocol(item): detected.append("proxy")
     items = allowed_items
     if not items:
         raise ValueError("all protocols disabled for this profile")
@@ -2724,7 +2744,7 @@ def is_telegram_proxy_url(url):
     u = html.unescape(str(url)).strip()
     if u.lower().startswith(("tg://proxy?", "https://t.me/proxy?")):
         return validate_telegram_proxy_url(u)[0]
-    if u.lower().startswith("socks://"):
+    if u.lower().startswith(("socks5://", "socks5h://")):
         return validate_telegram_proxy_url(u)[0]
     return False
 
@@ -2881,7 +2901,7 @@ def extract_links_from_text(text):
         return []
     source = html.unescape(text)
     patterns = [
-        r'(?:vless|vmess|trojan|ss|ssr|shadowsocks|socks|socks4|socks5|socks5h|hy2|hysteria|hysteria2|wg|wireguard)://[^\s<>"\']+'
+        r'(?:vless|vmess|trojan|ss|ssr|shadowsocks|socks|socks5|socks5h|hy2|hysteria|hysteria2|wg|wireguard)://[^\s<>"\']+'
     ]
     out=[]; seen=set()
     for pat in patterns:
@@ -2976,7 +2996,6 @@ def extract_proxy_links_from_text(text):
     patterns = [
         r'https?://t\.me/proxy\?[^\s<>"\']+',
         r'tg://proxy\?[^\s<>"\']+',
-        r'(?:socks://)[^\s<>"\']+',
     ]
     for pattern in patterns:
         for m in re.finditer(pattern, source, re.IGNORECASE):
@@ -3867,7 +3886,7 @@ async def post_proxies(bot, profile_id, proxies_with_ping, is_instant=False, max
         # Therefore switching to Glass MUST NOT change @ChannelName into a protocol.
         _config_header_mode, proxy_header_mode = get_header_modes(profile_id)
         if proxy_header_mode == "protocol":
-            proxy_title = detect_proxy_protocol(norm) or "MTPROTO"
+            proxy_title = detect_proxy_protocol(norm) or "PROXY"
         else:
             proxy_title = channel_label
         header_parts = [proxy_title]
@@ -4381,6 +4400,71 @@ async def profile_loop_proxy(bot, profile_id):
             log.error(f"❌ profile_loop_proxy error: {e}")
             log.error(traceback.format_exc())
             await asyncio.sleep(60)
+
+
+# ======================================================================
+# v0.1.16 redesigned scheduler
+# - fixed interval scheduling using monotonic next_run timestamps
+# - auto loops are independent from manual queue worker
+# - slow source scan no longer shifts the next execution window
+# ======================================================================
+
+_auto_next_runs = {}
+
+async def _run_scheduled_profile_cycle(bot, profile_id, mode):
+    try:
+        if mode == "config":
+            return await run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_proxies=False, is_instant=False)
+        return await run_cycle_for_profile(bot, profile_id, enable_configs=False, enable_proxies=True, is_instant=False)
+    except Exception:
+        log.error(traceback.format_exc())
+        return 0, "error"
+
+async def _profile_scheduler_v16(bot, profile_id, mode):
+    key=(profile_id, mode)
+    log.info(f"v0.1.16 scheduler started {key}")
+    while True:
+        try:
+            profile=get_profile(profile_id)
+            if not profile:
+                return
+            if not get_profile_enabled(profile_id):
+                await asyncio.sleep(30)
+                continue
+
+            enabled = get_profile_post_configs(profile_id) if mode=="config" else get_profile_post_proxies(profile_id)
+            if not enabled:
+                await asyncio.sleep(30)
+                continue
+
+            interval = get_profile_interval_config(profile_id) if mode=="config" else get_profile_interval_proxy(profile_id)
+            interval=max(1, int(interval or 1))
+
+            now=datetime.now(TEHRAN_TZ)
+            next_run=_auto_next_runs.get(key)
+            if not next_run:
+                next_run=now
+
+            if now < next_run:
+                await asyncio.sleep(min((next_run-now).total_seconds(),30))
+                continue
+
+            _auto_next_runs[key]=next_run+timedelta(minutes=interval)
+
+            # fire cycle without touching manual queue
+            await _run_scheduled_profile_cycle(bot, profile_id, mode)
+
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            log.error(traceback.format_exc())
+            await asyncio.sleep(30)
+
+async def profile_loop_config(bot, profile_id):
+    await _profile_scheduler_v16(bot, profile_id, "config")
+
+async def profile_loop_proxy(bot, profile_id):
+    await _profile_scheduler_v16(bot, profile_id, "proxy")
 
 # ======================================================================
 # بک‌آپ خودکار، گزارش روزانه، Railway و پاکسازی (بدون تغییر)
@@ -5209,7 +5293,7 @@ def manual_schedule_kb_with_draft(profile_id, draft=None):
 def manual_queue_list_kb(profile_id):
     jobs = get_manual_queue(profile_id)
     btns = []
-    for job in jobs[:20]:
+    for job in paginate_items(jobs, page, 20):
         kind = "📡" if job["kind"] == "config" else "🌐"
         count = len(job.get("items") or [])
         interval = int(job.get("interval_minutes") or 0)
@@ -5222,7 +5306,7 @@ def manual_queue_list_kb(profile_id):
 
 def manual_queue_detail_kb(profile_id, job_id, items):
     btns = []
-    for i, item in enumerate(items[:25]):
+    for i, item in enumerate(paginate_items(items, item_page, 25)):
         label = str(item)
         if len(label) > 42:
             label = label[:39] + "..."
