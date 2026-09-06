@@ -151,7 +151,7 @@ def header_mode_label(mode):
 def proxy_button_style(proxy_url):
     """Telegram button color for proxy types."""
     p = detect_proxy_protocol(proxy_url)
-    if p == "SOCKS":
+    if p == "SOCKS5":
         return "success"
     if p == "MTPROTO":
         return "primary"
@@ -159,14 +159,12 @@ def proxy_button_style(proxy_url):
 
 
 def detect_proxy_protocol(proxy_url):
-    """Detect real proxy URLs only. SOCKS config links are not proxies here."""
-    u = (proxy_url or "").strip().lower()
+    """Detect ONLY supported Telegram proxy types: MTPROTO and SOCKS5."""
+    u = html.unescape(str(proxy_url or "")).strip().lower()
+    if u.startswith(("tg://proxy?", "https://t.me/proxy?")):
+        return "MTPROTO"
     if u.startswith(("socks5://", "socks5h://")):
         return "SOCKS5"
-    if u.startswith(("http://", "https://")):
-        return "HTTP"
-    if u.startswith("tg://proxy?") or u.startswith("https://t.me/proxy?"):
-        return "MTPROTO"
     return ""
 
 
@@ -347,6 +345,8 @@ def prepare_replaced_database():
     migrate_old_config()
     migrate_header_modes()
     fix_column_types()
+    ensure_column("profiles", "config_header_enabled", "INTEGER DEFAULT 1", 1)
+    ensure_column("profiles", "low_cost_mode", "INTEGER DEFAULT 1", 1)
     conn.commit()
 
 async def replace_database_from_file(update, source_path, original_name="database"):
@@ -697,6 +697,8 @@ ensure_column("profiles", "show_ping", "INTEGER DEFAULT 1", 1)
 ensure_column("profiles", "proxy_banner_template", "TEXT DEFAULT ''", "")
 ensure_column("profiles", "proxy_post_mode", "INTEGER DEFAULT 0", 0)
 ensure_column("profiles", "ping_testing", "INTEGER DEFAULT 1", 1)
+ensure_column("profiles", "config_header_enabled", "INTEGER DEFAULT 1", 1)
+ensure_column("profiles", "low_cost_mode", "INTEGER DEFAULT 1", 1)
 
 c.execute("""CREATE TABLE IF NOT EXISTS blacklist (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1498,7 +1500,7 @@ def update_profile(profile_id, **kwargs):
                "schedule_cron", "last_backup_count", "timer_expiry", "timer_duration",
                "backup_interval", "interval_config", "interval_proxy", "max_post_config", "max_post_proxy",
                "naming_template", "channel_link", "ping_enabled", "profile_enabled",
-               "country_display", "show_ping", "proxy_banner_template", "proxy_post_mode", "ping_testing"]
+               "country_display", "show_ping", "proxy_banner_template", "proxy_post_mode", "ping_testing", "config_header_enabled", "low_cost_mode"]
     for key, value in kwargs.items():
         if key in allowed:
             c.execute(f"UPDATE profiles SET {key}=? WHERE id=?", (value, profile_id))
@@ -1760,6 +1762,37 @@ def get_profile_country_display(profile_id):
 
 def set_profile_country_display(profile_id, mode):
     update_profile(profile_id, country_display=mode)
+
+def get_profile_config_header_enabled(profile_id):
+    prof = get_profile(profile_id)
+    return bool(prof.get("config_header_enabled", 1)) if prof else True
+
+def set_profile_config_header_enabled(profile_id, enabled):
+    update_profile(profile_id, config_header_enabled=int(bool(enabled)))
+
+def get_profile_low_cost_mode(profile_id):
+    prof = get_profile(profile_id)
+    return bool(prof.get("low_cost_mode", 1)) if prof else True
+
+def set_profile_low_cost_mode(profile_id, enabled):
+    update_profile(profile_id, low_cost_mode=int(bool(enabled)))
+
+def render_naming_template(template, *, protocol, flag, country_code, channel_link, count):
+    """Render {TOKEN} and [TOKEN] placeholders."""
+    template = str(template or "{Flag} | ⚡️Telegram = {CHANNEL_ID}")
+    values = {
+        "Protocol": protocol or "", "PROTOCOL": protocol or "",
+        "Flag": flag or "", "FLAG": flag or "",
+        "COUNTRY_EN": COUNTRY_NAMES_EN.get(country_code, ""),
+        "COUNTRY_FA": COUNTRY_NAMES_FA.get(country_code, ""),
+        "Country": COUNTRY_NAMES_EN.get(country_code, ""),
+        "COUNTRY": COUNTRY_NAMES_EN.get(country_code, ""),
+        "CHANNEL_ID": channel_link or "", "COUNT": str(count), "PING": "",
+    }
+    out = template
+    for key,value in values.items():
+        out = out.replace("{"+key+"}", str(value)).replace("["+key+"]", str(value))
+    return out.strip()
 
 def get_profile_proxy_banner_template(profile_id):
     prof = get_profile(profile_id)
@@ -2716,7 +2749,7 @@ def validate_wireguard(url):
         return False, "parse error"
 
 def validate_http_proxy(url):
-    """Validate HTTP/HTTPS proxy-style URLs without accepting arbitrary web links."""
+    """Legacy validator only; HTTP/HTTPS is not a supported bot proxy type."""
     try:
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https"):
@@ -3679,6 +3712,7 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
         channel_link = dest if dest else ""
 
     country_display = get_profile_country_display(profile_id)
+    config_header_enabled = get_profile_config_header_enabled(profile_id)
 
     # Get appropriate sponsor
     sponsor = get_best_sponsor(profile_id, "config")
@@ -3707,25 +3741,22 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
             if ip:
                 flag, country_code = await get_flag_for_ip(ip)
 
-        # Build config header from the INDEPENDENT config header mode.
-        # IMPORTANT: proxy_post_mode has absolutely no effect on this.
-        # Channel mode -> @ChannelName + country.
-        # Protocol mode -> exact detected config protocol + country.
+        # Optional config title/header. When disabled, its whole line disappears.
         config_header_mode, _proxy_header_mode = get_header_modes(profile_id)
-        if config_header_mode == "protocol":
-            config_title = detect_config_protocol(url)
-            if not config_title:
-                # This should never happen because extraction validates the
-                # protocol, but never silently publish an empty/unknown title.
-                log.warning(f"[CONFIG][profile={profile_id}] Unknown config protocol while formatting: {url[:80]}")
-                continue
-            header_parts = [config_title]
-        else:
-            config_channel = channel_link or dest or "@Channel"
-            config_channel = str(config_channel).strip()
-            if not config_channel.startswith("@") and config_channel:
-                config_channel = "@" + config_channel.lstrip("@")
-            header_parts = [config_channel or "@Channel"]
+        config_title = detect_config_protocol(url)
+        header_parts = []
+        if config_header_enabled:
+            if config_header_mode == "protocol":
+                if not config_title:
+                    log.warning(f"[CONFIG][profile={profile_id}] Unknown config protocol: {url[:80]}")
+                    continue
+                header_parts = [config_title]
+            else:
+                config_channel = channel_link or dest or "@Channel"
+                config_channel = str(config_channel).strip()
+                if not config_channel.startswith("@") and config_channel:
+                    config_channel = "@" + config_channel.lstrip("@")
+                header_parts = [config_channel or "@Channel"]
 
         # Country display
         if country_display == 0:
@@ -3753,18 +3784,15 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
 
         # Ping display
         # Numbering
-        if show_numbers:
+        if show_numbers and config_header_enabled:
             header = f"<b>#{n}</b> " + " ".join(header_parts)
         else:
-            header = " ".join(header_parts)
+            header = " ".join(header_parts) if config_header_enabled else ""
 
-        # Build config line - use naming template
-        fragment_text = naming_template.replace("{Flag}", flag).replace("{CHANNEL_ID}", channel_link).replace("{COUNT}", str(n))
-        fragment_text = fragment_text.replace("{FLAG}", flag)
-        fragment_text = fragment_text.replace("{COUNTRY_EN}", COUNTRY_NAMES_EN.get(country_code, ""))
-        fragment_text = fragment_text.replace("{COUNTRY_FA}", COUNTRY_NAMES_FA.get(country_code, ""))
-        fragment_text = fragment_text.replace("{PING}", "")
-        fragment_text = fragment_text.replace("{COUNT}", str(n))
+        fragment_text = render_naming_template(
+            naming_template, protocol=config_title, flag=flag,
+            country_code=country_code, channel_link=channel_link, count=n
+        )
         encoded_fragment = quote(fragment_text, safe='')
         protocol = url.split('://')[0].lower() if '://' in url else ''
 
@@ -3780,7 +3808,7 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
                 modified_url = add_custom_query_to_url(modified_url, custom_query, protocol)
 
         block = f"<pre>{modified_url}</pre>"
-        config_blocks.append(header + "\n" + block)
+        config_blocks.append((header + "\n" if header else "") + block)
 
     configs_text = "\n\n".join(config_blocks)
     try:
@@ -3894,7 +3922,7 @@ async def post_proxies(bot, profile_id, proxies_with_ping, is_instant=False, max
         # Therefore switching to Glass MUST NOT change @ChannelName into a protocol.
         _config_header_mode, proxy_header_mode = get_header_modes(profile_id)
         if proxy_header_mode == "protocol":
-            proxy_title = detect_proxy_protocol(norm) or "PROXY"
+            proxy_title = detect_proxy_protocol(norm) or "MTPROTO"
         else:
             proxy_title = channel_label
         header_parts = [proxy_title]
@@ -4034,10 +4062,14 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
     seen_proxy_identities = set()
     source_newest_ids = {}
 
+    # Low-cost mode reduces Railway network/CPU usage.
+    low_cost_mode=get_profile_low_cost_mode(profile_id)
+    scrape_pages=2 if low_cost_mode else 5
+    config_test_limit=10 if low_cost_mode else 30
     # Scrape all sources in parallel
     async def scrape_one(src):
         config_links, proxy_links, newest_id = await scrape_channel_paginated(
-            profile_id, src, max_pages=5, stream=stream
+            profile_id, src, max_pages=scrape_pages, stream=stream
         )
         return src, config_links, proxy_links, newest_id
 
@@ -4080,10 +4112,10 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
     working = []
     if enable_configs and new_configs:
         # Test configs in batches
-        test_limit = min(len(new_configs), 30)  # we can increase batch size later
-        to_test = new_configs[:test_limit]
-        log.info(f"📊 Testing {len(to_test)} configs...")
-        sem = asyncio.Semaphore(50)  # controlled concurrency
+        test_limit=min(len(new_configs),config_test_limit)
+        to_test=new_configs[:test_limit]
+        log.info(f"📊 Testing {len(to_test)} configs... low_cost={low_cost_mode}")
+        sem=asyncio.Semaphore(20 if low_cost_mode else 50)
 
         async def _check(item):
             u, src = item
@@ -4551,66 +4583,52 @@ async def delete_file_after_delay(filepath, delay_seconds):
 BOT_START_TIME = datetime.now(timezone.utc)
 
 async def get_logs(update, context, profile_id, log_type="full", time_range_minutes=30):
-    log_file_path = os.path.join(DATA_DIR, "bot.log")
-    if not os.path.exists(log_file_path):
-        await update.message.reply_text("❌ فایل لاگ وجود ندارد.")
+    """Export the actual rotating bot.log files; safe for callback buttons too."""
+    message = getattr(update, "effective_message", None) or getattr(update, "message", None)
+    if message is None:
+        log.error("[LOGS] no effective message")
         return
-
-    now_utc = datetime.now(timezone.utc)
-    cutoff_utc = now_utc - timedelta(minutes=time_range_minutes)
-    start_cutoff = BOT_START_TIME
-
+    paths = [p for p in (_LOG_FILE, _LOG_FILE+".1", _LOG_FILE+".2", _LOG_FILE+".3") if os.path.isfile(p)]
+    if not paths:
+        await message.reply_text("❌ هیچ فایل لاگی پیدا نشد.")
+        return
     try:
-        with open(log_file_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطا در خواندن لاگ: {e}")
-        return
-
-    filtered = []
-    error_keywords = ["ERROR", "❌", "CRITICAL", "Exception", "Traceback"]
-    for line in lines:
-        match = re.match(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', line)
-        if not match:
-            continue
-        ts_str = match.group(1)
+        minutes=max(1,int(time_range_minutes or 30))
+    except (TypeError,ValueError):
+        minutes=30
+    cutoff=datetime.now(TEHRAN_TZ)-timedelta(minutes=minutes)
+    errors=("ERROR","CRITICAL","Traceback","Exception","[DEBUG]")
+    selected=[]; read_errors=[]
+    for path in paths:
         try:
-            ts = normalize_datetime_value(ts_str)
-        except:
-            continue
-        # bot.log timestamps are local Tehran time; compare only against the
-        # requested range after normalizing the timestamp.
-        if ts < normalize_datetime_value((datetime.now(TEHRAN_TZ) - timedelta(minutes=time_range_minutes)).strftime("%Y-%m-%d %H:%M:%S")):
-            continue
-
-        if log_type == "errors":
-            if any(kw in line for kw in error_keywords):
-                filtered.append(line)
-        else:
-            filtered.append(line)
-
-    if not filtered:
-        await update.message.reply_text(f"❌ هیچ لاگ {log_type} در {time_range_minutes} دقیقهٔ اخیر و پس از استارت یافت نشد.")
+            with open(path,"r",encoding="utf-8",errors="replace") as f:
+                for raw in f:
+                    line=raw.rstrip("\n")
+                    m=re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})",line)
+                    if m:
+                        ts=normalize_datetime_value(m.group(1))
+                        if ts and ts < cutoff: continue
+                    if log_type=="errors" and not any(k in line for k in errors): continue
+                    selected.append(line)
+        except Exception as exc:
+            read_errors.append(f"{os.path.basename(path)}: {exc}")
+    if not selected:
+        extra=("\n"+"; ".join(read_errors)) if read_errors else ""
+        await message.reply_text(f"❌ هیچ لاگ {html.escape(str(log_type))} در {minutes} دقیقه اخیر پیدا نشد.{extra}",parse_mode="HTML")
         return
-
-    max_lines = 500
-    if len(filtered) > max_lines:
-        filtered = filtered[-max_lines:]
-
-    content = "\n".join(filtered)
-    range_label = f"{time_range_minutes}m" if time_range_minutes < 1440 else "24h"
-    filename = f"logs_{log_type}_{range_label}_{get_tehran_date()}.txt"
-    filepath = os.path.join(DATA_DIR, filename)
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(content)
-
-    with open(filepath, 'rb') as f:
-        await update.message.reply_document(
-            document=f,
-            filename=filename,
-            caption=f"📋 لاگ {log_type} ({range_label} اخیر پس از استارت) - {len(filtered)} خط"
-        )
-    os.remove(filepath)
+    selected=selected[-2500:]
+    content="\n".join(selected)
+    if read_errors: content += "\n\n[LOG READ WARNINGS]\n"+"\n".join(read_errors)
+    stamp=datetime.now(TEHRAN_TZ).strftime("%Y%m%d_%H%M%S")
+    filename=f"bot_logs_{log_type}_{minutes}m_{stamp}.txt"
+    filepath=os.path.join(DATA_DIR,filename)
+    try:
+        with open(filepath,"w",encoding="utf-8") as f: f.write(content)
+        with open(filepath,"rb") as f:
+            await message.reply_document(document=f,filename=filename,caption=f"📋 لاگ واقعی bot.log ({log_type}) | {len(selected)} خط | {minutes} دقیقه")
+    finally:
+        try: os.remove(filepath)
+        except OSError: pass
 
 async def send_daily_report(app):
     try:
@@ -4781,7 +4799,8 @@ T = {
                        "🔗 لینک کانال: {channel_link}\n"
                        "🌍 پینگ: {ping_status}\n"
                        "🔘 وضعیت: {profile_status}\n"
-                       "🌐 کشور: {country_display}\n",
+                       "🌐 کشور: {country_display}\n"
+                       "🧩 عنوان کانفیگ: {config_header_status} | ⚡ کم‌مصرف: {low_cost_status}\n",
         "general_settings": "⚙️ **تنظیمات عمومی**\n\n"
                             "زبان فعلی: {lang}\n"
                             "تعداد ادمین‌ها: {admins_count}",
@@ -4941,7 +4960,7 @@ T = {
         "btn_list_admins": "📋 لیست ادمین‌ها",
         "only_admin": "❌ فقط ادمین‌ها می‌توانند از این بات استفاده کنند.",
         "btn_set_naming_template": "🏷️ قالب نام‌گذاری",
-        "naming_template_prompt": "🏷️ قالب نام‌گذاری را وارد کنید.\n\nمتغیرهای قابل استفاده:\n- `{Flag}` : پرچم کشور\n- `{CHANNEL_ID}` : لینک کانال (تنظیم شده در پروفایل)\n- `{COUNT}` : شماره کانفیگ\n\nمثال:\n`{Flag} | ⚡️Telegram = {CHANNEL_ID}`\n\nبرای استفاده از شمارنده، حتماً `{COUNT}` را در قالب قرار دهید.",
+        "naming_template_prompt": "🏷️ قالب نام‌گذاری را وارد کنید.\n\nمتغیرها: `{Protocol}`، `{Flag}`، `{COUNTRY_EN}`، `{COUNTRY_FA}`، `{CHANNEL_ID}`، `{COUNT}`\nفرمت `{TOKEN}` یا `[TOKEN]` هر دو قابل استفاده‌اند.\nمثال: `[Protocol] [Flag] [COUNTRY_EN] • [COUNTRY_FA]`",
         "naming_template_set": "✅ قالب نام‌گذاری تنظیم شد: {template}",
         "btn_set_channel_link": "🔗 لینک کانال",
         "channel_link_prompt": "🔗 لینک کانال را وارد کنید (مثلاً `MyChannel`):\n\nاین مقدار در قالب نام‌گذاری به جای `{CHANNEL_ID}` قرار می‌گیرد.\nاگر خالی بگذارید، از نام پروفایل استفاده می‌شود.",
@@ -5014,6 +5033,7 @@ T = {
                        "🌍 Ping: {ping_status}\n"
                        "🔘 Status: {profile_status}\n"
                        "🌐 Country: {country_display}\n"
+        "🧩 Config title: {config_header_status} | ⚡ Low-cost: {low_cost_status}\n"
         # ... (other keys)
     }
 }
@@ -5112,6 +5132,8 @@ def profile_admin_kb(profile_id):
         [InlineKeyboardButton(f"📢 اسپانسر: {sponsor_status}", callback_data=f"sponsor_list_{profile_id}", style="primary"),
          InlineKeyboardButton(msg("btn_set_name"), callback_data=f"ac_{profile_id}", style="primary")],
         [InlineKeyboardButton("⚙️ مدیریت پروتکل‌ها", callback_data=f"proto_menu_{profile_id}", style="primary")],
+        [InlineKeyboardButton(f"🧩 عنوان کانفیگ: {'✅ فعال' if prof.get('config_header_enabled', 1) else '❌ حذف'}", callback_data=f"tgl_cfg_header_{profile_id}", style="success" if prof.get('config_header_enabled', 1) else "danger"),
+         InlineKeyboardButton(f"⚡ کم‌مصرف: {'✅ فعال' if prof.get('low_cost_mode', 1) else '❌ خاموش'}", callback_data=f"tgl_low_cost_{profile_id}", style="success" if prof.get('low_cost_mode', 1) else "danger")],
         [InlineKeyboardButton(msg("btn_set_banner_config"), callback_data=f"ab_config_{profile_id}", style="primary"),
          InlineKeyboardButton(msg("btn_set_banner_proxy"), callback_data=f"ab_proxy_{profile_id}", style="primary")],
         [InlineKeyboardButton("⏰ بازه کانفیگ", callback_data=f"set_cfg_interval_{profile_id}", style="primary"),
@@ -5153,6 +5175,7 @@ def profile_admin_kb(profile_id):
          InlineKeyboardButton(msg("btn_timer"), callback_data=f"timer_menu_{profile_id}", style="primary")],
         [InlineKeyboardButton(f"⏱️ {timer_status}", callback_data="dummy", style="primary"),
          InlineKeyboardButton(msg("btn_log_menu"), callback_data=f"log_menu_{profile_id}", style="primary")],
+        [InlineKeyboardButton("🧪 دیباگ عمیق", callback_data="run_deep_debug", style="primary")],
         [InlineKeyboardButton(msg("btn_set_naming_template"), callback_data=f"set_naming_{profile_id}", style="primary"),
          InlineKeyboardButton(msg("btn_set_channel_link"), callback_data=f"set_channel_link_{profile_id}", style="primary")],
         [InlineKeyboardButton(f"🌐 کشور: {country_label}", callback_data=f"tgl_country_{profile_id}", style="primary")],
@@ -5299,18 +5322,30 @@ def manual_schedule_kb_with_draft(profile_id, draft=None):
 
 
 def manual_queue_list_kb(profile_id, page=1):
-    jobs = get_manual_queue(profile_id)
-    btns = []
-    for job in paginate_items(jobs, page, 20):
-        kind = "📡" if job["kind"] == "config" else "🌐"
-        count = len(job.get("items") or [])
-        interval = int(job.get("interval_minutes") or 0)
-        interval_text = "فوری" if interval == 0 else f"هر {interval}د"
-        btns.append([InlineKeyboardButton(f"{kind} #{job['id']} • {count} باقی • {interval_text}", callback_data=f"mq_detail_{profile_id}_{job['id']}", style="primary")])
-    if not btns:
-        btns.append([InlineKeyboardButton("صف خالی است", callback_data="dummy", style="primary")])
-    btns.append([InlineKeyboardButton("🔙 بازگشت", callback_data=f"prof_{profile_id}", style="primary")])
+    """Paginated queue list with explicit, validated page state."""
+    jobs=get_manual_queue(profile_id)
+    try: page=max(1,int(page))
+    except (TypeError,ValueError): page=1
+    per_page=20
+    total_pages=max(1,(len(jobs)+per_page-1)//per_page)
+    page=min(page,total_pages)
+    btns=[]
+    for job in paginate_items(jobs,page,per_page):
+        kind="📡" if job["kind"]=="config" else "🌐"
+        count=len(job.get("items") or [])
+        interval=int(job.get("interval_minutes") or 0)
+        interval_text="فوری" if interval==0 else f"هر {interval}د"
+        btns.append([InlineKeyboardButton(f"{kind} #{job['id']} • {count} باقی • {interval_text}",callback_data=f"mq_detail_{profile_id}_{job['id']}",style="primary")])
+    if not btns: btns.append([InlineKeyboardButton("صف خالی است",callback_data="dummy",style="primary")])
+    if total_pages>1:
+        nav=[]
+        if page>1: nav.append(InlineKeyboardButton("◀️ قبلی",callback_data=f"mq_list_{profile_id}_{page-1}",style="primary"))
+        nav.append(InlineKeyboardButton(f"صفحه {page}/{total_pages}",callback_data="dummy",style="primary"))
+        if page<total_pages: nav.append(InlineKeyboardButton("بعدی ▶️",callback_data=f"mq_list_{profile_id}_{page+1}",style="primary"))
+        btns.append(nav)
+    btns.append([InlineKeyboardButton("🔙 بازگشت",callback_data=f"prof_{profile_id}",style="primary")])
     return InlineKeyboardMarkup(btns)
+
 
 def manual_queue_detail_kb(profile_id, job_id, items, item_page=1):
     btns = []
@@ -5381,6 +5416,7 @@ def general_settings_kb():
         [InlineKeyboardButton(msg("btn_admins"), callback_data="manage_admins", style="primary")],
         [InlineKeyboardButton(msg("btn_backup"), callback_data="backup_db", style="primary")],
         [InlineKeyboardButton(msg("btn_replace_database"), callback_data="replace_db", style="danger")],
+        [InlineKeyboardButton("🧪 دیباگ عمیق با شماره لاین", callback_data="run_deep_debug", style="primary")],
         [InlineKeyboardButton(msg("btn_back"), callback_data="back_home", style="primary")],
     ])
 
@@ -5500,27 +5536,67 @@ async def cmd_sendtest(u, ctx):
             await u.message.reply_text(f"❌ Failed for {dest}: {e}")
     await u.message.reply_text(f"✅ Test sent to {len(profiles)} destinations")
 
+def _debug_static_report():
+    import ast
+    from collections import Counter
+    path=os.path.abspath(__file__)
+    try: source=open(path,"r",encoding="utf-8",errors="replace").read()
+    except Exception as exc: return f"FILE READ FAILED: {exc}"
+    lines=source.splitlines(); out=[f"BOT DEEP DEBUG | version={APP_VERSION}",f"FILE: {path}",f"LINES: {len(lines)}"]
+    try: tree=ast.parse(source,filename=path); out.append("SYNTAX: PASS")
+    except SyntaxError as exc:
+        out.append(f"SYNTAX: FAIL | line={exc.lineno} col={exc.offset} | {exc.msg}"); return "\n".join(out)
+    funcs=[(n.name,n.lineno) for n in ast.walk(tree) if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef))]
+    c=Counter(n for n,_ in funcs)
+    for name,count in c.items():
+        if count>1: out.append(f"[WARN][DUPLICATE] {name}: lines {[ln for nm,ln in funcs if nm==name]}")
+    imported=set(); defined=set()
+    for n in tree.body:
+        if isinstance(n,ast.Import): imported.update(a.asname or a.name.split('.')[0] for a in n.names)
+        elif isinstance(n,ast.ImportFrom): imported.update(a.asname or a.name for a in n.names)
+        elif isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)): defined.add(n.name)
+        elif isinstance(n,(ast.Assign,ast.AnnAssign)):
+            ts=n.targets if isinstance(n,ast.Assign) else [n.target]
+            for t in ts:
+                if isinstance(t,ast.Name): defined.add(t.id)
+    import builtins
+    known=set(dir(builtins))|imported|defined
+    loads=[]
+    for n in ast.walk(tree):
+        if isinstance(n,ast.Name) and isinstance(n.ctx,ast.Load) and n.id not in known: loads.append((n.id,n.lineno))
+    uc=Counter(n for n,_ in loads); out.append(f"POTENTIAL UNDEFINED NAMES: {len(uc)}")
+    for name,_ in uc.most_common(100): out.append(f"[CHECK][NAME] {name}: lines {sorted({ln for nm,ln in loads if nm==name})[:20]}")
+    for i,line in enumerate(lines,1):
+        st=line.strip()
+        if st=="except:" or st.startswith("except Exception:"): out.append(f"[WARN][BROAD-EXCEPT] line {i}: {st}")
+        if "TODO" in line or "FIXME" in line: out.append(f"[INFO][TODO] line {i}: {st[:180]}")
+    out.append("PROXY TYPE TESTS:")
+    samples=["https://t.me/proxy?port=8443&secret=EERighJJvXrFGRMCIMJdCQ&server=beer.crona-extra.co.uk","https://t.me/proxy?port=444&secret=dd41b712fe12019c64e281bcb6aeccded7&server=185.84.156.45","socks5://127.0.0.1:1080","http://127.0.0.1:8080"]
+    for x in samples: out.append(f"  {x[:60]} => {detect_proxy_protocol(x) or 'REJECTED'}")
+    return "\n".join(out)
+
+async def run_deep_debug(update, context):
+    user = getattr(update, "effective_user", None) or getattr(update, "from_user", None)
+    if not user or not is_admin(user.id): return
+    report=_debug_static_report()
+    try:
+        ok,detail=_validate_sqlite_database(DB_PATH)
+        report += f"\n\nDB CHECK: {'PASS' if ok else 'FAIL'} | {detail}"
+        report += f"\nLOG FILE: {_LOG_FILE} | exists={os.path.exists(_LOG_FILE)} | size={os.path.getsize(_LOG_FILE) if os.path.exists(_LOG_FILE) else 0}"
+        report += f"\nPROFILES: {len(get_profiles())}"
+    except Exception: report += "\n\n[RUNTIME ERROR]\n"+traceback.format_exc()
+    stamp=datetime.now(TEHRAN_TZ).strftime("%Y%m%d_%H%M%S"); path=os.path.join(DATA_DIR,f"deep_debug_{stamp}.txt")
+    with open(path,"w",encoding="utf-8") as f: f.write(report)
+    message=getattr(update,"effective_message",None) or getattr(update,"message",None)
+    try:
+        if message:
+            with open(path,"rb") as f: await message.reply_document(document=f,filename=os.path.basename(path),caption="🧪 دیباگ عمیق کامل؛ شماره لاین‌ها و تست پروتکل‌ها داخل فایل است.")
+    finally:
+        try: os.remove(path)
+        except OSError: pass
+
 async def cmd_diag(update: Update, context):
-    if not is_admin(update.effective_user.id):
-        return
-    msg_lines = []
-    msg_lines.append("🔍 **گزارش عیب‌یابی جامع بات**")
-    msg_lines.append("")
-    profiles = get_profiles()
-    msg_lines.append(f"📌 تعداد پروفایل‌ها: {len(profiles)}")
-    for prof in profiles:
-        timer_status = "⏳ فعال" if prof.get("timer_expiry") else "⏹ غیرفعال"
-        enabled_status = "✅ فعال" if get_profile_enabled(prof['id']) else "⛔ غیرفعال"
-        ping_testing = "✅" if get_profile_ping_enabled(prof['id']) else "❌"
-        msg_lines.append(f"  • {prof['dest_name']} (ID:{prof['id']}) - {len(get_profile_sources(prof['id']))} منبع, بازه کانفیگ:{prof.get('interval_config',5)}m, بازه پروکسی:{prof.get('interval_proxy',5)}m, پینگ {prof['ping_mode']}, تست پینگ:{ping_testing}, تایمر: {timer_status}, وضعیت:{enabled_status}")
-    msg_lines.append("")
-    seen_cfg = c.execute("SELECT COUNT(*) FROM seen").fetchone()[0]
-    seen_prx = c.execute("SELECT COUNT(*) FROM proxies_seen").fetchone()[0]
-    msg_lines.append("💾 **دیتابیس:**")
-    msg_lines.append(f"• کانفیگ‌های دیده‌شده: {seen_cfg}")
-    msg_lines.append(f"• پروکسی‌های دیده‌شده: {seen_prx}")
-    msg_lines.append("")
-    await update.message.reply_text("\n".join(msg_lines), parse_mode="Markdown")
+    await run_deep_debug(update, context)
 
 async def cmd_status(update: Update, context):
     if not is_admin(update.effective_user.id):
@@ -5585,6 +5661,10 @@ async def on_callback(u, ctx):
     try:
         d = q.data or ""
         log.info(f"📨 Callback data: {d}")
+
+        if d == "run_deep_debug":
+            await run_deep_debug(q, ctx)
+            return
 
         # Any navigation/back/cancel action must terminate the previous text-entry
         # state before rendering the destination page. This is global across all bot sections.
@@ -6979,12 +7059,13 @@ async def on_callback(u, ctx):
         if d.startswith("mq_list_"):
             ctx.user_data.pop("manual_queue_edit", None)
             ctx.user_data.pop("manual_schedule_custom", None)
+            parts=d.split("_")
             try:
-                profile_id = int(d.rsplit("_", 1)[1])
-            except ValueError:
-                await q.answer("⚠️ شناسه نامعتبر"); return
-            jobs = get_manual_queue(profile_id)
-            await q.edit_message_text(f"📋 <b>صف ارسال‌های دستی</b>\nتعداد صف فعال: <b>{len(jobs)}</b>\nفقط موارد در انتظار نمایش داده می‌شوند.", parse_mode="HTML", reply_markup=manual_queue_list_kb(profile_id))
+                profile_id=int(parts[2]); page=max(1,int(parts[3])) if len(parts)>3 else 1
+            except (ValueError,IndexError):
+                await q.answer("⚠️ شناسه/صفحه نامعتبر",show_alert=True); return
+            jobs=get_manual_queue(profile_id)
+            await q.edit_message_text(f"📋 <b>صف ارسال‌های دستی</b>\nتعداد صف فعال: <b>{len(jobs)}</b>\nصفحه: <b>{page}</b>",parse_mode="HTML",reply_markup=manual_queue_list_kb(profile_id,page))
             return
 
         if d.startswith("mq_detail_"):
@@ -7487,6 +7568,25 @@ async def on_callback(u, ctx):
                 await q.answer("⚠️ خطا در داده")
             return
 
+        if d.startswith("tgl_cfg_header_"):
+            try:
+                profile_id=int(d.rsplit("_",1)[1]); current=get_profile_config_header_enabled(profile_id)
+                set_profile_config_header_enabled(profile_id,not current)
+                await q.answer("✅ عنوان بخش فعال شد." if not current else "🗑 عنوان بخش حذف شد.")
+                await show_profile_admin(q.message,profile_id)
+            except (ValueError,IndexError) as exc:
+                log.exception("config header toggle failed"); await q.answer(f"⚠️ خطا: {exc}",show_alert=True)
+            return
+        if d.startswith("tgl_low_cost_"):
+            try:
+                profile_id=int(d.rsplit("_",1)[1]); current=get_profile_low_cost_mode(profile_id)
+                set_profile_low_cost_mode(profile_id,not current)
+                await q.answer("⚡ حالت کم‌مصرف فعال شد." if not current else "⚡ حالت کم‌مصرف خاموش شد.")
+                await show_profile_admin(q.message,profile_id)
+            except (ValueError,IndexError) as exc:
+                log.exception("low cost toggle failed"); await q.answer(f"⚠️ خطا: {exc}",show_alert=True)
+            return
+
         # New toggles for country
         if d.startswith("tgl_country_"):
             parts = d.split("_")
@@ -7657,6 +7757,8 @@ async def show_profile_admin(msg_or_q, profile_id):
         ping_status=ping_status,
         profile_status=profile_status,
         country_display=country_label,
+        config_header_status="فعال" if get_profile_config_header_enabled(profile_id) else "حذف",
+        low_cost_status="فعال" if get_profile_low_cost_mode(profile_id) else "خاموش",
     )
     kb = profile_admin_kb(profile_id)
     try:
@@ -8243,8 +8345,10 @@ async def on_text(u, ctx):
         if not template:
             await u.message.reply_text("❌ قالب خالی است.")
             return
-        if "{Flag}" not in template and "{CHANNEL_ID}" not in template and "{COUNT}" not in template:
-            await u.message.reply_text("❌ قالب باید حداقل یکی از متغیرهای {Flag}، {CHANNEL_ID} یا {COUNT} را داشته باشد.")
+        normalized_template = template.replace("[", "{").replace("]", "}")
+        allowed_tokens = ("{Flag}", "{FLAG}", "{Protocol}", "{PROTOCOL}", "{COUNTRY_EN}", "{COUNTRY_FA}", "{Country}", "{COUNTRY}", "{CHANNEL_ID}", "{COUNT}", "{PING}")
+        if not any(token in normalized_template for token in allowed_tokens):
+            await u.message.reply_text("❌ قالب باید حداقل یکی از متغیرهای Protocol / Flag / Country / Channel / Count را داشته باشد.")
             return
         set_profile_naming_template(profile_id, template)
         await u.message.reply_text(msg("naming_template_set", template=template))
@@ -8741,7 +8845,8 @@ if __name__ == "__main__":
 # - sqlite size control
 # ======================================================================
 
-DB_OPTIMIZER_VERSION = "3.2.1"
+DB_OPTIMIZER_VERSION = "3.2.2"
+APP_VERSION = "0.1.21-FINAL"
 
 def post_fingerprint(text):
     return hashlib.sha256((text or "").encode("utf-8", errors="ignore")).hexdigest()
