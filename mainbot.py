@@ -1,3 +1,4 @@
+APP_VERSION = "0.1.22-FINAL"
 import os
 import re
 import asyncio
@@ -346,6 +347,7 @@ def prepare_replaced_database():
     migrate_header_modes()
     fix_column_types()
     ensure_column("profiles", "config_header_enabled", "INTEGER DEFAULT 1", 1)
+    ensure_column("profiles", "config_header_template", "TEXT DEFAULT '[Protocol] [Flag] [Country]'", "[Protocol] [Flag] [Country]")
     ensure_column("profiles", "low_cost_mode", "INTEGER DEFAULT 1", 1)
     conn.commit()
 
@@ -1500,7 +1502,7 @@ def update_profile(profile_id, **kwargs):
                "schedule_cron", "last_backup_count", "timer_expiry", "timer_duration",
                "backup_interval", "interval_config", "interval_proxy", "max_post_config", "max_post_proxy",
                "naming_template", "channel_link", "ping_enabled", "profile_enabled",
-               "country_display", "show_ping", "proxy_banner_template", "proxy_post_mode", "ping_testing", "config_header_enabled", "low_cost_mode"]
+               "country_display", "show_ping", "proxy_banner_template", "proxy_post_mode", "ping_testing", "config_header_enabled", "config_header_template", "low_cost_mode"]
     for key, value in kwargs.items():
         if key in allowed:
             c.execute(f"UPDATE profiles SET {key}=? WHERE id=?", (value, profile_id))
@@ -1700,6 +1702,26 @@ def get_profile_backup_interval(profile_id):
 
 def set_profile_backup_interval(profile_id, interval):
     update_profile(profile_id, backup_interval=interval)
+
+def get_profile_config_header_template(profile_id):
+    prof = get_profile(profile_id)
+    return prof.get("config_header_template", "[Protocol] [Flag] [Country]") if prof else "[Protocol] [Flag] [Country]"
+
+def set_profile_config_header_template(profile_id, template):
+    template = (template or "[Protocol] [Flag] [Country]").strip()
+    if not template:
+        template = "[Protocol] [Flag] [Country]"
+    allowed = ("Protocol", "Flag", "Country", "COUNTRY_EN", "COUNTRY_FA", "CHANNEL_ID", "COUNT", "PING")
+    cleaned = template
+    # Keep unknown placeholders visible to the admin instead of silently corrupting output.
+    unknown = re.findall(r"[\[{]([A-Za-z_]+)[\]}]", cleaned)
+    bad = sorted({x for x in unknown if x not in allowed})
+    if bad:
+        raise ValueError("Placeholder نامعتبر: " + ", ".join(bad))
+    update_profile(profile_id, config_header_template=cleaned)
+
+def reset_profile_config_header_template(profile_id):
+    set_profile_config_header_template(profile_id, "[Protocol] [Flag] [Country]")
 
 def get_profile_naming_template(profile_id):
     prof = get_profile(profile_id)
@@ -3741,22 +3763,14 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
             if ip:
                 flag, country_code = await get_flag_for_ip(ip)
 
-        # Optional config title/header. When disabled, its whole line disappears.
-        config_header_mode, _proxy_header_mode = get_header_modes(profile_id)
+        # Config title/header is fully template-driven. Default: [Protocol] [Flag] [Country].
         config_title = detect_config_protocol(url)
         header_parts = []
+        config_header_template = get_profile_config_header_template(profile_id)
         if config_header_enabled:
-            if config_header_mode == "protocol":
-                if not config_title:
-                    log.warning(f"[CONFIG][profile={profile_id}] Unknown config protocol: {url[:80]}")
-                    continue
-                header_parts = [config_title]
-            else:
-                config_channel = channel_link or dest or "@Channel"
-                config_channel = str(config_channel).strip()
-                if not config_channel.startswith("@") and config_channel:
-                    config_channel = "@" + config_channel.lstrip("@")
-                header_parts = [config_channel or "@Channel"]
+            if not config_title:
+                log.warning(f"[CONFIG][profile={profile_id}] Unknown config protocol: {url[:80]}")
+                continue
 
         # Country display
         if country_display == 0:
@@ -3782,12 +3796,27 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
             elif flag_emoji:
                 header_parts.append(flag_emoji)
 
-        # Ping display
-        # Numbering
-        if show_numbers and config_header_enabled:
-            header = f"<b>#{n}</b> " + " ".join(header_parts)
+        # Render configurable config title. Country mode is controlled independently: 
+        # when country is off, [Country] simply becomes empty.
+        if config_header_enabled:
+            header_values = {
+                "Protocol": config_title or "",
+                "Flag": flag or "",
+                "Country": (f"{COUNTRY_NAMES_EN.get(country_code, '')} • {COUNTRY_NAMES_FA.get(country_code, '')}".strip(" •")
+                            if country_display == 2 else COUNTRY_NAMES_EN.get(country_code, "") if country_display == 1 else ""),
+                "COUNTRY_EN": COUNTRY_NAMES_EN.get(country_code, "") if country_display in (1,2) else "",
+                "COUNTRY_FA": COUNTRY_NAMES_FA.get(country_code, "") if country_display == 2 else "",
+                "CHANNEL_ID": channel_link or dest or "",
+                "COUNT": str(n), "PING": "",
+            }
+            header = config_header_template
+            for _key, _value in header_values.items():
+                header = header.replace("{"+_key+"}", str(_value)).replace("["+_key+"]", str(_value))
+            header = re.sub(r"[ \t]{2,}", " ", header).strip(" -•|")
+            if show_numbers:
+                header = f"<b>#{n}</b> {header}" if header else f"<b>#{n}</b>"
         else:
-            header = " ".join(header_parts) if config_header_enabled else ""
+            header = ""
 
         fragment_text = render_naming_template(
             naming_template, protocol=config_title, flag=flag,
@@ -5134,6 +5163,7 @@ def profile_admin_kb(profile_id):
         [InlineKeyboardButton("⚙️ مدیریت پروتکل‌ها", callback_data=f"proto_menu_{profile_id}", style="primary")],
         [InlineKeyboardButton(f"🧩 عنوان کانفیگ: {'✅ فعال' if prof.get('config_header_enabled', 1) else '❌ حذف'}", callback_data=f"tgl_cfg_header_{profile_id}", style="success" if prof.get('config_header_enabled', 1) else "danger"),
          InlineKeyboardButton(f"⚡ کم‌مصرف: {'✅ فعال' if prof.get('low_cost_mode', 1) else '❌ خاموش'}", callback_data=f"tgl_low_cost_{profile_id}", style="success" if prof.get('low_cost_mode', 1) else "danger")],
+        [InlineKeyboardButton(f"🏷 قالب عنوان: {get_profile_config_header_template(profile_id)}", callback_data=f"cfg_header_tpl_{profile_id}", style="primary")],
         [InlineKeyboardButton(msg("btn_set_banner_config"), callback_data=f"ab_config_{profile_id}", style="primary"),
          InlineKeyboardButton(msg("btn_set_banner_proxy"), callback_data=f"ab_proxy_{profile_id}", style="primary")],
         [InlineKeyboardButton("⏰ بازه کانفیگ", callback_data=f"set_cfg_interval_{profile_id}", style="primary"),
@@ -5542,7 +5572,7 @@ def _debug_static_report():
     path=os.path.abspath(__file__)
     try: source=open(path,"r",encoding="utf-8",errors="replace").read()
     except Exception as exc: return f"FILE READ FAILED: {exc}"
-    lines=source.splitlines(); out=[f"BOT DEEP DEBUG | version={APP_VERSION}",f"FILE: {path}",f"LINES: {len(lines)}"]
+    lines=source.splitlines(); out=[f"BOT DEEP DEBUG | version={globals().get('APP_VERSION', 'unknown')}",f"FILE: {path}",f"LINES: {len(lines)}"]
     try: tree=ast.parse(source,filename=path); out.append("SYNTAX: PASS")
     except SyntaxError as exc:
         out.append(f"SYNTAX: FAIL | line={exc.lineno} col={exc.offset} | {exc.msg}"); return "\n".join(out)
@@ -7606,6 +7636,38 @@ async def on_callback(u, ctx):
                 await q.answer("⚠️ خطا در داده")
             return
 
+        # Config header template
+        if d.startswith("cfg_header_tpl_default_"):
+            try:
+                profile_id = int(d.rsplit("_", 1)[1])
+            except (ValueError, IndexError):
+                await q.answer("⚠️ شناسه پروفایل نامعتبر", show_alert=True); return
+            reset_profile_config_header_template(profile_id)
+            ctx.user_data.pop("action", None)
+            await q.answer("✅ قالب عنوان به پیش‌فرض برگشت")
+            await show_profile_admin(q.message, profile_id)
+            return
+
+        if d.startswith("cfg_header_tpl_"):
+            try:
+                profile_id = int(d.rsplit("_", 1)[1])
+            except (ValueError, IndexError):
+                await q.answer("⚠️ شناسه پروفایل نامعتبر", show_alert=True); return
+            current = get_profile_config_header_template(profile_id)
+            ctx.user_data["action"] = f"cfg_header_tpl_{profile_id}"
+            await q.edit_message_text(
+                "🏷 <b>قالب عنوان کانفیگ</b>\n\n"
+                f"قالب فعلی: <code>{html.escape(current)}</code>\n\n"
+                "توکن‌ها: [Protocol] [Flag] [Country] [COUNTRY_EN] [COUNTRY_FA] [CHANNEL_ID] [COUNT] [PING]\n\n"
+                "قالب پیش‌فرض: <code>[Protocol] [Flag] [Country]</code>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("♻️ بازگردانی پیش‌فرض", callback_data=f"cfg_header_tpl_default_{profile_id}", style="success")],
+                    [InlineKeyboardButton("🔙 بازگشت", callback_data=f"prof_{profile_id}", style="primary")]
+                ])
+            )
+            return
+
         # Naming template and channel link
         if d.startswith("set_naming_"):
             parts = d.split("_")
@@ -8756,9 +8818,9 @@ async def post_init(app):
     if ENABLE_AUTO:
         for prof in profiles:
             log.info(f"⏰ Creating config loop for profile {prof['id']} ({prof['dest_name']})")
-            start_worker(app, f"config_{prof["id"]}", lambda pid=prof["id"]: profile_loop_config(app.bot, pid))
+            start_worker(app, f"config_{prof['id']}", lambda pid=prof["id"]: profile_loop_config(app.bot, pid))
             log.info(f"⏰ Creating proxy loop for profile {prof['id']} ({prof['dest_name']})")
-            start_worker(app, f"proxy_{prof["id"]}", lambda pid=prof["id"]: profile_loop_proxy(app.bot, pid))
+            start_worker(app, f"proxy_{prof['id']}", lambda pid=prof["id"]: profile_loop_proxy(app.bot, pid))
         log.info("⏰ Scheduler started for all profiles (config and proxy loops)")
 
     start_worker(app, "cleanup", lambda: periodic_cleanup())
@@ -8812,7 +8874,6 @@ def optimize_database():
             db.close()
 
 def main():
-    optimize_database()
     try:
         optimize_database()
     except Exception:
@@ -8846,7 +8907,6 @@ if __name__ == "__main__":
 # ======================================================================
 
 DB_OPTIMIZER_VERSION = "3.2.2"
-APP_VERSION = "0.1.21-FINAL"
 
 def post_fingerprint(text):
     return hashlib.sha256((text or "").encode("utf-8", errors="ignore")).hexdigest()
