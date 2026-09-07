@@ -1,9 +1,9 @@
 # bot.py — 4.1.4
-APP_VERSION = "4.1.7"
+APP_VERSION = "4.1.8"
 APP_VERSION_MAJOR = 4
 APP_VERSION_MINOR = 1
-APP_VERSION_PATCH = 7
-APP_VERSION_LABEL = "4.1.7-stable"
+APP_VERSION_PATCH = 8
+APP_VERSION_LABEL = "4.1.8-stable"
 BOT_VERSION = APP_VERSION
 import os
 import re
@@ -4491,6 +4491,17 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
             config_blocks.append((header + "\n" if header else "") + block)
         posted_entries.append((modified_url, source_for_seen, url))
 
+    # Absolute safety gate: NEVER send a banner by itself. A Telegram message
+    # is considered publishable only when at least one real config block was
+    # successfully built. This also protects against unknown/unsupported
+    # protocols being filtered after the candidate list was selected.
+    if not config_blocks or not posted_entries:
+        log.warning(
+            f"⛔ [CONFIG][profile={profile_id}] refusing empty banner send: "
+            f"items={len(items)} blocks={len(config_blocks)} entries={len(posted_entries)}"
+        )
+        return 0
+
     if config_mode == 1:
         # Quote mode ONLY: one expandable quote + one code block for ALL configs.
         # This makes the whole group one copyable payload and removes blank lines
@@ -4906,15 +4917,31 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
                 conn.commit()
                 log.info(f"📦 [AUTO-CONFIG] strict queue tested={len(chunk)}/{len(fresh)} pending={len(working)} target={desired}")
         else:
-            adaptive_limit = max(desired * 2, desired + 8)
-            test_limit = min(len(new_configs), adaptive_limit)
-            to_test=new_configs[:test_limit]
-            log.info(f"📊 Testing {len(to_test)} configs... low_cost={low_cost_mode}")
-            rs = await asyncio.gather(*[_check(item) for item in to_test], return_exceptions=True)
-            for r in rs:
-                if not isinstance(r, Exception) and r[1]:
-                    working.append((r[0], r[2], r[3]))
-            log.info(f"📊 Working configs: {len(working)}")
+            # Normal mode: when ping testing is OFF, do not spend time in the
+            # health-test pipeline. Any structurally valid, new config is
+            # publishable and at least one must be selected when available.
+            if not ping_testing:
+                working = [(u, 0, 0) for u, _src in new_configs[:desired]]
+                log.info(
+                    f"📊 Ping testing OFF for profile={profile_id}; "
+                    f"publishing {len(working)} new configs without health filtering"
+                )
+            else:
+                # Do not stop after only desired*2 candidates. A temporary
+                # outage in the first few sources must not make the profile
+                # look broken while hundreds of later candidates are available.
+                # Test a bounded but sufficiently large window and stop only
+                # after collecting the requested number of healthy configs.
+                test_limit = min(len(new_configs), max(60, min(240, desired * 30)))
+                to_test = new_configs[:test_limit]
+                log.info(f"📊 Testing {len(to_test)} configs... low_cost={low_cost_mode}")
+                rs = await asyncio.gather(*[_check(item) for item in to_test], return_exceptions=True)
+                for r in rs:
+                    if not isinstance(r, Exception) and r[1]:
+                        working.append((r[0], r[2], r[3]))
+                        if len(working) >= desired:
+                            break
+                log.info(f"📊 Working configs: {len(working)}")
         if not working:
             log.warning(f"[AUTO-CONFIG] profile={profile_id} no publishable configs in current window; cursor retained")
     else:
@@ -5022,7 +5049,13 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
             f"ready={len(working)}/{desired}; nothing will be posted until the batch is full"
         )
     if config_batch_ready and enable_configs:
-        total_configs = await post_configs(
+        # A config post is legal only if there is at least one candidate.
+        # post_configs has a second hard gate, so an empty banner can never be
+        # emitted even if a caller accidentally reaches this branch.
+        if not working:
+            log.warning(f"⛔ [AUTO-CONFIG] profile={profile_id}: no config candidate; skipping post")
+        else:
+            total_configs = await post_configs(
             bot, profile_id, working[:desired] if batch_posting else working,
             source_for_seen="auto", is_instant=is_instant,
             extra_button_rows=glass_proxy_rows
@@ -5126,8 +5159,8 @@ async def profile_loop_config(bot, profile_id):
     log.info(f"🔄 Starting config loop for profile {profile_id}")
     while True:
         try:
-            _WORKER_HEARTBEATS.get(f"auto_{mode}_{profile_id}")
-            _WORKER_HEARTBEATS[f"auto_{mode}_{profile_id}"] = time.time()
+            _WORKER_HEARTBEATS.get(f"auto_config_{profile_id}")
+            _WORKER_HEARTBEATS[f"auto_config_{profile_id}"] = time.time()
             profile = get_profile(profile_id)
             if not profile:
                 log.error(f"❌ Profile {profile_id} not found, stopping config loop.")
@@ -5200,8 +5233,8 @@ async def profile_loop_proxy(bot, profile_id):
     log.info(f"🔄 Starting proxy loop for profile {profile_id}")
     while True:
         try:
-            _WORKER_HEARTBEATS.get(f"auto_{mode}_{profile_id}")
-            _WORKER_HEARTBEATS[f"auto_{mode}_{profile_id}"] = time.time()
+            _WORKER_HEARTBEATS.get(f"auto_proxy_{profile_id}")
+            _WORKER_HEARTBEATS[f"auto_proxy_{profile_id}"] = time.time()
             profile = get_profile(profile_id)
             if not profile:
                 log.error(f"❌ Profile {profile_id} not found, stopping proxy loop.")
