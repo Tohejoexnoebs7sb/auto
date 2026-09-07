@@ -1,9 +1,9 @@
 # bot.py — 4.1.4
-APP_VERSION = "4.1.9"
+APP_VERSION = "4.1.10"
 APP_VERSION_MAJOR = 4
 APP_VERSION_MINOR = 1
-APP_VERSION_PATCH = 9
-APP_VERSION_LABEL = "4.1.9-stable"
+APP_VERSION_PATCH = 10
+APP_VERSION_LABEL = "4.1.10-stable"
 BOT_VERSION = APP_VERSION
 import os
 import re
@@ -1375,6 +1375,11 @@ def _manual_queue_commit_batch(job_id, profile_id, sent_items, error=""):
     job = get_manual_queue_job(job_id, profile_id)
     if not job:
         return
+    # If an admin cancelled while Telegram was processing the request, preserve
+    # the queue contents. Cancellation is a pause, never an implicit deletion.
+    if job.get("status") == "cancelled":
+        log.info(f"[MANUAL_QUEUE] job={job_id} remains cancelled; preserving queue after send attempt")
+        return
     remaining = list(job.get("items") or [])
     sent_set = set(sent_items or [])
     # Preserve order while removing exactly the items that were successfully published.
@@ -1416,6 +1421,67 @@ def _manual_queue_commit_batch(job_id, profile_id, sent_items, error=""):
             last_error=str(error or "")[:500]
         )
 
+async def _send_manual_config_items(bot, profile_id, items):
+    """Send explicit manual configs without touching automatic dedup/cursors."""
+    items = [str(x).strip() for x in (items or []) if str(x).strip()]
+    if not items:
+        return 0
+    # De-duplicate only within this manual batch. Explicit manual sending is
+    # intentionally allowed even if AUTO has posted the same config before.
+    unique = []
+    keys = set()
+    for url in items:
+        key = _config_identity_hash(url)
+        if key in keys:
+            continue
+        keys.add(key)
+        unique.append(url)
+    working = [(url, 0, 0) for url in unique]
+    return await post_configs(
+        bot, profile_id, working, source_for_seen="manual",
+        is_instant=True, max_post_override=len(working),
+        dedup=False, update_auto_state=False
+    )
+
+async def _send_manual_proxy_items(bot, profile_id, items):
+    """Send explicit manual MTProto proxies without touching AUTO dedup state."""
+    unique=[]; keys=set()
+    for raw in items or []:
+        norm = canonical_telegram_proxy_url(raw)
+        if not norm:
+            continue
+        key = _proxy_identity_hash(norm)
+        if key in keys:
+            continue
+        keys.add(key); unique.append(norm)
+    if not unique:
+        return 0
+    flag_rows=[]
+    for norm in unique[:50]:
+        host,_ = extract_host(norm)
+        flag,country_code = "🌐",""
+        if host:
+            try:
+                ip=await host_to_ip(host)
+                if ip:
+                    flag,country_code=await get_flag_for_ip(ip)
+            except Exception:
+                pass
+        flag_rows.append((norm,0,flag,country_code))
+    cnt,payload,selected = await post_proxies(
+        bot, profile_id, flag_rows, is_instant=True,
+        max_proxies_override=len(flag_rows), dedup=False
+    )
+    if cnt <= 0 or not payload:
+        return 0
+    text_p,buttons=payload
+    ok=await send_to_destination(bot, profile_id, text_p, buttons)
+    if ok:
+        # Deliberately do not call mark_proxies_posted_batch here. Manual traffic
+        # must not change the automatic profile's dedup ledger.
+        return len(selected)
+    return 0
+
 async def _send_manual_queue_batch(bot, job):
     profile_id = int(job["profile_id"])
     kind = job["kind"]
@@ -1432,7 +1498,8 @@ async def _send_manual_queue_batch(bot, job):
         working = [(url, 0, 0) for url in batch]
         sent = await post_configs(
             bot, profile_id, working, source_for_seen="manual",
-            is_instant=False, max_post_override=len(batch)
+            is_instant=True, max_post_override=len(batch),
+            dedup=False, update_auto_state=False
         )
         if sent <= 0:
             _manual_queue_commit_batch(job["id"], profile_id, [], "Telegram config send failed")
@@ -1442,33 +1509,12 @@ async def _send_manual_queue_batch(bot, job):
         _manual_queue_commit_batch(job["id"], profile_id, batch[:sent], "")
         return sent
 
-    proxy_with_ping = []
-    for proxy_url in batch:
-        host, _ = extract_host(proxy_url)
-        flag, country_code = "🌐", ""
-        if host:
-            try:
-                ip = await host_to_ip(host)
-                if ip:
-                    flag, country_code = await get_flag_for_ip(ip)
-            except Exception:
-                pass
-        proxy_with_ping.append((proxy_url, 0, flag, country_code))
-
-    cnt, payload, selected = await post_proxies(
-        bot, profile_id, proxy_with_ping, is_instant=False, max_proxies_override=len(batch)
-    )
-    if cnt <= 0 or not payload:
-        _manual_queue_commit_batch(job["id"], profile_id, [], "No publishable proxies in batch")
-        return 0
-    text_p, buttons = payload
-    sent_ok = await send_to_destination(bot, profile_id, text_p, buttons)
-    if not sent_ok:
+    sent = await _send_manual_proxy_items(bot, profile_id, batch)
+    if sent <= 0:
         _manual_queue_commit_batch(job["id"], profile_id, [], "Telegram proxy send failed")
         return 0
-    mark_proxies_posted_batch(profile_id, selected)
-    _manual_queue_commit_batch(job["id"], profile_id, selected, "")
-    return len(selected)
+    _manual_queue_commit_batch(job["id"], profile_id, batch[:sent], "")
+    return sent
 
 
 DB_RETENTION_HOURS = 24 * 7
@@ -1508,20 +1554,17 @@ def sqlite_maintenance_cycle():
     return cleanup_expired_runtime_data()
 
 async def _run_manual_queue_batch_isolated(bot, job):
-    """Send one queue batch without racing the profile's automatic cycle.
+    """Send one manual batch in its own per-profile lane.
 
-    Manual queues are persistent and independent, but they must not publish
-    concurrently with the same profile's automatic cycle. Waiting on this
-    per-profile lock prevents duplicate posts and shared cursor corruption.
+    IMPORTANT: this lock is intentionally separate from _PROFILE_CYCLE_LOCKS.
+    Manual queue traffic never blocks, waits for, or mutates the automatic cycle.
     """
     profile_id = int(job["profile_id"])
-    lock = _PROFILE_CYCLE_LOCKS.get(profile_id)
+    lock = _MANUAL_QUEUE_LOCKS.get(profile_id)
     if lock is None:
         lock = asyncio.Lock()
-        _PROFILE_CYCLE_LOCKS[profile_id] = lock
+        _MANUAL_QUEUE_LOCKS[profile_id] = lock
     async with lock:
-        # Re-read after waiting: the admin may have cancelled/deleted the job
-        # while this task was waiting.
         fresh = get_manual_queue_job(int(job["id"]), profile_id)
         if not fresh or fresh.get("status") != "running":
             return 0
@@ -1602,6 +1645,19 @@ async def manual_queue_worker(bot):
         except Exception:
             log.exception("manual_queue_worker error")
             await asyncio.sleep(0.5)
+
+async def _force_manual_queue_send(bot, profile_id, job_id):
+    try:
+        job=get_manual_queue_job(job_id, profile_id)
+        if not job or job.get("status") != "running":
+            return
+        sent=await _run_manual_queue_batch_isolated(bot, job)
+        log.info(f"[MANUAL_FORCE] job={job_id} profile={profile_id} sent={sent}")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log.exception(f"[MANUAL_FORCE] job={job_id} profile={profile_id} failed")
+        update_manual_queue_job(job_id, profile_id, status="pending", last_error=str(exc)[:500], next_run_at=_queue_iso(_queue_now()+timedelta(seconds=10)))
 
 # Normalize missing Ping mode to the new default (Global) without overwriting explicit user choices.
 c.execute("UPDATE profiles SET ping_mode=? WHERE ping_mode IS NULL OR TRIM(ping_mode)=?", ("global", ""))
@@ -4357,7 +4413,7 @@ def split_text(text, max_len=4096):
 # ======================================================================
 # ارسال کانفیگ‌ها و پروکسی‌ها (با بهبودهای جدید)
 # ======================================================================
-async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=False, max_post_override=None, extra_button_rows=None):
+async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=False, max_post_override=None, extra_button_rows=None, dedup=True, update_auto_state=True):
     if not working:
         return 0
 
@@ -4369,7 +4425,10 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
     local_seen = set()
     for url, ping, cnt in working:
         identity_hash = _config_identity_hash(url)
-        if identity_hash in local_seen or is_already_posted(profile_id, url):
+        if identity_hash in local_seen:
+            log.info(f"⏭️ Duplicate config skipped inside current send: {str(url)[:70]}...")
+            continue
+        if dedup and is_already_posted(profile_id, url):
             log.info(f"⏭️ Duplicate config skipped before send: {str(url)[:70]}...")
             continue
         local_seen.add(identity_hash)
@@ -4622,30 +4681,31 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
         if not sent_message:
             ok = False
             break
+        # Channel-message history is useful for the per-profile deletion tool,
+        # but manual sends must never alter the automatic dedup/cursor state.
         record_channel_post(profile_id, sent_message)
-        # Record ONLY the configs contained in this Telegram message, and only
-        # after Telegram confirmed that message was sent. If a later chunk fails,
-        # earlier successful chunks remain permanently deduplicated.
         batch_entries = message_entry_batches[idx] if idx < len(message_entry_batches) else []
         if batch_entries:
-            mark_configs_posted_batch(profile_id, batch_entries)
+            if update_auto_state:
+                # Record ONLY after Telegram confirmed delivery.
+                mark_configs_posted_batch(profile_id, batch_entries)
             sent_count += len(batch_entries)
         if idx < len(html_messages) - 1:
             await asyncio.sleep(0.25)
 
     if not ok:
         log.error(f"❌ Config send stopped after partial success: sent={sent_count}")
-        if sent_count > 0:
+        if update_auto_state and sent_count > 0:
             set_profile_last_num(profile_id, last_n + sent_count)
         return sent_count
 
-    if sent_count > 0:
+    if update_auto_state and sent_count > 0:
         set_profile_last_num(profile_id, last_n + sent_count)
 
     log.info(f"✅ Sent {sent_count} configs in one message to {dest}")
     return sent_count
 
-async def post_proxies(bot, profile_id, proxies_with_ping, is_instant=False, max_proxies_override=None):
+async def post_proxies(bot, profile_id, proxies_with_ping, is_instant=False, max_proxies_override=None, dedup=True):
     """Build a proxy post. Does NOT mark anything posted; caller does that only after Telegram success."""
     if not proxies_with_ping:
         return 0, None, []
@@ -4670,7 +4730,9 @@ async def post_proxies(bot, profile_id, proxies_with_ping, is_instant=False, max
         except Exception:
             continue
         norm = canonical_telegram_proxy_url(raw)
-        if not norm or is_proxy_posted(profile_id, norm):
+        if not norm:
+            continue
+        if dedup and is_proxy_posted(profile_id, norm):
             continue
         proxy_identity_hash = _proxy_identity_hash(norm)
         if any(proxy_identity_hash == existing for existing in local_proxy_keys):
@@ -5171,6 +5233,9 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
 # One cycle at a time per profile. Automatic and manual triggers share this
 # lock, so two callers can never publish the same candidate concurrently.
 _PROFILE_CYCLE_LOCKS = {}
+# Manual sending is deliberately isolated from automatic cycles.
+# It has its own per-profile lock and never acquires the automatic-cycle lock.
+_MANUAL_QUEUE_LOCKS = {}
 
 async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_proxies=True, is_instant=False, wait_if_running=False):
     pid = int(profile_id)
@@ -8533,12 +8598,16 @@ async def _on_callback_impl(u, ctx):
         if d.startswith("mq_force_"):
             parts=d.split("_")
             try: profile_id=int(parts[2]); job_id=int(parts[3])
-            except (ValueError,IndexError): await q.answer("⚠️ داده نامعتبر"); return
+            except (ValueError,IndexError): await q.answer("⚠️ داده نامعتبر", show_alert=True); return
             job=get_manual_queue_job(job_id, profile_id)
-            if not job or job.get("status") != "pending":
+            if not job or job.get("status") not in ("pending", "cancelled"):
                 await q.answer("صف فعال نیست", show_alert=True); return
-            update_manual_queue_job(job_id, profile_id, next_run_at=_queue_iso(_queue_now()))
-            await q.answer("⏩ برای ارسال فوری علامت‌گذاری شد")
+            if not (job.get("items") or []):
+                await q.answer("صف خالی است", show_alert=True); return
+            update_manual_queue_job(job_id, profile_id, status="running", next_run_at=_queue_iso(_queue_now()), last_error="")
+            task_key=f"manual_queue_force_{profile_id}_{job_id}"
+            asyncio.create_task(_force_manual_queue_send(u.get_bot(), profile_id, job_id), name=task_key)
+            await q.answer("🚀 ارسال همین پست شروع شد")
             return
 
         if d.startswith("mq_edit_back_"):
@@ -9595,8 +9664,14 @@ async def _on_text_impl(u, ctx):
             # A new profile must use the same precise scheduler as profiles
             # loaded at startup. Do not call Bot.create_task (Bot has no such
             # API); schedule these coroutines on the running event loop.
-            asyncio.create_task(_profile_scheduler_v16(bot, new_id, "config"), name=f"auto_config_{new_id}")
-            asyncio.create_task(_profile_scheduler_v16(bot, new_id, "proxy"), name=f"auto_proxy_{new_id}")
+            # Use the current Application when available; otherwise schedule on the running loop.
+            app_obj = getattr(ctx, "application", None)
+            if app_obj is not None:
+                start_worker(app_obj, f"auto_config_{new_id}", lambda: _profile_scheduler_v16(bot, new_id, "config"))
+                start_worker(app_obj, f"auto_proxy_{new_id}", lambda: _profile_scheduler_v16(bot, new_id, "proxy"))
+            else:
+                asyncio.create_task(_profile_scheduler_v16(bot, new_id, "config"), name=f"auto_config_{new_id}")
+                asyncio.create_task(_profile_scheduler_v16(bot, new_id, "proxy"), name=f"auto_proxy_{new_id}")
             log.info(f"⏰ Started precise auto schedulers for new profile {new_id}")
         await show_profiles_list(u.message)
         return
@@ -10186,6 +10261,22 @@ def start_worker(app, name, coro_factory):
     log.info(f"[BOOT] Worker started: {name}")
     return task
 
+async def _profile_scheduler_supervisor(app):
+    """Continuously ensure every enabled profile has exactly one AUTO scheduler per stream."""
+    while True:
+        try:
+            if ENABLE_AUTO:
+                for prof in get_profiles():
+                    pid=int(prof["id"])
+                    start_worker(app, f"auto_config_{pid}", lambda pid=pid: _profile_scheduler_v16(app.bot, pid, "config"))
+                    start_worker(app, f"auto_proxy_{pid}", lambda pid=pid: _profile_scheduler_v16(app.bot, pid, "proxy"))
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            log.exception("[AUTO-SUPERVISOR] scheduler reconciliation failed")
+            await asyncio.sleep(5)
+
 async def worker_watchdog():
     while True:
         try:
@@ -10269,6 +10360,8 @@ async def post_init(app):
             log.info(f"⏰ Creating precise proxy scheduler for profile {pid} ({prof['dest_name']})")
             start_worker(app, f"auto_proxy_{pid}", lambda pid=pid: _profile_scheduler_v16(app.bot, pid, "proxy"))
         log.info("⏰ Precise automatic scheduler started: config/proxy are fully independent")
+        start_worker(app, "profile_scheduler_supervisor", lambda: _profile_scheduler_supervisor(app))
+        log.info("🛡️ AUTO scheduler supervisor enabled (10s reconciliation)")
 
     start_worker(app, "cleanup", lambda: periodic_cleanup())
     start_worker(app, "database_cleaner", lambda: database_cleanup_worker())
