@@ -1,9 +1,9 @@
-# bot.py — 4.1.4
-APP_VERSION = "4.1.5"
+# bot.py — 4.1.6
+APP_VERSION = "4.1.6"
 APP_VERSION_MAJOR = 4
 APP_VERSION_MINOR = 1
 APP_VERSION_PATCH = 5
-APP_VERSION_LABEL = "4.1.5-stable"
+APP_VERSION_LABEL = "4.1.6-stable"
 BOT_VERSION = APP_VERSION
 import os
 import re
@@ -371,15 +371,12 @@ def prepare_replaced_database():
     ensure_column("profiles", "config_header_enabled", "INTEGER DEFAULT 1", 1)
     ensure_column("profiles", "config_header_template", "TEXT DEFAULT '[Protocol] [Flag] [Country]'", "[Protocol] [Flag] [Country]")
     ensure_column("profiles", "low_cost_mode", "INTEGER DEFAULT 1", 1)
-# Optional smart batch posting. MUST default to OFF for every new/existing profile.
-ensure_column("profiles", "batch_posting", "INTEGER DEFAULT 0", 0)
-try:
-    c.execute("UPDATE profiles SET batch_posting=0 WHERE batch_posting IS NULL")
-    conn.commit()
-except Exception:
-    pass
-    conn.commit()
-
+    ensure_column("profiles", "batch_posting", "INTEGER DEFAULT 0", 0)
+    try:
+        c.execute("UPDATE profiles SET batch_posting=0 WHERE batch_posting IS NULL")
+        conn.commit()
+    except Exception:
+        pass
 async def replace_database_from_file(update, source_path, original_name="database"):
     """Safely replace the live DB with a validated SQLite DB or SQL dump.
 
