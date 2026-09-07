@@ -1,5 +1,9 @@
-# bot.py — 4.0.0
-APP_VERSION = "4.0.0"
+# bot.py — 4.1.0
+APP_VERSION = "4.1.0"
+APP_VERSION_MAJOR = 4
+APP_VERSION_MINOR = 1
+APP_VERSION_PATCH = 0
+APP_VERSION_LABEL = "4.1.0-stable"
 BOT_VERSION = APP_VERSION
 import os
 import re
@@ -127,11 +131,16 @@ def header_mode_keyboard(profile_id, kind):
     ])
 
 def get_header_modes(profile_id):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT config_header_mode, proxy_header_mode FROM profiles WHERE id=?", (profile_id,))
-    row = cur.fetchone()
-    conn.close()
+    # Fast path: reuse the process connection for tiny settings reads.
+    # This avoids opening/configuring a new SQLite connection on every button press.
+    try:
+        row = c.execute(
+            "SELECT config_header_mode, proxy_header_mode FROM profiles WHERE id=?",
+            (int(profile_id),)
+        ).fetchone()
+    except sqlite3.Error as exc:
+        log.warning("header mode read failed for profile %s: %s", profile_id, exc)
+        return "channel", "channel"
     if not row:
         return "channel", "channel"
     return (row[0] or "channel"), (row[1] or "channel")
@@ -141,13 +150,15 @@ def set_header_mode(profile_id, kind, mode):
     if kind not in ("config", "proxy") or mode not in ("channel", "protocol"):
         return False
     column = "config_header_mode" if kind == "config" else "proxy_header_mode"
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(f"UPDATE profiles SET {column}=? WHERE id=?", (mode, profile_id))
-    changed = cur.rowcount > 0
-    conn.commit()
-    conn.close()
-    return changed
+    try:
+        c.execute(f"UPDATE profiles SET {column}=? WHERE id=?", (mode, int(profile_id)))
+        changed = c.rowcount > 0
+        conn.commit()
+        return changed
+    except sqlite3.Error as exc:
+        conn.rollback()
+        log.exception("header mode write failed for profile %s", profile_id)
+        return False
 
 
 def header_mode_label(mode):
@@ -663,6 +674,7 @@ c.execute("""CREATE TABLE IF NOT EXISTS profiles (
     country_display INTEGER DEFAULT 2,
     show_ping INTEGER DEFAULT 1,
     proxy_banner_template TEXT DEFAULT '',
+    config_post_mode INTEGER DEFAULT 0,
     ping_testing INTEGER DEFAULT 1
 )""")
 conn.commit()
@@ -677,6 +689,21 @@ for _idx in [
         c.execute(_idx)
     except Exception:
         log.exception("index creation failed")
+conn.commit()
+
+# High-value indexes: keep duplicate checks and 24h cleanup O(log n).
+for _idx in [
+    "CREATE INDEX IF NOT EXISTS idx_seen_profile_uuid_address ON seen(profile_id, uuid, address)",
+    "CREATE INDEX IF NOT EXISTS idx_seen_profile_last_posted ON seen(profile_id, last_posted)",
+    "CREATE INDEX IF NOT EXISTS idx_seen_profile_full_url ON seen(profile_id, full_url)",
+    "CREATE INDEX IF NOT EXISTS idx_proxy_seen_profile_url ON proxies_seen(profile_id, proxy_url)",
+    "CREATE INDEX IF NOT EXISTS idx_proxy_seen_profile_last_posted ON proxies_seen(profile_id, last_posted)",
+    "CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at)",
+]:
+    try:
+        c.execute(_idx)
+    except sqlite3.Error:
+        log.exception("performance index creation failed: %s", _idx)
 conn.commit()
 
 # Add new columns if missing
@@ -1350,7 +1377,7 @@ def sqlite_maintenance_cycle():
     try:
         c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         c.execute("DELETE FROM manual_send_queue WHERE status IN ('done','cancelled','failed') AND updated_at < ?",
-                  (_queue_iso(_queue_now()-timedelta(days=3)),))
+                  (_queue_iso(_queue_now()-timedelta(days=1)),))
         # Keep historical tables bounded. These tables are state tables, not logs.
         c.execute("DELETE FROM processed_messages WHERE rowid NOT IN (SELECT rowid FROM processed_messages ORDER BY rowid DESC LIMIT 50000)")
         c.execute("DELETE FROM country_cache WHERE rowid NOT IN (SELECT rowid FROM country_cache ORDER BY rowid DESC LIMIT 10000)")
@@ -1528,7 +1555,7 @@ def update_profile(profile_id, **kwargs):
                "schedule_cron", "last_backup_count", "timer_expiry", "timer_duration",
                "backup_interval", "interval_config", "interval_proxy", "max_post_config", "max_post_proxy",
                "naming_template", "channel_link", "ping_enabled", "profile_enabled",
-               "country_display", "show_ping", "proxy_banner_template", "proxy_post_mode", "ping_testing", "config_header_enabled", "config_header_template", "low_cost_mode"]
+               "country_display", "show_ping", "proxy_banner_template", "proxy_post_mode", "config_post_mode", "ping_testing", "config_header_enabled", "config_header_template", "low_cost_mode"]
     for key, value in kwargs.items():
         if key in allowed:
             c.execute(f"UPDATE profiles SET {key}=? WHERE id=?", (value, profile_id))
@@ -3163,12 +3190,26 @@ def canonical_config_identity(url):
         return clean_config_url(url or "").split("#", 1)[0].strip()
 
 def is_already_posted(profile_id, url):
-    identity = canonical_config_identity(url)
-    rows = c.execute("SELECT full_url FROM seen WHERE profile_id=?", (profile_id,)).fetchall()
-    if any(canonical_config_identity(row[0] or "") == identity for row in rows):
-        return True
-    uid, host = extract_uuid_and_address(clean_config_url(url))
-    return bool(uid and host and c.execute("SELECT 1 FROM seen WHERE uuid=? AND address=? AND profile_id=?", (uid, host, profile_id)).fetchone())
+    """Indexed/cheap duplicate check; never scan the whole seen table per URL."""
+    try:
+        clean = clean_config_url(url or "")
+        uid, host = extract_uuid_and_address(clean)
+        if uid and host:
+            if c.execute(
+                "SELECT 1 FROM seen WHERE profile_id=? AND uuid=? AND address=? LIMIT 1",
+                (profile_id, uid, host)
+            ).fetchone():
+                return True
+        # Fallback for legacy rows where UUID/host parsing was incomplete.
+        base = strip_url_fragment(clean)
+        row = c.execute(
+            "SELECT 1 FROM seen WHERE profile_id=? AND full_url LIKE ? LIMIT 1",
+            (profile_id, base + "%")
+        ).fetchone()
+        return row is not None
+    except sqlite3.Error as exc:
+        log.warning("config duplicate check failed: %s", exc)
+        return False
 
 def canonical_proxy_identity(url):
     try:
@@ -3182,8 +3223,24 @@ def canonical_proxy_identity(url):
 
 def is_proxy_posted(profile_id, proxy_url):
     identity = canonical_proxy_identity(proxy_url)
-    rows = c.execute("SELECT proxy_url FROM proxies_seen WHERE profile_id=?", (profile_id,)).fetchall()
-    return any(canonical_proxy_identity(row[0] or "") == identity for row in rows)
+    norm = canonical_telegram_proxy_url(proxy_url or "") or (proxy_url or "").strip()
+    try:
+        # First use the exact normalized URL (indexed by profile_id/proxy_url).
+        if c.execute(
+            "SELECT 1 FROM proxies_seen WHERE profile_id=? AND proxy_url=? LIMIT 1",
+            (profile_id, norm)
+        ).fetchone():
+            return True
+        # Legacy rows may differ only in query ordering. Restrict fallback to the
+        # current profile instead of scanning every profile/table row.
+        rows = c.execute(
+            "SELECT proxy_url FROM proxies_seen WHERE profile_id=? ORDER BY rowid DESC LIMIT 500",
+            (profile_id,)
+        ).fetchall()
+        return any(canonical_proxy_identity(row[0] or "") == identity for row in rows)
+    except sqlite3.Error as exc:
+        log.warning("proxy duplicate check failed: %s", exc)
+        return False
 
 def mark_proxy_posted(profile_id, proxy_url):
     now = get_tehran_time()
@@ -3330,6 +3387,28 @@ def add_custom_query_to_url(url, custom_query, protocol):
 # ======================================================================
 _DNS_CACHE = {}
 _DNS_CACHE_TTL = 300
+_PING_CLIENT = None
+_PING_CLIENT_LOCK = asyncio.Lock()
+
+async def _get_ping_client():
+    global _PING_CLIENT
+    if _PING_CLIENT is None or _PING_CLIENT.is_closed:
+        async with _PING_CLIENT_LOCK:
+            if _PING_CLIENT is None or _PING_CLIENT.is_closed:
+                _PING_CLIENT = httpx.AsyncClient(
+                    timeout=httpx.Timeout(2.5, connect=1.5),
+                    limits=httpx.Limits(max_connections=24, max_keepalive_connections=12),
+                    follow_redirects=True,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                )
+    return _PING_CLIENT
+
+async def _close_ping_client():
+    global _PING_CLIENT
+    client = _PING_CLIENT
+    _PING_CLIENT = None
+    if client is not None and not client.is_closed:
+        await client.aclose()
 
 async def host_to_ip(host):
     host = (host or "").strip().lower()
@@ -3353,7 +3432,7 @@ async def test_tcp_ping(host, port):
         start = loop.time()
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port),
-            timeout=0.8
+            timeout=0.6
         )
         writer.close()
         await writer.wait_closed()
@@ -3369,44 +3448,42 @@ async def ping_from_iran_only(host, port=None, allow_tcp_fallback=True):
     target = ip
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(2.5, connect=1.5), limits=httpx.Limits(max_connections=50, max_keepalive_connections=20)) as cl:
-            r = await cl.get(
-                f"https://check-host.net/check-ping?host={target}&json=1",
-                headers={"User-Agent": "Mozilla/5.0"},
-                follow_redirects=True
-            )
-            if r.status_code == 200:
-                try:
-                    data = r.json()
-                except json.JSONDecodeError:
-                    log.warning(f"⚠️ check-host.net returned invalid JSON for {target}")
-                    data = None
-                if data:
-                    nodes = data.get("nodes", {})
-                    iran_pings = []
-                    iran_keywords = [
-                        "ir1", "ir2", "ir3", "ir4", "ir5", "ir6", "ir7", "ir8", "ir9",
-                        "iran", "tehran", "ir-", "-ir", "ir_", "_ir",
-                        "mci", "hamrahe", "rightel", "shatel", "iranel",
-                        "teh", "shiraz", "isfahan", "mashhad", "tabriz", "ahvaz"
-                    ]
-                    for node_name, results in nodes.items():
-                        if not isinstance(results, list):
-                            continue
-                        node_lower = node_name.lower()
-                        for v in results:
-                            if isinstance(v, (int, float)) and v > 0:
-                                if any(kw in node_lower for kw in iran_keywords):
-                                    iran_pings.append(int(v))
-                                break
-                    if iran_pings:
-                        avg_ping = int(sum(iran_pings) / len(iran_pings))
-                        log.info(f"✅ Iran ping OK: {target} -> {len(iran_pings)} nodes, avg {avg_ping}ms")
-                        return avg_ping, True, len(iran_pings)
-                    else:
-                        log.info(f"⚠️ No Iran nodes responded for {target}")
-            else:
-                log.warning(f"check-host.net status: {r.status_code}")
+        cl = await _get_ping_client()
+        r = await cl.get(
+            f"https://check-host.net/check-ping?host={target}&json=1"
+        )
+        if r.status_code == 200:
+            try:
+                data = r.json()
+            except json.JSONDecodeError:
+                log.warning(f"⚠️ check-host.net returned invalid JSON for {target}")
+                data = None
+            if data:
+                nodes = data.get("nodes", {})
+                iran_pings = []
+                iran_keywords = [
+                    "ir1", "ir2", "ir3", "ir4", "ir5", "ir6", "ir7", "ir8", "ir9",
+                    "iran", "tehran", "ir-", "-ir", "ir_", "_ir",
+                    "mci", "hamrahe", "rightel", "shatel", "iranel",
+                    "teh", "shiraz", "isfahan", "mashhad", "tabriz", "ahvaz"
+                ]
+                for node_name, results in nodes.items():
+                    if not isinstance(results, list):
+                        continue
+                    node_lower = node_name.lower()
+                    for v in results:
+                        if isinstance(v, (int, float)) and v > 0:
+                            if any(kw in node_lower for kw in iran_keywords):
+                                iran_pings.append(int(v))
+                            break
+                if iran_pings:
+                    avg_ping = int(sum(iran_pings) / len(iran_pings))
+                    log.info(f"✅ Iran ping OK: {target} -> {len(iran_pings)} nodes, avg {avg_ping}ms")
+                    return avg_ping, True, len(iran_pings)
+                else:
+                    log.info(f"⚠️ No Iran nodes responded for {target}")
+        else:
+            log.warning(f"check-host.net status: {r.status_code}")
     except Exception as e:
         log.warning(f"check-host.net request failed: {e}")
 
@@ -3424,7 +3501,7 @@ async def ping_from_iran_only(host, port=None, allow_tcp_fallback=True):
             log.info(f"❌ TCP fallback FAILED: {host}:{port}")
     else:
         log.info(f"🔄 No port in config, trying common ports...")
-        ports_to_try = [443, 80, 8080, 8443, 2053, 2096, 2087, 2083]
+        ports_to_try = [443, 80, 8443]
         for test_port in ports_to_try:
             ok, ping = await test_tcp_ping(host, test_port)
             if ok:
@@ -4227,12 +4304,12 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
     # Telegram pages. Four pages per source are enough for normal interval runs;
     # an unfinished backlog remains behind the stream cursor and is picked up by
     # the next cycle. This keeps manual/automatic execution bounded and stable.
-    scrape_pages = 4
+    scrape_pages = 3
     config_test_limit = None
     # Scrape all sources in parallel
     async def scrape_one(src):
         last_exc = None
-        for attempt in range(1, 4):
+        for attempt in range(1, 3):
             try:
                 config_links, proxy_links, newest_id = await scrape_channel_paginated(
                     profile_id, src, max_pages=scrape_pages, stream=stream
@@ -4241,8 +4318,8 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
             except Exception as exc:
                 last_exc = exc
                 log.warning(f"⚠️ [profile={profile_id}] source={src} scrape attempt {attempt}/3 failed: {exc}")
-                if attempt < 3:
-                    await asyncio.sleep(min(10, attempt * 2))
+                if attempt < 2:
+                    await asyncio.sleep(1)
         raise RuntimeError(f"source {src} failed after 3 attempts: {last_exc}")
 
     scrape_tasks = [scrape_one(src) for src in sources]
@@ -6326,10 +6403,10 @@ async def _on_callback_impl(u, ctx):
             if kind not in ("config", "proxy") or mode not in ("channel", "protocol") or not get_profile(profile_id):
                 await q.answer("⚠️ تنظیم نامعتبر", show_alert=True)
                 return
+            await q.answer("⏳ در حال ذخیره…")
             if set_header_mode(profile_id, kind, mode):
                 title = "کانفیگ" if kind == "config" else "پروکسی"
                 label = "نام کانال" if mode == "channel" else "پروتکل"
-                await q.answer(f"✅ حالت نمایش {title}: {label}")
                 await q.edit_message_text(
                     f"⚙️ حالت نمایش {title}: <b>{label}</b>",
                     parse_mode="HTML",
@@ -7245,6 +7322,7 @@ async def _on_callback_impl(u, ctx):
             except Exception:
                 await q.answer("⚠️ شناسه نامعتبر")
                 return
+            await q.answer("⏳ در حال ذخیره…")
             current = get_profile_config_post_mode(profile_id)
             new_mode = 0 if current == 1 else 1
             set_profile_config_post_mode(profile_id, new_mode)
@@ -9111,69 +9189,54 @@ DB_CLEAN_INTERVAL = 12 * 60 * 60
 
 
 def automatic_database_cleanup():
-    """Safe SQLite cleanup. Never touches profiles/settings/admin data."""
+    """Delete only disposable state older than 24h; preserve profiles/settings/cursors."""
     db = None
     try:
         db = get_conn()
         cur = db.cursor()
-
-        cutoff = _queue_iso(_queue_now() - timedelta(days=3)) if '_queue_iso' in globals() else get_tehran_time()
-
-        try:
-            cur.execute("""
-                DELETE FROM manual_send_queue
-                WHERE status IN ('done','cancelled','failed')
-                AND updated_at < ?
-            """, (cutoff,))
-        except Exception:
-            pass
-
-        try:
-            cur.execute("""
-                DELETE FROM processed_messages
-                WHERE rowid NOT IN (
-                    SELECT rowid FROM processed_messages
-                    ORDER BY rowid DESC LIMIT 50000
-                )
-            """)
-        except Exception:
-            pass
-
-        try:
-            cur.execute("""
-                DELETE FROM country_cache
-                WHERE rowid NOT IN (
-                    SELECT rowid FROM country_cache
-                    ORDER BY rowid DESC LIMIT 10000
-                )
-            """)
-        except Exception:
-            pass
-
+        cutoff = (datetime.now(TEHRAN_TZ) - timedelta(days=1)).isoformat()
+        deleted = {}
+        cleanup_sql = {
+            "posts": "DELETE FROM posts WHERE created_at IS NOT NULL AND created_at < ?",
+            "seen": "DELETE FROM seen WHERE last_posted IS NOT NULL AND last_posted < ?",
+            "proxies_seen": "DELETE FROM proxies_seen WHERE last_posted IS NOT NULL AND last_posted < ?",
+            "manual_send_queue": "DELETE FROM manual_send_queue WHERE status IN ('done','cancelled','failed') AND updated_at < ?",
+            "processed_messages": "DELETE FROM processed_messages WHERE rowid NOT IN (SELECT rowid FROM processed_messages ORDER BY rowid DESC LIMIT 20000)",
+            "country_cache": "DELETE FROM country_cache WHERE rowid NOT IN (SELECT rowid FROM country_cache ORDER BY rowid DESC LIMIT 5000)",
+        }
+        for table, sql in cleanup_sql.items():
+            try:
+                if table in ("processed_messages", "country_cache"):
+                    cur.execute(sql)
+                else:
+                    cur.execute(sql, (cutoff,))
+                deleted[table] = cur.rowcount if cur.rowcount >= 0 else 0
+            except sqlite3.Error as exc:
+                log.warning("[DB CLEANER] %s skipped: %s", table, exc)
         db.commit()
-        cur.execute('PRAGMA optimize')
-        cur.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-
-        free_pages = cur.execute('PRAGMA freelist_count').fetchone()[0]
-        # VACUUM is intentionally disabled in the live bot; it can lock SQLite
-        # and freeze callbacks/queues for a long time. WAL/PRAGMA optimize is enough.
-        pass
-
+        cur.execute("PRAGMA optimize")
+        try:
+            cur.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except sqlite3.Error:
+            pass
         db.commit()
-        log.info(f'[DB CLEANER] completed free_pages={free_pages}')
-
-    except Exception:
-        log.exception('[DB CLEANER] failed')
+        log.info("[DB CLEANER] 24h cleanup completed: %s", deleted)
+    except sqlite3.Error:
+        if db:
+            db.rollback()
+        log.exception("[DB CLEANER] failed")
     finally:
         if db:
             db.close()
 
 
 async def database_cleanup_worker():
-    log.info('[DB CLEANER] worker started')
+    log.info('[DB CLEANER] worker started | retention=24h')
+    # Never compete with startup/callback initialization.
+    await asyncio.sleep(10)
     while True:
         try:
-            automatic_database_cleanup()
+            await asyncio.to_thread(automatic_database_cleanup)
         except Exception:
             log.exception('[DB CLEANER] worker error')
         await asyncio.sleep(DB_CLEAN_INTERVAL)
@@ -9307,7 +9370,7 @@ def optimize_database():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_processed_message ON processed_messages(source,message_id,profile_id)")
 
-        cutoff = (datetime.now(TEHRAN_TZ) - timedelta(hours=48)).isoformat()
+        cutoff = (datetime.now(TEHRAN_TZ) - timedelta(days=1)).isoformat()
         # delete old duplicate trackers, not actual configs
         cur.execute("DELETE FROM posts WHERE created_at < ?", (cutoff,))
         cur.execute("DELETE FROM seen WHERE last_posted IS NOT NULL AND last_posted < ? AND first_seen IS NOT NULL", (cutoff,))
@@ -9374,7 +9437,7 @@ def main():
     # Never perform database cleanup/VACUUM before polling starts. A large
     # SQLite file can otherwise block the entire bot for minutes and make the
     # bot look dead. Maintenance runs in its own worker after startup.
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    app = _build_application()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("runnow", cmd_runnow))
@@ -9389,39 +9452,19 @@ def main():
     log.info("✅ Bot is ready, polling...")
     app.run_polling()
 
+
+
+async def _post_stop_cleanup(app):
+    await _close_ping_client()
+
+# Final lifecycle hook: all functions are defined before polling starts.
+# This prevents the historical "main() before trailing definitions" layout.
+
+def _build_application():
+    app = Application.builder().token(TOKEN).post_init(post_init).post_stop(_post_stop_cleanup).build()
+    return app
+
 if __name__ == "__main__":
-    log.info("=" * 50)
-    log.info("🚀 Starting bot...")
+    log.info("=" * 60)
+    log.info("🚀 Starting bot | version=%s", APP_VERSION_LABEL)
     main()
-
-
-# ======================================================================
-# v3.2.0 Database optimizer
-# - duplicate post protection
-# - automatic 48h cleanup
-# - sqlite size control
-# ======================================================================
-
-DB_OPTIMIZER_VERSION = "3.2.2"
-
-def post_fingerprint(text):
-    return hashlib.sha256((text or "").encode("utf-8", errors="ignore")).hexdigest()
-
-def is_duplicate_post(text):
-    fp = post_fingerprint(text)
-    db = get_conn()
-    try:
-        row = db.execute("SELECT 1 FROM posts WHERE content=? LIMIT 1", (fp,)).fetchone()
-        return bool(row)
-    finally:
-        db.close()
-
-def save_unique_post(text, count=0):
-    fp = post_fingerprint(text)
-    db = get_conn()
-    try:
-        db.execute("INSERT OR IGNORE INTO posts(content,count,created_at) VALUES(?,?,?)", (fp,count,get_tehran_time()))
-        db.commit()
-    finally:
-        db.close()
-
