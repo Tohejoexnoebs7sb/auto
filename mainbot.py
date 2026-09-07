@@ -1,9 +1,9 @@
-# bot.py — 4.1.0
-APP_VERSION = "4.1.1"
+# bot.py — 4.1.2
+APP_VERSION = "4.1.2"
 APP_VERSION_MAJOR = 4
 APP_VERSION_MINOR = 1
-APP_VERSION_PATCH = 0
-APP_VERSION_LABEL = "4.1.0-stable"
+APP_VERSION_PATCH = 2
+APP_VERSION_LABEL = "4.1.2-stable"
 BOT_VERSION = APP_VERSION
 import os
 import re
@@ -258,6 +258,9 @@ conn.execute("PRAGMA synchronous=NORMAL")
 conn.execute("PRAGMA wal_autocheckpoint=200")
 conn.execute("PRAGMA journal_size_limit=1048576")
 conn.execute("PRAGMA busy_timeout=10000")
+conn.execute("PRAGMA cache_size=-65536")
+conn.execute("PRAGMA temp_store=MEMORY")
+conn.execute("PRAGMA mmap_size=134217728")
 c = conn.cursor()
 
 # مستقل از ترتیب تعریف توابع، تمام عملیات DB از این helper استفاده می‌کنند.
@@ -268,6 +271,9 @@ def get_conn():
     db.execute("PRAGMA wal_autocheckpoint=200")
     db.execute("PRAGMA journal_size_limit=1048576")
     db.execute("PRAGMA busy_timeout=10000")
+    db.execute("PRAGMA cache_size=-65536")
+    db.execute("PRAGMA temp_store=MEMORY")
+    db.execute("PRAGMA mmap_size=134217728")
     return db
 
 
@@ -677,6 +683,22 @@ c.execute("""CREATE TABLE IF NOT EXISTS profiles (
     config_post_mode INTEGER DEFAULT 0,
     ping_testing INTEGER DEFAULT 1
 )""")
+conn.commit()
+
+# Permanent, compact once-only ledgers. The large URL history tables are only
+# runtime/backup history; these SHA-256 keys are the authoritative permanent
+# dedup state and are intentionally tiny.
+c.execute("""CREATE TABLE IF NOT EXISTS posted_config_keys (
+    profile_id INTEGER NOT NULL,
+    identity_hash TEXT NOT NULL,
+    first_posted TEXT,
+    source TEXT DEFAULT '',
+    PRIMARY KEY(profile_id, identity_hash))""")
+c.execute("""CREATE TABLE IF NOT EXISTS posted_proxy_keys (
+    profile_id INTEGER NOT NULL,
+    identity_hash TEXT NOT NULL,
+    first_posted TEXT,
+    PRIMARY KEY(profile_id, identity_hash))""")
 conn.commit()
 
 # Performance indexes and lightweight maintenance for long-running Railway workers.
@@ -1365,9 +1387,7 @@ async def _send_manual_queue_batch(bot, job):
     if not sent_ok:
         _manual_queue_commit_batch(job["id"], profile_id, [], "Telegram proxy send failed")
         return 0
-    for proxy_url in selected:
-        if not is_proxy_posted(profile_id, proxy_url):
-            mark_proxy_posted(profile_id, proxy_url)
+    mark_proxies_posted_batch(profile_id, selected)
     _manual_queue_commit_batch(job["id"], profile_id, selected, "")
     return len(selected)
 
@@ -1585,6 +1605,8 @@ def delete_profile(profile_id):
     c.execute("DELETE FROM sponsors WHERE profile_id=?", (profile_id,))
     c.execute("DELETE FROM seen WHERE profile_id=?", (profile_id,))
     c.execute("DELETE FROM proxies_seen WHERE profile_id=?", (profile_id,))
+    c.execute("DELETE FROM posted_config_keys WHERE profile_id=?", (profile_id,))
+    c.execute("DELETE FROM posted_proxy_keys WHERE profile_id=?", (profile_id,))
     c.execute("DELETE FROM last_scrape WHERE profile_id=?", (profile_id,))
     c.execute("DELETE FROM source_stream_state WHERE profile_id=?", (profile_id,))
     c.execute("DELETE FROM processed_messages WHERE profile_id=?", (profile_id,))
@@ -3207,24 +3229,44 @@ def canonical_config_identity(url):
     except Exception:
         return clean_config_url(url or "").split("#", 1)[0].strip()
 
-def is_already_posted(profile_id, url):
-    """Indexed/cheap duplicate check; never scan the whole seen table per URL."""
+# Hot-path deduplication cache. The posting workers never query SQLite for each
+# candidate; permanent identity hashes are loaded once and checked in O(1).
+_SEEN_CONFIG_KEYS = set()
+_SEEN_PROXY_KEYS = set()
+_DEDUP_CACHE_READY = False
+
+def _config_identity_hash(url):
+    return hashlib.sha256(canonical_config_identity(url).encode("utf-8", errors="ignore")).hexdigest()
+
+def _proxy_identity_hash(url):
+    return hashlib.sha256(canonical_proxy_identity(url).encode("utf-8", errors="ignore")).hexdigest()
+
+def load_dedup_cache():
+    global _DEDUP_CACHE_READY
+    if _DEDUP_CACHE_READY:
+        return
     try:
-        clean = clean_config_url(url or "")
-        uid, host = extract_uuid_and_address(clean)
-        if uid and host:
-            if c.execute(
-                "SELECT 1 FROM seen WHERE profile_id=? AND uuid=? AND address=? LIMIT 1",
-                (profile_id, uid, host)
-            ).fetchone():
-                return True
-        # Fallback for legacy rows where UUID/host parsing was incomplete.
-        base = strip_url_fragment(clean)
-        row = c.execute(
-            "SELECT 1 FROM seen WHERE profile_id=? AND full_url LIKE ? LIMIT 1",
-            (profile_id, base + "%")
-        ).fetchone()
-        return row is not None
+        rows = c.execute("SELECT profile_id,full_url,first_seen,source FROM seen WHERE full_url IS NOT NULL AND full_url!=''").fetchall()
+        c.executemany("INSERT OR IGNORE INTO posted_config_keys(profile_id,identity_hash,first_posted,source) VALUES (?,?,?,?)",
+                      [(int(pid), _config_identity_hash(url), fs, src or "") for pid,url,fs,src in rows])
+        rows = c.execute("SELECT profile_id,proxy_url,first_seen FROM proxies_seen WHERE proxy_url IS NOT NULL AND proxy_url!=''").fetchall()
+        c.executemany("INSERT OR IGNORE INTO posted_proxy_keys(profile_id,identity_hash,first_posted) VALUES (?,?,?)",
+                      [(int(pid), _proxy_identity_hash(url), fs) for pid,url,fs in rows])
+        conn.commit()
+        _SEEN_CONFIG_KEYS.update((int(pid), h) for pid,h in c.execute("SELECT profile_id,identity_hash FROM posted_config_keys").fetchall())
+        _SEEN_PROXY_KEYS.update((int(pid), h) for pid,h in c.execute("SELECT profile_id,identity_hash FROM posted_proxy_keys").fetchall())
+        _DEDUP_CACHE_READY = True
+        log.info("[DB] compact dedup cache ready: configs=%d proxies=%d", len(_SEEN_CONFIG_KEYS), len(_SEEN_PROXY_KEYS))
+    except sqlite3.Error:
+        log.exception("[DB] compact dedup cache load failed")
+
+
+def is_already_posted(profile_id, url):
+    try:
+        key = (int(profile_id), _config_identity_hash(url))
+        if _DEDUP_CACHE_READY:
+            return key in _SEEN_CONFIG_KEYS
+        return c.execute("SELECT 1 FROM posted_config_keys WHERE profile_id=? AND identity_hash=? LIMIT 1", key).fetchone() is not None
     except sqlite3.Error as exc:
         log.warning("config duplicate check failed: %s", exc)
         return False
@@ -3240,45 +3282,75 @@ def canonical_proxy_identity(url):
         return (url or "").strip().split("#", 1)[0]
 
 def is_proxy_posted(profile_id, proxy_url):
-    identity = canonical_proxy_identity(proxy_url)
-    norm = canonical_telegram_proxy_url(proxy_url or "") or (proxy_url or "").strip()
     try:
-        # First use the exact normalized URL (indexed by profile_id/proxy_url).
-        if c.execute(
-            "SELECT 1 FROM proxies_seen WHERE profile_id=? AND proxy_url=? LIMIT 1",
-            (profile_id, norm)
-        ).fetchone():
-            return True
-        # Legacy rows may differ only in query ordering. Restrict fallback to the
-        # current profile instead of scanning every profile/table row.
-        rows = c.execute(
-            "SELECT proxy_url FROM proxies_seen WHERE profile_id=? ORDER BY rowid DESC LIMIT 500",
-            (profile_id,)
-        ).fetchall()
-        return any(canonical_proxy_identity(row[0] or "") == identity for row in rows)
+        key = (int(profile_id), _proxy_identity_hash(proxy_url))
+        if _DEDUP_CACHE_READY:
+            return key in _SEEN_PROXY_KEYS
+        return c.execute("SELECT 1 FROM posted_proxy_keys WHERE profile_id=? AND identity_hash=? LIMIT 1", key).fetchone() is not None
     except sqlite3.Error as exc:
         log.warning("proxy duplicate check failed: %s", exc)
         return False
 
 def mark_proxy_posted(profile_id, proxy_url):
+    norm = canonical_telegram_proxy_url(proxy_url or "") or (proxy_url or "").strip()
+    identity_hash = _proxy_identity_hash(norm)
     now = get_tehran_time()
-    c.execute("INSERT OR REPLACE INTO proxies_seen (proxy_url, first_seen, last_posted, profile_id) VALUES (?,?,?,?)",
-              (proxy_url, now, now, profile_id))
+    c.execute("INSERT OR IGNORE INTO posted_proxy_keys(profile_id,identity_hash,first_posted) VALUES (?,?,?)",
+              (profile_id, identity_hash, now))
+    c.execute("INSERT OR IGNORE INTO proxies_seen (proxy_url,first_seen,last_posted,profile_id) VALUES (?,?,?,?)",
+              (norm, now, now, profile_id))
     conn.commit()
+    _SEEN_PROXY_KEYS.add((int(profile_id), identity_hash))
 
 def mark_as_posted(profile_id, url, source, full_url=""):
-    uid, host = extract_uuid_and_address(url)
-    if not uid or not host:
-        uid = url[:200]
-        host = ""
+    clean = clean_config_url(url or "")
+    identity_hash = _config_identity_hash(clean)
     now = get_tehran_time()
-    max_bn = c.execute("SELECT COALESCE(MAX(backup_num),0) FROM seen WHERE profile_id=?", (profile_id,)).fetchone()[0]
-    new_bn = max_bn + 1 if full_url else 0
-    c.execute("""
-        INSERT OR REPLACE INTO seen (uuid, address, source, first_seen, last_posted, profile_id, full_url, backup_num)
-        VALUES (?,?,?,?,?,?,?,?)
-    """, (uid, host, source, now, now, profile_id, full_url or url, new_bn))
+    c.execute("INSERT OR IGNORE INTO posted_config_keys(profile_id,identity_hash,first_posted,source) VALUES (?,?,?,?)",
+              (profile_id, identity_hash, now, source or ""))
+    # Keep only a short-lived URL copy for backup/export; the hash above is the
+    # permanent once-only record.
+    uid, host = extract_uuid_and_address(clean)
+    if not uid and not host:
+        uid = clean[:200]; host = ""
+    c.execute("INSERT OR IGNORE INTO seen(uuid,address,source,first_seen,last_posted,profile_id,full_url,backup_num) VALUES (?,?,?,?,?,?,?,0)",
+              (uid, host, source or "", now, now, profile_id, clean))
     conn.commit()
+    _SEEN_CONFIG_KEYS.add((int(profile_id), identity_hash))
+
+def mark_configs_posted_batch(profile_id, entries):
+    if not entries:
+        return 0
+    now = get_tehran_time()
+    cfg_rows = []
+    seen_rows = []
+    for url, source in entries:
+        clean = clean_config_url(url or "")
+        h = _config_identity_hash(clean)
+        cfg_rows.append((profile_id, h, now, source or ""))
+        uid, host = extract_uuid_and_address(clean)
+        if not uid and not host:
+            uid = clean[:200]; host = ""
+        seen_rows.append((uid, host, source or "", now, now, profile_id, clean))
+    c.executemany("INSERT OR IGNORE INTO posted_config_keys(profile_id,identity_hash,first_posted,source) VALUES (?,?,?,?)", cfg_rows)
+    c.executemany("INSERT OR IGNORE INTO seen(uuid,address,source,first_seen,last_posted,profile_id,full_url,backup_num) VALUES (?,?,?,?,?,?,?,0)", seen_rows)
+    conn.commit()
+    for pid,h,_a,_b in cfg_rows:
+        _SEEN_CONFIG_KEYS.add((int(pid), h))
+    return len(entries)
+
+def mark_proxies_posted_batch(profile_id, urls):
+    if not urls:
+        return 0
+    now = get_tehran_time()
+    key_rows = [(profile_id, _proxy_identity_hash(u), now) for u in urls]
+    seen_rows = [(canonical_telegram_proxy_url(u or "") or (u or "").strip(), now, now, profile_id) for u in urls]
+    c.executemany("INSERT OR IGNORE INTO posted_proxy_keys(profile_id,identity_hash,first_posted) VALUES (?,?,?)", key_rows)
+    c.executemany("INSERT OR IGNORE INTO proxies_seen(proxy_url,first_seen,last_posted,profile_id) VALUES (?,?,?,?)", seen_rows)
+    conn.commit()
+    for pid,h,_t in key_rows:
+        _SEEN_PROXY_KEYS.add((int(pid), h))
+    return len(urls)
 
 def is_message_processed(profile_id, source, message_id):
     r = c.execute("SELECT 1 FROM processed_messages WHERE source=? AND message_id=? AND profile_id=?", (source, message_id, profile_id)).fetchone()
@@ -3312,6 +3384,17 @@ def get_stream_last_message_id(profile_id, source, stream):
         (profile_id, source, stream)
     ).fetchone()
     return r[0] if r else ""
+
+def set_stream_last_message_ids_batch(profile_id, stream, updates):
+    rows = [(int(profile_id), str(src), str(stream), str(msg_id or ""), get_tehran_time())
+            for src, msg_id in updates if msg_id]
+    if not rows:
+        return
+    c.executemany("""INSERT INTO source_stream_state
+        (profile_id,source,stream,last_message_id,updated_at) VALUES (?,?,?,?,?)
+        ON CONFLICT(profile_id,source,stream) DO UPDATE SET
+        last_message_id=excluded.last_message_id, updated_at=excluded.updated_at""", rows)
+    conn.commit()
 
 def set_stream_last_message_id(profile_id, source, stream, msg_id):
     c.execute(
@@ -3553,6 +3636,28 @@ _USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
 ]
 
+_SCRAPE_CLIENT = None
+_SCRAPE_CLIENT_LOCK = asyncio.Lock()
+
+async def _get_scrape_client():
+    global _SCRAPE_CLIENT
+    if _SCRAPE_CLIENT is None or _SCRAPE_CLIENT.is_closed:
+        async with _SCRAPE_CLIENT_LOCK:
+            if _SCRAPE_CLIENT is None or _SCRAPE_CLIENT.is_closed:
+                _SCRAPE_CLIENT = httpx.AsyncClient(
+                    timeout=httpx.Timeout(7.0, connect=3.0),
+                    follow_redirects=True,
+                    limits=httpx.Limits(max_connections=120, max_keepalive_connections=60),
+                )
+    return _SCRAPE_CLIENT
+
+async def _close_scrape_client():
+    global _SCRAPE_CLIENT
+    client = _SCRAPE_CLIENT
+    _SCRAPE_CLIENT = None
+    if client and not client.is_closed:
+        await client.aclose()
+
 async def scrape_channel_paginated(profile_id, channel, max_pages=5, stream="combined"):
     """
     Scrape public Telegram channel pages and return ONLY messages newer than
@@ -3595,72 +3700,69 @@ async def scrape_channel_paginated(profile_id, channel, max_pages=5, stream="com
         f"{clean_channel} (max {effective_max_pages} pages, last_msg_id={last_msg_id or 'NONE'})"
     )
 
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(7.0, connect=3.0),
-        follow_redirects=True,
-        limits=httpx.Limits(max_connections=100, max_keepalive_connections=50),
-    ) as scrape_client:
-      while (effective_max_pages is None or page_count < effective_max_pages) and not stopped:
-          page_count += 1
-          log.info(
-              f"🔍 [profile={profile_id}][stream={stream}] Scraping page "
-              f"{page_count} for {clean_channel}: {current_url}"
-          )
+    scrape_client = await _get_scrape_client()
+    while (effective_max_pages is None or page_count < effective_max_pages) and not stopped:
+        page_count += 1
+        log.info(
+            f"🔍 [profile={profile_id}][stream={stream}] Scraping page "
+            f"{page_count} for {clean_channel}: {current_url}"
+        )
 
-          _page_configs, _page_proxies, msg_ids, msg_content_map = \
-              await _scrape_single_page_with_messages(current_url, clean_channel, scrape_client)
+        _page_configs, _page_proxies, msg_ids, msg_content_map = \
+            await _scrape_single_page_with_messages(current_url, clean_channel, scrape_client)
 
-          if not msg_ids:
-              log.info(f"⚠️ [profile={profile_id}][stream={stream}] No messages on page {page_count} for {clean_channel}")
-              break
+        if not msg_ids:
+            log.info(f"⚠️ [profile={profile_id}][stream={stream}] No messages on page {page_count} for {clean_channel}")
+            break
 
-          # Telegram normally returns newest -> oldest. Keep the newest ID we
-          # actually encountered for this scan, but do not advance DB state yet.
-          if not newest_seen_id:
-              newest_seen_id = msg_ids[0]
+        # Telegram normally returns newest -> oldest. Keep the newest ID we
+        # actually encountered for this scan, but do not advance DB state yet.
+        if not newest_seen_id:
+            newest_seen_id = msg_ids[0]
 
-          new_msg_ids = []
-          for mid in msg_ids:
-              if last_msg_id and str(mid) == str(last_msg_id):
-                  stopped = True
-                  break
-              new_msg_ids.append(mid)
+        new_msg_ids = []
+        for mid in msg_ids:
+            if last_msg_id and str(mid) == str(last_msg_id):
+                stopped = True
+                break
+            new_msg_ids.append(mid)
 
-          if not new_msg_ids:
-              log.info(
-                  f"✅ [profile={profile_id}][stream={stream}] Reached cursor for "
-                  f"{clean_channel}; no newer messages on page {page_count}."
-              )
-              break
+        if not new_msg_ids:
+            log.info(
+                f"✅ [profile={profile_id}][stream={stream}] Reached cursor for "
+                f"{clean_channel}; no newer messages on page {page_count}."
+            )
+            break
 
-          for mid in new_msg_ids:
-              content = msg_content_map.get(mid, "")
-              if not content:
-                  continue
+        for mid in new_msg_ids:
+            content = msg_content_map.get(mid, "")
+            if not content:
+                continue
 
-              configs = extract_links_from_text(content)
-              proxies = extract_proxy_links_from_text(content)
-              all_configs.extend(configs)
-              all_proxies.extend(proxies)
+            configs = extract_links_from_text(content)
+            proxies = extract_proxy_links_from_text(content)
+            all_configs.extend(configs)
+            all_proxies.extend(proxies)
 
-              # Keep the existing audit table, but DO NOT use it as the cursor.
-              # Config and proxy streams must be able to inspect the same source
-              # message independently.
-              mark_message_processed(profile_id, clean_channel, mid)
+            # The stream cursor is the authoritative processing state.
+            # Do NOT write one processed_messages row per scraped message: that
+            # turns a read-only scrape into thousands of synchronous SQLite
+            # writes and directly slows the bot. Failed posts remain behind the
+            # cursor and are retried on the next cycle.
 
-          numeric_ids = []
-          for mid in msg_ids:
-              parts = str(mid).split('/')
-              if len(parts) == 2 and parts[1].isdigit():
-                  numeric_ids.append(int(parts[1]))
-          if numeric_ids:
-              oldest = min(numeric_ids)
-              current_url = f"{base_url}?before={oldest}"
-          else:
-              break
+        numeric_ids = []
+        for mid in msg_ids:
+            parts = str(mid).split('/')
+            if len(parts) == 2 and parts[1].isdigit():
+                numeric_ids.append(int(parts[1]))
+        if numeric_ids:
+            oldest = min(numeric_ids)
+            current_url = f"{base_url}?before={oldest}"
+        else:
+            break
 
-          # No fixed per-page delay: source requests are already rate-limited by Telegram.
-          await asyncio.sleep(0)
+        # No fixed per-page delay: source requests are already rate-limited by Telegram.
+        await asyncio.sleep(0)
 
     all_configs = list(dict.fromkeys(all_configs))
     all_proxies = list(dict.fromkeys(all_proxies))
@@ -3753,7 +3855,7 @@ async def _scrape_single_page_with_messages(url, channel, client=None):
         config_links = list(dict.fromkeys(extract_links_from_text(html_text)))
         proxy_links = list(dict.fromkeys(extract_proxy_links_from_text(html_text)))
 
-        log.info(
+        log.debug(
             f"📄 [profile-source={channel}] Page {url}: "
             f"configs={len(config_links)}, proxies={len(proxy_links)}, messages={len(msg_ids)}"
         )
@@ -3910,6 +4012,7 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
         sponsor_button = InlineKeyboardButton(sponsor["button_text"], url=sponsor["url"], style=btn_style)
 
     config_blocks = []
+    posted_entries = []
     config_mode = get_profile_config_post_mode(profile_id)
 
     # Resolve DNS/Geo metadata concurrently. The previous sequential path could
@@ -3949,6 +4052,7 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
         if (url or '').strip().lower().startswith(("https://t.me/proxy?", "tg://proxy?")):
             header = "<b>MTPROTO</b>"
             config_blocks.append(header + "\n<pre>" + (url or '').strip() + "</pre>")
+            posted_entries.append(((url or '').strip(), source_for_seen))
             continue
 
         flag, country_code = config_meta.get(url, ("🌐", ""))
@@ -4031,6 +4135,7 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
         else:
             block = f"<pre>{modified_url}</pre>"
             config_blocks.append((header + "\n" if header else "") + block)
+        posted_entries.append((modified_url, source_for_seen))
 
     if config_mode == 1:
         configs_text = "<blockquote expandable>\n" + "\n".join(
@@ -4109,25 +4214,10 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
         log.error(f"❌ Failed to send configs after all retries")
         return 0
 
-    sent_count = len(items)
-    for i, (url, ping, node_count) in enumerate(items, 1):
-        n = last_n + i
-        flag, country_code = config_meta.get(url, ("🌐", ""))
-        fragment_text = naming_template.replace("{Flag}", flag).replace("{CHANNEL_ID}", channel_link).replace("{COUNT}", str(n))
-        fragment_text = fragment_text.replace("{FLAG}", flag)
-        fragment_text = fragment_text.replace("{COUNTRY_EN}", COUNTRY_NAMES_EN.get(country_code, ""))
-        fragment_text = fragment_text.replace("{COUNTRY_FA}", COUNTRY_NAMES_FA.get(country_code, ""))
-        fragment_text = fragment_text.replace("{PING}", "")
-        fragment_text = fragment_text.replace("{COUNT}", str(n))
-        encoded_fragment = quote(fragment_text, safe='')
-        base_url = strip_url_fragment(url)
-        modified_url = base_url + "#" + encoded_fragment
-        if custom_query:
-            protocol = url.split('://')[0].lower() if '://' in url else ''
-            if custom_query and protocol not in ('vmess', 'https', 'tg'):
-                modified_url = add_custom_query_to_url(modified_url, custom_query, protocol)
-        if not is_already_posted(profile_id, modified_url):
-            mark_as_posted(profile_id, modified_url, source_for_seen, full_url=modified_url)
+    # Ledger is updated ONLY after every Telegram message in this batch has
+    # succeeded. Only entries that were actually rendered are recorded.
+    sent_count = len(posted_entries)
+    mark_configs_posted_batch(profile_id, posted_entries)
 
     if sent_count > 0:
         set_profile_last_num(profile_id, last_n + sent_count)
@@ -4322,7 +4412,7 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
     # Telegram pages. Four pages per source are enough for normal interval runs;
     # an unfinished backlog remains behind the stream cursor and is picked up by
     # the next cycle. This keeps manual/automatic execution bounded and stable.
-    scrape_pages = 3
+    scrape_pages = 1
     config_test_limit = None
     # Scrape all sources in parallel
     async def scrape_one(src):
@@ -4351,7 +4441,7 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
             continue
         src, config_links, proxy_links, newest_id = res
         source_newest_ids[src] = newest_id
-        log.info(f"  [profile={profile_id}][{stream}] {src}: {len(config_links)} configs, {len(proxy_links)} proxies from web, newest={newest_id or 'NONE'}")
+        log.debug(f"[profile={profile_id}][{stream}] {src}: {len(config_links)} configs, {len(proxy_links)} proxies from web, newest={newest_id or 'NONE'}")
         for link in config_links:
             identity = canonical_config_identity(link)
             if identity not in seen_config_identities:
@@ -4367,7 +4457,13 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
 
     # Filter duplicates based on database
     new_configs = []
+    blacklist_words = get_blacklist(profile_id)
     for u, s in all_configs:
+        # Remove blacklisted candidates BEFORE the ping/test window is selected.
+        # Otherwise a small max_post/test window can be filled entirely by
+        # blacklisted URLs and newer valid configs never get a chance to publish.
+        if blacklist_words and any(str(word).lower() in str(u).lower() for word in blacklist_words if word):
+            continue
         if not is_already_posted(profile_id, u):
             new_configs.append((u, s))
 
@@ -4525,9 +4621,7 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
             if sent:
                 total_proxies = cnt
                 log.info(f"[PROXY][profile={profile_id}] Telegram send succeeded for {cnt} proxies")
-                for proxy_url in selected_proxy_urls:
-                    if not is_proxy_posted(profile_id, proxy_url):
-                        mark_proxy_posted(profile_id, proxy_url)
+                mark_proxies_posted_batch(profile_id, selected_proxy_urls)
 
     # Advance each stream independently. A failed Telegram send MUST NOT move
     # that stream's cursor, otherwise the failed content would be lost forever.
@@ -4540,18 +4634,15 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
     # next cycle must revisit the same window and publish the remainder.
     config_ok = (not enable_configs) or (not new_configs) or (total_configs >= len(new_configs))
     proxy_ok = (not enable_proxies) or (not new_proxies) or (total_proxies >= len(new_proxies))
-    for src, newest_id in source_newest_ids.items():
-        if not newest_id:
-            continue
-        if stream == "combined":
-            if config_ok:
-                set_stream_last_message_id(profile_id, src, "config", newest_id)
-            if proxy_ok:
-                set_stream_last_message_id(profile_id, src, "proxy", newest_id)
-        elif stream == "config" and config_ok:
-            set_stream_last_message_id(profile_id, src, "config", newest_id)
-        elif stream == "proxy" and proxy_ok:
-            set_stream_last_message_id(profile_id, src, "proxy", newest_id)
+    if stream == "combined":
+        if config_ok:
+            set_stream_last_message_ids_batch(profile_id, "config", source_newest_ids.items())
+        if proxy_ok:
+            set_stream_last_message_ids_batch(profile_id, "proxy", source_newest_ids.items())
+    elif stream == "config" and config_ok:
+        set_stream_last_message_ids_batch(profile_id, "config", source_newest_ids.items())
+    elif stream == "proxy" and proxy_ok:
+        set_stream_last_message_ids_batch(profile_id, "proxy", source_newest_ids.items())
 
     result_msg = f"posted {total_configs} configs and {total_proxies} proxies"
     if failed_sources:
@@ -4821,13 +4912,15 @@ async def _profile_scheduler_v16(bot, profile_id, mode):
                     next_deadline = None
                     interval_seconds = None
 
-            # interval=0 retains the legacy instant mode: run, then check again
-            # after a short pause. Positive intervals are scheduled precisely.
+            # interval=0 is a responsive polling mode, not a busy loop.
+            # Public-channel scraping cannot be truly event-driven, so use a
+            # bounded 30-second cadence instead of hammering 100+ sources every
+            # second. Positive intervals are scheduled precisely.
             if interval_minutes == 0:
                 started = datetime.now(TEHRAN_TZ)
                 log.info(f"[SCHEDULER] AUTO TICK {key} at {started.isoformat()} (instant mode)")
                 await _run_scheduled_profile_cycle(bot, profile_id, mode)
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(30.0)
                 continue
 
             seconds = float(interval_minutes * 60)
@@ -9147,9 +9240,7 @@ async def post_working_configs(bot, profile_id, working, proxies_with_ping, forc
             if sent:
                 total_proxies = cnt
                 log.info(f"[PROXY][profile={profile_id}] Telegram send succeeded for {cnt} proxies")
-                for proxy_url in selected_proxy_urls:
-                    if not is_proxy_posted(profile_id, proxy_url):
-                        mark_proxy_posted(profile_id, proxy_url)
+                mark_proxies_posted_batch(profile_id, selected_proxy_urls)
     return total_configs, total_proxies
 
 async def export_backup(update, context, profile_id, backup_type, count=None):
@@ -9203,34 +9294,45 @@ async def export_backup(update, context, profile_id, backup_type, count=None):
 # ======================================================================
 # Automatic database garbage collector (v1.1.0)
 # ======================================================================
-DB_CLEAN_INTERVAL = 12 * 60 * 60
+DB_CLEAN_INTERVAL = 24 * 60 * 60
 
 
 def automatic_database_cleanup():
-    """Delete only disposable state older than 24h; preserve profiles/settings/cursors."""
+    """Delete disposable runtime data only; permanent profiles/cursors/dedup stay intact."""
     db = None
     try:
         db = get_conn()
         cur = db.cursor()
-        cutoff = (datetime.now(TEHRAN_TZ) - timedelta(days=1)).isoformat()
+        cutoff = (datetime.now(TEHRAN_TZ) - timedelta(hours=DB_RETENTION_HOURS)).isoformat()
         deleted = {}
-        cleanup_sql = {
-            "posts": "DELETE FROM posts WHERE created_at IS NOT NULL AND created_at < ?",
-            "seen": "DELETE FROM seen WHERE last_posted IS NOT NULL AND last_posted < ?",
-            "proxies_seen": "DELETE FROM proxies_seen WHERE last_posted IS NOT NULL AND last_posted < ?",
-            "manual_send_queue": "DELETE FROM manual_send_queue WHERE status IN ('done','cancelled','failed') AND updated_at < ?",
-            "processed_messages": "DELETE FROM processed_messages WHERE rowid NOT IN (SELECT rowid FROM processed_messages ORDER BY rowid DESC LIMIT 20000)",
-            "country_cache": "DELETE FROM country_cache WHERE rowid NOT IN (SELECT rowid FROM country_cache ORDER BY rowid DESC LIMIT 5000)",
-        }
-        for table, sql in cleanup_sql.items():
+        for table, where in ((
+            "posts", "created_at < ?"),
+            ("manual_send_queue", "status IN ('done','cancelled','failed') AND updated_at < ?"),
+        ):
             try:
-                if table in ("processed_messages", "country_cache"):
-                    cur.execute(sql)
-                else:
-                    cur.execute(sql, (cutoff,))
-                deleted[table] = cur.rowcount if cur.rowcount >= 0 else 0
-            except sqlite3.Error as exc:
-                log.warning("[DB CLEANER] %s skipped: %s", table, exc)
+                cur.execute(f"DELETE FROM {table} WHERE {where}", (cutoff,))
+                deleted[table] = max(0, cur.rowcount)
+            except sqlite3.Error:
+                deleted[table] = 0
+        # URL history is disposable after 24h. Permanent once-only hashes remain.
+        for table, col in (("seen", "last_posted"), ("proxies_seen", "last_posted")):
+            try:
+                cur.execute(f"DELETE FROM {table} WHERE {col} IS NOT NULL AND {col} < ?", (cutoff,))
+                deleted[table] = max(0, cur.rowcount)
+            except sqlite3.Error:
+                deleted[table] = 0
+
+        # processed_messages is disposable; retain only a bounded recent tail.
+        try:
+            cur.execute("DELETE FROM processed_messages WHERE rowid NOT IN (SELECT rowid FROM processed_messages ORDER BY rowid DESC LIMIT 5000)")
+            deleted["processed_messages"] = max(0, cur.rowcount)
+        except sqlite3.Error:
+            deleted["processed_messages"] = 0
+        try:
+            cur.execute("DELETE FROM country_cache")
+            deleted["country_cache"] = max(0, cur.rowcount)
+        except sqlite3.Error:
+            deleted["country_cache"] = 0
         db.commit()
         cur.execute("PRAGMA optimize")
         try:
@@ -9238,15 +9340,49 @@ def automatic_database_cleanup():
         except sqlite3.Error:
             pass
         db.commit()
-        log.info("[DB CLEANER] 24h cleanup completed: %s", deleted)
+        log.info("[DB CLEANER] disposable cleanup completed: %s; permanent ledgers preserved", deleted)
+        return deleted
     except sqlite3.Error:
         if db:
             db.rollback()
         log.exception("[DB CLEANER] failed")
+        return {}
     finally:
         if db:
             db.close()
 
+def compact_database_once():
+    """One-time physical compaction. Runs off the event loop and skips if DB is busy."""
+    db = None
+    try:
+        db = get_conn()
+        db.execute("PRAGMA busy_timeout=500")
+        # Only compact when the file has enough free pages to justify the work.
+        row = db.execute("PRAGMA freelist_count").fetchone()
+        free_pages = int(row[0] or 0) if row else 0
+        page_size = int((db.execute("PRAGMA page_size").fetchone() or [4096])[0])
+        if free_pages * page_size < 8 * 1024 * 1024:
+            log.info("[DB COMPACT] skipped; reclaimable space below 8 MiB")
+            return False
+        log.info("[DB COMPACT] starting one-time compaction: reclaimable=%d MiB", (free_pages * page_size) // (1024 * 1024))
+        db.execute("VACUUM")
+        log.info("[DB COMPACT] completed")
+        return True
+    except sqlite3.Error as exc:
+        log.warning("[DB COMPACT] skipped: %s", exc)
+        return False
+    finally:
+        if db:
+            db.close()
+
+async def database_compact_worker():
+    # Delay compaction until the bot is already responsive. This is a one-time
+    # disk operation and is never performed in the polling/event-loop thread.
+    await asyncio.sleep(90)
+    try:
+        await asyncio.to_thread(compact_database_once)
+    except Exception:
+        log.exception("[DB COMPACT] worker failed")
 
 async def database_cleanup_worker():
     log.info('[DB CLEANER] worker started | retention=24h')
@@ -9333,6 +9469,13 @@ async def post_init(app):
         log.info(f"✅ Created default profile with id {new_id}.")
         profiles = get_profiles()
     log.info(f"✅ INIT done: {len(profiles)} profiles, AUTO={ENABLE_AUTO}")
+    # Load permanent dedup identities once. Hot posting paths then avoid SQLite
+    # lookups entirely; profiles/settings remain untouched.
+    load_dedup_cache()
+    try:
+        purge_duplicate_ledgers()
+    except Exception:
+        log.exception("startup ledger repair failed")
 
     job_queue = app.job_queue
     if job_queue:
@@ -9367,6 +9510,7 @@ async def post_init(app):
         log.info("⏰ Precise automatic scheduler started: config/proxy are fully independent")
 
     start_worker(app, "cleanup", lambda: periodic_cleanup())
+    start_worker(app, "database_compactor", lambda: database_compact_worker())
     start_worker(app, "database_cleaner", lambda: database_cleanup_worker())
     start_worker(app, "watchdog", lambda: worker_watchdog())
     log.info("🧹 Periodic cleanup task started")
@@ -9391,8 +9535,7 @@ def optimize_database():
         cutoff = (datetime.now(TEHRAN_TZ) - timedelta(days=1)).isoformat()
         # delete old duplicate trackers, not actual configs
         cur.execute("DELETE FROM posts WHERE created_at < ?", (cutoff,))
-        cur.execute("DELETE FROM seen WHERE last_posted IS NOT NULL AND last_posted < ? AND first_seen IS NOT NULL", (cutoff,))
-        cur.execute("DELETE FROM proxies_seen WHERE last_posted IS NOT NULL AND last_posted < ? AND first_seen IS NOT NULL", (cutoff,))
+        # NEVER delete seen/proxies_seen: they are permanent once-only posting ledgers.
         cur.execute("DELETE FROM processed_messages WHERE rowid NOT IN (SELECT MIN(rowid) FROM processed_messages GROUP BY source,message_id,profile_id)")
 
         db.commit()
@@ -9474,6 +9617,7 @@ def main():
 
 async def _post_stop_cleanup(app):
     await _close_ping_client()
+    await _close_scrape_client()
 
 # Final lifecycle hook: all functions are defined before polling starts.
 # This prevents the historical "main() before trailing definitions" layout.
