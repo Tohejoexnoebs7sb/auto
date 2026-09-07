@@ -1,5 +1,5 @@
 # bot.py — 4.1.0
-APP_VERSION = "4.1.0"
+APP_VERSION = "4.1.1"
 APP_VERSION_MAJOR = 4
 APP_VERSION_MINOR = 1
 APP_VERSION_PATCH = 0
@@ -1372,23 +1372,41 @@ async def _send_manual_queue_batch(bot, job):
     return len(selected)
 
 
-def sqlite_maintenance_cycle():
-    """Controlled SQLite maintenance. Prevent WAL/queue/log database growth."""
+DB_RETENTION_HOURS = 24
+
+def cleanup_expired_runtime_data():
+    """Remove disposable runtime history after 24h; profiles/settings and permanent dedup ledgers stay forever."""
+    cutoff = (datetime.now() - timedelta(hours=DB_RETENTION_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+    deleted = {}
+    for table, where in (("posts", "created_at < ?"), ("processed_messages", "updated_at < ?"), ("manual_send_queue", "status IN (\'done\',\'cancelled\',\'failed\') AND updated_at < ?")):
+        try:
+            cur = c.execute(f"DELETE FROM {table} WHERE {where}", (cutoff,))
+            deleted[table] = cur.rowcount
+        except sqlite3.OperationalError:
+            deleted[table] = 0
     try:
-        c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        c.execute("DELETE FROM manual_send_queue WHERE status IN ('done','cancelled','failed') AND updated_at < ?",
-                  (_queue_iso(_queue_now()-timedelta(days=1)),))
-        # Keep historical tables bounded. These tables are state tables, not logs.
-        c.execute("DELETE FROM processed_messages WHERE rowid NOT IN (SELECT rowid FROM processed_messages ORDER BY rowid DESC LIMIT 50000)")
-        c.execute("DELETE FROM country_cache WHERE rowid NOT IN (SELECT rowid FROM country_cache ORDER BY rowid DESC LIMIT 10000)")
-        c.execute("PRAGMA optimize")
+        cur = c.execute("DELETE FROM country_cache")
+        deleted["country_cache"] = cur.rowcount
+    except sqlite3.OperationalError:
+        deleted["country_cache"] = 0
+    conn.commit()
+    try: c.execute("PRAGMA wal_checkpoint(PASSIVE)")
+    except sqlite3.DatabaseError: pass
+    try: c.execute("PRAGMA optimize")
+    except sqlite3.DatabaseError: pass
+    return deleted
+
+def purge_duplicate_ledgers():
+    """Repair legacy duplicate rows; never delete profiles or configuration."""
+    try:
+        c.execute("DELETE FROM seen WHERE rowid NOT IN (SELECT MAX(rowid) FROM seen GROUP BY profile_id, COALESCE(full_url,\'\'), uuid, address)")
+        c.execute("DELETE FROM proxies_seen WHERE rowid NOT IN (SELECT MAX(rowid) FROM proxies_seen GROUP BY profile_id, proxy_url)")
         conn.commit()
-        # Only compact when SQLite has a large amount of free pages.
-        free_pages = c.execute("PRAGMA freelist_count").fetchone()[0]
-        # Do not VACUUM while the bot is serving callbacks/schedulers.
-        pass
-    except Exception:
-        log.exception("sqlite maintenance failed")
+    except sqlite3.DatabaseError:
+        log.exception("dedup ledger repair failed")
+
+def sqlite_maintenance_cycle():
+    return cleanup_expired_runtime_data()
 
 async def manual_queue_worker(bot):
     """Persistent manual scheduler with second-level deadline accuracy.
