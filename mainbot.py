@@ -1,5 +1,5 @@
-# bot.py — Version 1
-APP_VERSION = "1"
+# bot.py — 2
+APP_VERSION = "2"
 BOT_VERSION = APP_VERSION
 import os
 import re
@@ -3328,11 +3328,23 @@ def add_custom_query_to_url(url, custom_query, protocol):
 # ======================================================================
 # پینگ (بهینه‌شده) - با لایه‌های تست
 # ======================================================================
+_DNS_CACHE = {}
+_DNS_CACHE_TTL = 300
+
 async def host_to_ip(host):
+    host = (host or "").strip().lower()
+    if not host:
+        return None
+    cached = _DNS_CACHE.get(host)
+    now = time.monotonic()
+    if cached and now - cached[0] < _DNS_CACHE_TTL:
+        return cached[1]
     try:
-        return socket.gethostbyname(host)
+        ip = await asyncio.to_thread(socket.gethostbyname, host)
+        _DNS_CACHE[host] = (now, ip)
+        return ip
     except Exception as e:
-        log.warning(f"DNS resolution failed for {host}: {e}")
+        log.debug(f"DNS resolution failed for {host}: {e}")
         return None
 
 async def test_tcp_ping(host, port):
@@ -3488,67 +3500,72 @@ async def scrape_channel_paginated(profile_id, channel, max_pages=5, stream="com
         f"{clean_channel} (max {effective_max_pages} pages, last_msg_id={last_msg_id or 'NONE'})"
     )
 
-    while (effective_max_pages is None or page_count < effective_max_pages) and not stopped:
-        page_count += 1
-        log.info(
-            f"🔍 [profile={profile_id}][stream={stream}] Scraping page "
-            f"{page_count} for {clean_channel}: {current_url}"
-        )
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(7.0, connect=3.0),
+        follow_redirects=True,
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=50),
+    ) as scrape_client:
+      while (effective_max_pages is None or page_count < effective_max_pages) and not stopped:
+          page_count += 1
+          log.info(
+              f"🔍 [profile={profile_id}][stream={stream}] Scraping page "
+              f"{page_count} for {clean_channel}: {current_url}"
+          )
 
-        _page_configs, _page_proxies, msg_ids, msg_content_map = \
-            await _scrape_single_page_with_messages(current_url, clean_channel)
+          _page_configs, _page_proxies, msg_ids, msg_content_map = \
+              await _scrape_single_page_with_messages(current_url, clean_channel, scrape_client)
 
-        if not msg_ids:
-            log.info(f"⚠️ [profile={profile_id}][stream={stream}] No messages on page {page_count} for {clean_channel}")
-            break
+          if not msg_ids:
+              log.info(f"⚠️ [profile={profile_id}][stream={stream}] No messages on page {page_count} for {clean_channel}")
+              break
 
-        # Telegram normally returns newest -> oldest. Keep the newest ID we
-        # actually encountered for this scan, but do not advance DB state yet.
-        if not newest_seen_id:
-            newest_seen_id = msg_ids[0]
+          # Telegram normally returns newest -> oldest. Keep the newest ID we
+          # actually encountered for this scan, but do not advance DB state yet.
+          if not newest_seen_id:
+              newest_seen_id = msg_ids[0]
 
-        new_msg_ids = []
-        for mid in msg_ids:
-            if last_msg_id and str(mid) == str(last_msg_id):
-                stopped = True
-                break
-            new_msg_ids.append(mid)
+          new_msg_ids = []
+          for mid in msg_ids:
+              if last_msg_id and str(mid) == str(last_msg_id):
+                  stopped = True
+                  break
+              new_msg_ids.append(mid)
 
-        if not new_msg_ids:
-            log.info(
-                f"✅ [profile={profile_id}][stream={stream}] Reached cursor for "
-                f"{clean_channel}; no newer messages on page {page_count}."
-            )
-            break
+          if not new_msg_ids:
+              log.info(
+                  f"✅ [profile={profile_id}][stream={stream}] Reached cursor for "
+                  f"{clean_channel}; no newer messages on page {page_count}."
+              )
+              break
 
-        for mid in new_msg_ids:
-            content = msg_content_map.get(mid, "")
-            if not content:
-                continue
+          for mid in new_msg_ids:
+              content = msg_content_map.get(mid, "")
+              if not content:
+                  continue
 
-            configs = extract_links_from_text(content)
-            proxies = extract_proxy_links_from_text(content)
-            all_configs.extend(configs)
-            all_proxies.extend(proxies)
+              configs = extract_links_from_text(content)
+              proxies = extract_proxy_links_from_text(content)
+              all_configs.extend(configs)
+              all_proxies.extend(proxies)
 
-            # Keep the existing audit table, but DO NOT use it as the cursor.
-            # Config and proxy streams must be able to inspect the same source
-            # message independently.
-            mark_message_processed(profile_id, clean_channel, mid)
+              # Keep the existing audit table, but DO NOT use it as the cursor.
+              # Config and proxy streams must be able to inspect the same source
+              # message independently.
+              mark_message_processed(profile_id, clean_channel, mid)
 
-        numeric_ids = []
-        for mid in msg_ids:
-            parts = str(mid).split('/')
-            if len(parts) == 2 and parts[1].isdigit():
-                numeric_ids.append(int(parts[1]))
-        if numeric_ids:
-            oldest = min(numeric_ids)
-            current_url = f"{base_url}?before={oldest}"
-        else:
-            break
+          numeric_ids = []
+          for mid in msg_ids:
+              parts = str(mid).split('/')
+              if len(parts) == 2 and parts[1].isdigit():
+                  numeric_ids.append(int(parts[1]))
+          if numeric_ids:
+              oldest = min(numeric_ids)
+              current_url = f"{base_url}?before={oldest}"
+          else:
+              break
 
-        # No fixed per-page delay: source requests are already rate-limited by Telegram.
-        await asyncio.sleep(0)
+          # No fixed per-page delay: source requests are already rate-limited by Telegram.
+          await asyncio.sleep(0)
 
     all_configs = list(dict.fromkeys(all_configs))
     all_proxies = list(dict.fromkeys(all_proxies))
@@ -3559,7 +3576,7 @@ async def scrape_channel_paginated(profile_id, channel, max_pages=5, stream="com
     )
     return all_configs, all_proxies, newest_seen_id
 
-async def _scrape_single_page_with_messages(url, channel):
+async def _scrape_single_page_with_messages(url, channel, client=None):
     headers = {
         "User-Agent": _USER_AGENTS[hash(datetime.now(TEHRAN_TZ).timestamp()) % len(_USER_AGENTS)],
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -3570,7 +3587,13 @@ async def _scrape_single_page_with_messages(url, channel):
         "Pragma": "no-cache",
     }
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(7.0, connect=3.0), follow_redirects=True, limits=httpx.Limits(max_connections=50, max_keepalive_connections=20)) as cl:
+    own_client = client is None
+    cl = client or httpx.AsyncClient(
+        timeout=httpx.Timeout(7.0, connect=3.0),
+        follow_redirects=True,
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=50),
+    )
+    try:
         r = await cl.get(url, headers=headers)
         if r.status_code == 429:
             log.warning(f"Rate limit for {channel}, waiting 10s")
@@ -3640,6 +3663,9 @@ async def _scrape_single_page_with_messages(url, channel):
             f"configs={len(config_links)}, proxies={len(proxy_links)}, messages={len(msg_ids)}"
         )
         return config_links, proxy_links, msg_ids, msg_content_map
+    finally:
+        if own_client:
+            await cl.aclose()
 
 # ======================================================================
 # ارسال (بدون تغییر)
@@ -3790,6 +3816,35 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
 
     config_blocks = []
     config_mode = get_profile_config_post_mode(profile_id)
+
+    # Resolve DNS/Geo metadata concurrently. The previous sequential path could
+    # spend several seconds per config and made manual runs unnecessarily slow.
+    _meta_sem = asyncio.Semaphore(24)
+    async def _resolve_config_meta(_url):
+        async with _meta_sem:
+            host, _ = extract_host(_url)
+            flag = "🌐"
+            country_code = ""
+            if host:
+                try:
+                    ip = await host_to_ip(host)
+                    if ip:
+                        flag, country_code = await get_flag_for_ip(ip)
+                except Exception as _e:
+                    log.debug(f"[CONFIG] metadata failed for {host}: {_e}")
+            return flag, country_code
+
+    _meta_results = await asyncio.gather(
+        *[_resolve_config_meta(url) for url, _, _ in items],
+        return_exceptions=True,
+    )
+    config_meta = {}
+    for (_url, _ping, _cnt), _meta in zip(items, _meta_results):
+        if isinstance(_meta, Exception):
+            config_meta[_url] = ("🌐", "")
+        else:
+            config_meta[_url] = _meta
+
     for i, (url, ping, node_count) in enumerate(items, 1):
         n = last_n + i
 
@@ -3801,13 +3856,7 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
             config_blocks.append(header + "\n<pre>" + (url or '').strip() + "</pre>")
             continue
 
-        host, _ = extract_host(url)
-        flag = "🌐"
-        country_code = ""
-        if host:
-            ip = await host_to_ip(host)
-            if ip:
-                flag, country_code = await get_flag_for_ip(ip)
+        flag, country_code = config_meta.get(url, ("🌐", ""))
 
         # Config title/header is fully template-driven. Default: [Protocol] [Flag] [Country].
         config_title = detect_config_protocol(url)
@@ -3968,13 +4017,7 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
     sent_count = len(items)
     for i, (url, ping, node_count) in enumerate(items, 1):
         n = last_n + i
-        host, _ = extract_host(url)
-        flag = "🌐"
-        country_code = ""
-        if host:
-            ip = await host_to_ip(host)
-            if ip:
-                flag, country_code = await get_flag_for_ip(ip)
+        flag, country_code = config_meta.get(url, ("🌐", ""))
         fragment_text = naming_template.replace("{Flag}", flag).replace("{CHANNEL_ID}", channel_link).replace("{COUNT}", str(n))
         fragment_text = fragment_text.replace("{FLAG}", flag)
         fragment_text = fragment_text.replace("{COUNTRY_EN}", COUNTRY_NAMES_EN.get(country_code, ""))
@@ -4182,7 +4225,7 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
     low_cost_mode=get_profile_low_cost_mode(profile_id)
     # Exhaustive source scan: keep paging until the stored cursor or channel history ends.
     # Low-cost mode now controls ping/test intensity only; it must never hide source messages.
-    scrape_pages = 12 if is_instant else None
+    scrape_pages = None
     config_test_limit = None  # no artificial item cap; Telegram max_post still controls publication
     # Scrape all sources in parallel
     async def scrape_one(src):
@@ -4572,12 +4615,28 @@ async def profile_loop_proxy(bot, profile_id):
 _auto_next_runs = {}
 
 async def _run_scheduled_profile_cycle(bot, profile_id, mode):
+    """Run exactly one independent automatic stream.
+
+    Config and proxy workers never depend on each other; a proxy success can
+    never mask a config failure. Every config tick therefore calls the same
+    config-only cycle used by the normal scheduler.
+    """
     try:
         if mode == "config":
-            return await run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_proxies=False, is_instant=False)
-        return await run_cycle_for_profile(bot, profile_id, enable_configs=False, enable_proxies=True, is_instant=False)
+            result = await run_cycle_for_profile(
+                bot, profile_id, enable_configs=True, enable_proxies=False, is_instant=False
+            )
+            log.info(f"[AUTO-CONFIG] profile={profile_id} result={result}")
+            return result
+        result = await run_cycle_for_profile(
+            bot, profile_id, enable_configs=False, enable_proxies=True, is_instant=False
+        )
+        log.info(f"[AUTO-PROXY] profile={profile_id} result={result}")
+        return result
+    except asyncio.CancelledError:
+        raise
     except Exception:
-        log.error(traceback.format_exc())
+        log.exception(f"[AUTO-{mode.upper()}] profile={profile_id} cycle failed")
         return 0, "error"
 
 async def _profile_scheduler_v16(bot, profile_id, mode):
@@ -4701,11 +4760,7 @@ async def _profile_scheduler_v16(bot, profile_id, mode):
             if interval_seconds and next_deadline is None:
                 next_deadline = loop.time() + interval_seconds
 
-async def profile_loop_config(bot, profile_id):
-    await _profile_scheduler_v16(bot, profile_id, "config")
-
-async def profile_loop_proxy(bot, profile_id):
-    await _profile_scheduler_v16(bot, profile_id, "proxy")
+# Scheduler entrypoints are defined once above.
 
 # ======================================================================
 # بک‌آپ خودکار، گزارش روزانه، Railway و پاکسازی (بدون تغییر)
@@ -5366,7 +5421,8 @@ def profile_admin_kb(profile_id):
         )],
         [InlineKeyboardButton(f"🌐 حالت انتشار پروکسی: {'شیشه‌ای' if get_profile_proxy_post_mode(profile_id) == 1 else 'عادی'}", callback_data=f"tgl_prx_mode_{profile_id}", style="primary"),
          InlineKeyboardButton(f"📡 تست Ping: {'✅' if ping_testing else '❌'}", callback_data=f"tgl_ping_test_{profile_id}", style="primary")],
-        [InlineKeyboardButton(f"🧩 حالت انتشار کانفیگ: {'Quote جمع‌شونده' if get_profile_config_post_mode(profile_id) == 1 else 'عادی'}", callback_data=f"tgl_cfg_post_mode_{profile_id}", style="primary")],
+        [InlineKeyboardButton(f"🧩 کانفیگ: {'✅ عادی' if get_profile_config_post_mode(profile_id) == 0 else 'عادی'}", callback_data=f"set_cfg_post_mode_0_{profile_id}", style="success" if get_profile_config_post_mode(profile_id) == 0 else "primary"),
+         InlineKeyboardButton(f"🧩 کانفیگ: {'✅ Quote جمع‌شونده' if get_profile_config_post_mode(profile_id) == 1 else 'Quote جمع‌شونده'}", callback_data=f"set_cfg_post_mode_1_{profile_id}", style="success" if get_profile_config_post_mode(profile_id) == 1 else "primary")],
         [InlineKeyboardButton(f"👁 نمایش Ping: {'✅' if prof.get('show_ping', 1) else '❌'}", callback_data=f"tgl_show_ping_{profile_id}", style="primary"),
          InlineKeyboardButton("📍 تنظیم مناطق Ping", callback_data=f"ping_regions_{profile_id}", style="primary")],
         [InlineKeyboardButton(f"📍 Ping ویتوری: {'🇮🇷 ایران' if get_profile_config_ping_mode(profile_id) == 'iran' else '🌍 جهانی'}", callback_data=f"ping_region_config_{profile_id}", style="primary"),
@@ -6971,18 +7027,25 @@ async def _on_callback_impl(u, ctx):
                     pass
                 async def _run_manual_fast():
                     try:
+                        _started_mono = asyncio.get_running_loop().time()
                         n, m = await asyncio.wait_for(
-                            run_cycle_for_profile(u.get_bot(), profile_id, enable_configs=True, enable_proxies=True, is_instant=True),
-                            timeout=110.0
+                            run_cycle_for_profile(
+                                u.get_bot(), profile_id, enable_configs=True, enable_proxies=True, is_instant=True
+                            ),
+                            timeout=118.0
                         )
+                        _elapsed = asyncio.get_running_loop().time() - _started_mono
                         try:
-                            await u.get_bot().send_message(MAIN_ADMIN_ID, f"✅ اجرای دستی تمام شد\n📊 {n}\n📝 {m}")
+                            await u.get_bot().send_message(
+                                MAIN_ADMIN_ID,
+                                f"✅ اجرای دستی تمام شد\n📊 {n}\n📝 {m}\n⏱ زمان: {_elapsed:.1f} ثانیه"
+                            )
                         except Exception:
                             pass
                     except asyncio.TimeoutError:
                         log.error(f"❌ runnow timeout for profile {profile_id}")
                         try:
-                            await u.get_bot().send_message(MAIN_ADMIN_ID, "⚠️ اجرای دستی بیش از ۱۱۰ ثانیه طول کشید و برای جلوگیری از کرش متوقف شد.\nجزئیات در لاگ ثبت شده است.")
+                            await u.get_bot().send_message(MAIN_ADMIN_ID, "⚠️ اجرای دستی بیش از ۱۱۸ ثانیه طول کشید و برای جلوگیری از کرش متوقف شد.\nجزئیات در لاگ ثبت شده است.")
                         except Exception:
                             pass
                     except Exception as e:
@@ -7148,6 +7211,19 @@ async def _on_callback_impl(u, ctx):
                 await show_profile_admin(q.message, profile_id)
             else:
                 await q.answer("⚠️ خطا در داده")
+            return
+
+        if d.startswith("set_cfg_post_mode_"):
+            parts = d.split("_")
+            try:
+                mode = int(parts[4])
+                profile_id = int(parts[5])
+            except Exception:
+                await q.answer("⚠️ داده نامعتبر")
+                return
+            set_profile_config_post_mode(profile_id, mode)
+            await q.answer("✅ حالت عادی فعال شد." if mode == 0 else "✅ Quote جمع‌شونده فعال شد.")
+            await show_profile_admin(q.message, profile_id)
             return
 
         if d.startswith("tgl_cfg_post_mode_"):
