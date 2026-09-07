@@ -1,9 +1,9 @@
-# bot.py — 4.1.2
-APP_VERSION = "4.1.2"
+# bot.py — 4.1.3
+APP_VERSION = "4.1.3"
 APP_VERSION_MAJOR = 4
 APP_VERSION_MINOR = 1
-APP_VERSION_PATCH = 2
-APP_VERSION_LABEL = "4.1.2-stable"
+APP_VERSION_PATCH = 3
+APP_VERSION_LABEL = "4.1.3-stable"
 BOT_VERSION = APP_VERSION
 import os
 import re
@@ -699,6 +699,16 @@ c.execute("""CREATE TABLE IF NOT EXISTS posted_proxy_keys (
     identity_hash TEXT NOT NULL,
     first_posted TEXT,
     PRIMARY KEY(profile_id, identity_hash))""")
+
+# Bounded ledger of messages actually sent by this bot to each profile destination.
+c.execute("""CREATE TABLE IF NOT EXISTS channel_posts (
+    profile_id INTEGER NOT NULL,
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    sent_at TEXT NOT NULL,
+    UNIQUE(chat_id, message_id))""")
+c.execute("CREATE INDEX IF NOT EXISTS idx_channel_posts_profile_latest ON channel_posts(profile_id, message_id DESC)")
+c.execute("CREATE INDEX IF NOT EXISTS idx_channel_posts_chat_latest ON channel_posts(chat_id, message_id DESC)")
 conn.commit()
 
 # Performance indexes and lightweight maintenance for long-running Railway workers.
@@ -1607,6 +1617,7 @@ def delete_profile(profile_id):
     c.execute("DELETE FROM proxies_seen WHERE profile_id=?", (profile_id,))
     c.execute("DELETE FROM posted_config_keys WHERE profile_id=?", (profile_id,))
     c.execute("DELETE FROM posted_proxy_keys WHERE profile_id=?", (profile_id,))
+    c.execute("DELETE FROM channel_posts WHERE profile_id=?", (profile_id,))
     c.execute("DELETE FROM last_scrape WHERE profile_id=?", (profile_id,))
     c.execute("DELETE FROM source_stream_state WHERE profile_id=?", (profile_id,))
     c.execute("DELETE FROM processed_messages WHERE profile_id=?", (profile_id,))
@@ -3242,19 +3253,40 @@ def _proxy_identity_hash(url):
     return hashlib.sha256(canonical_proxy_identity(url).encode("utf-8", errors="ignore")).hexdigest()
 
 def load_dedup_cache():
+    """Warm compact permanent dedup hashes in bounded batches."""
     global _DEDUP_CACHE_READY
     if _DEDUP_CACHE_READY:
         return
     try:
-        rows = c.execute("SELECT profile_id,full_url,first_seen,source FROM seen WHERE full_url IS NOT NULL AND full_url!=''").fetchall()
-        c.executemany("INSERT OR IGNORE INTO posted_config_keys(profile_id,identity_hash,first_posted,source) VALUES (?,?,?,?)",
-                      [(int(pid), _config_identity_hash(url), fs, src or "") for pid,url,fs,src in rows])
-        rows = c.execute("SELECT profile_id,proxy_url,first_seen FROM proxies_seen WHERE proxy_url IS NOT NULL AND proxy_url!=''").fetchall()
-        c.executemany("INSERT OR IGNORE INTO posted_proxy_keys(profile_id,identity_hash,first_posted) VALUES (?,?,?)",
-                      [(int(pid), _proxy_identity_hash(url), fs) for pid,url,fs in rows])
-        conn.commit()
-        _SEEN_CONFIG_KEYS.update((int(pid), h) for pid,h in c.execute("SELECT profile_id,identity_hash FROM posted_config_keys").fetchall())
-        _SEEN_PROXY_KEYS.update((int(pid), h) for pid,h in c.execute("SELECT profile_id,identity_hash FROM posted_proxy_keys").fetchall())
+        cur = conn.cursor()
+        cur.execute("SELECT profile_id,full_url,first_seen,source FROM seen WHERE full_url IS NOT NULL AND full_url!=''")
+        while True:
+            rows = cur.fetchmany(2000)
+            if not rows: break
+            cur.executemany(
+                "INSERT OR IGNORE INTO posted_config_keys(profile_id,identity_hash,first_posted,source) VALUES (?,?,?,?)",
+                [(int(pid), _config_identity_hash(url), fs, src or "") for pid,url,fs,src in rows]
+            )
+            conn.commit()
+        cur.execute("SELECT profile_id,proxy_url,first_seen FROM proxies_seen WHERE proxy_url IS NOT NULL AND proxy_url!=''")
+        while True:
+            rows = cur.fetchmany(2000)
+            if not rows: break
+            cur.executemany(
+                "INSERT OR IGNORE INTO posted_proxy_keys(profile_id,identity_hash,first_posted) VALUES (?,?,?)",
+                [(int(pid), _proxy_identity_hash(url), fs) for pid,url,fs in rows]
+            )
+            conn.commit()
+        cur.execute("SELECT profile_id,identity_hash FROM posted_config_keys")
+        while True:
+            rows = cur.fetchmany(5000)
+            if not rows: break
+            _SEEN_CONFIG_KEYS.update((int(pid), h) for pid,h in rows)
+        cur.execute("SELECT profile_id,identity_hash FROM posted_proxy_keys")
+        while True:
+            rows = cur.fetchmany(5000)
+            if not rows: break
+            _SEEN_PROXY_KEYS.update((int(pid), h) for pid,h in rows)
         _DEDUP_CACHE_READY = True
         log.info("[DB] compact dedup cache ready: configs=%d proxies=%d", len(_SEEN_CONFIG_KEYS), len(_SEEN_PROXY_KEYS))
     except sqlite3.Error:
@@ -3324,9 +3356,16 @@ def mark_configs_posted_batch(profile_id, entries):
     now = get_tehran_time()
     cfg_rows = []
     seen_rows = []
-    for url, source in entries:
+    for entry in entries:
+        url = entry[0] if len(entry) > 0 else ""
+        source = entry[1] if len(entry) > 1 else ""
+        # In Quote/normal rendering the display URL can receive a custom query
+        # or name fragment. Dedup must use the ORIGINAL scraped URL so changing
+        # a display template/query can never make the same config look new.
+        identity_url = entry[2] if len(entry) > 2 and entry[2] else url
         clean = clean_config_url(url or "")
-        h = _config_identity_hash(clean)
+        identity_clean = clean_config_url(identity_url or "")
+        h = _config_identity_hash(identity_clean)
         cfg_rows.append((profile_id, h, now, source or ""))
         uid, host = extract_uuid_and_address(clean)
         if not uid and not host:
@@ -3865,20 +3904,75 @@ async def _scrape_single_page_with_messages(url, channel, client=None):
             await cl.aclose()
 
 # ======================================================================
-# ارسال (بدون تغییر)
+# ثبت پیام‌های واقعی کانال + حذف جدیدترین پست‌های هر پروفایل
 # ======================================================================
-async def send_with_retry(bot, chat_id, text, parse_mode="HTML", reply_markup=None, disable_web_page_preview=True, max_retries=3):
+def record_channel_post(profile_id, message):
+    try:
+        chat = getattr(message, "chat", None)
+        chat_id = getattr(chat, "id", None)
+        message_id = getattr(message, "message_id", None)
+        if chat_id is None or message_id is None:
+            return
+        c.execute("INSERT OR IGNORE INTO channel_posts(profile_id,chat_id,message_id,sent_at) VALUES (?,?,?,?)",
+                  (int(profile_id), int(chat_id), int(message_id), get_tehran_time()))
+        conn.commit()
+    except Exception:
+        log.exception("[CHANNEL-POSTS] record failed")
+
+async def delete_latest_channel_posts(bot, profile_id, count):
+    count = max(1, min(int(count), 5000))
+    rows = c.execute(
+        "SELECT chat_id,message_id FROM channel_posts WHERE profile_id=? ORDER BY message_id DESC LIMIT ?",
+        (int(profile_id), count)
+    ).fetchall()
+    if not rows:
+        return 0, 0
+    deleted = failed = 0
+    for idx, (chat_id, message_id) in enumerate(rows, 1):
+        try:
+            await bot.delete_message(chat_id=int(chat_id), message_id=int(message_id))
+            deleted += 1
+            c.execute("DELETE FROM channel_posts WHERE chat_id=? AND message_id=?", (int(chat_id), int(message_id)))
+        except RetryAfter as exc:
+            await asyncio.sleep(float(exc.retry_after) + 0.5)
+            try:
+                await bot.delete_message(chat_id=int(chat_id), message_id=int(message_id))
+                deleted += 1
+                c.execute("DELETE FROM channel_posts WHERE chat_id=? AND message_id=?", (int(chat_id), int(message_id)))
+            except Exception as retry_exc:
+                failed += 1
+                log.warning("[CHANNEL-DELETE] retry failed profile=%s message=%s: %s", profile_id, message_id, retry_exc)
+        except BadRequest as exc:
+            text = str(exc).lower()
+            if "message to delete not found" in text or "message can't be deleted" in text or "message not found" in text:
+                c.execute("DELETE FROM channel_posts WHERE chat_id=? AND message_id=?", (int(chat_id), int(message_id)))
+            else:
+                failed += 1
+                log.warning("[CHANNEL-DELETE] profile=%s message=%s failed: %s", profile_id, message_id, exc)
+        except Exception as exc:
+            failed += 1
+            log.warning("[CHANNEL-DELETE] profile=%s message=%s failed: %s", profile_id, message_id, exc)
+        if idx % 20 == 0:
+            conn.commit()
+            await asyncio.sleep(0.15)
+    conn.commit()
+    return deleted, failed
+
+# ======================================================================
+# ارسال (حالت‌های عادی دست‌نخورده)
+# ======================================================================
+async def send_with_retry(bot, chat_id, text, parse_mode="HTML", reply_markup=None, disable_web_page_preview=True, max_retries=3, return_message=False):
     retry_count = 0
     while retry_count < max_retries:
         try:
-            await bot.send_message(
+            message = await bot.send_message(
                 chat_id=chat_id,
                 text=text,
                 parse_mode=parse_mode,
                 reply_markup=reply_markup,
                 disable_web_page_preview=disable_web_page_preview
             )
-            return True
+            return message if return_message else True
         except RetryAfter as e:
             wait = e.retry_after + 1
             log.warning(f"Flood control, waiting {wait} seconds...")
@@ -3891,13 +3985,13 @@ async def send_with_retry(bot, chat_id, text, parse_mode="HTML", reply_markup=No
         except BadRequest as e:
             if "can't parse entities" in str(e):
                 try:
-                    await bot.send_message(
+                    message = await bot.send_message(
                         chat_id=chat_id,
                         text=re.sub(r'<[^>]+>', '', text)[:4096],
                         reply_markup=reply_markup,
                         disable_web_page_preview=disable_web_page_preview
                     )
-                    return True
+                    return message if return_message else True
                 except Exception:
                     pass
             log.error(f"BadRequest: {e}")
@@ -3921,23 +4015,30 @@ async def send_to_destination(bot, profile_id, text, buttons=None):
         # Telegram proxy URLs must remain raw. Do not wrap them in inline buttons or
         # HTML anchors; otherwise Telegram may open the bot/admin callback instead.
         contains_tg_proxy = "t.me/proxy?" in chunk.lower() or "tg://proxy?" in chunk.lower()
-        reply_markup = None if contains_tg_proxy else (InlineKeyboardMarkup(buttons) if buttons and idx == 0 else None)
-        ok = await send_with_retry(
+        # Same sponsor/channel buttons on every chunk, including Quote mode.
+        reply_markup = None if contains_tg_proxy else (InlineKeyboardMarkup(buttons) if buttons else None)
+        sent_message = await send_with_retry(
             bot, dest, chunk,
             parse_mode="HTML",
             reply_markup=reply_markup,
-            disable_web_page_preview=True
+            disable_web_page_preview=True,
+            return_message=True
         )
-        if not ok:
+        if sent_message:
+            record_channel_post(profile_id, sent_message)
+        else:
             plain = re.sub(r'<[^>]+>', '', chunk)
-            ok2 = await send_with_retry(
+            sent_message = await send_with_retry(
                 bot, dest, plain[:4096],
                 parse_mode=None,
-                reply_markup=reply_markup if idx == 0 else None,
-                disable_web_page_preview=True
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+                return_message=True
             )
-            if not ok2:
-                success = False
+            if sent_message:
+                record_channel_post(profile_id, sent_message)
+        if not sent_message:
+            success = False
         if idx < len(chunks) - 1:
             await asyncio.sleep(0.5)
     return success
@@ -3981,7 +4082,13 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
 
     blacklist_words = get_blacklist(profile_id)
     filtered_working = []
+    local_seen = set()
     for url, ping, cnt in working:
+        identity_hash = _config_identity_hash(url)
+        if identity_hash in local_seen or is_already_posted(profile_id, url):
+            log.info(f"⏭️ Duplicate config skipped before send: {str(url)[:70]}...")
+            continue
+        local_seen.add(identity_hash)
         if blacklist_words and is_word_blacklisted(profile_id, url):
             log.info(f"⛔ Blacklisted config skipped: {url[:50]}...")
             continue
@@ -4052,7 +4159,7 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
         if (url or '').strip().lower().startswith(("https://t.me/proxy?", "tg://proxy?")):
             header = "<b>MTPROTO</b>"
             config_blocks.append(header + "\n<pre>" + (url or '').strip() + "</pre>")
-            posted_entries.append(((url or '').strip(), source_for_seen))
+            posted_entries.append(((url or '').strip(), source_for_seen, (url or '').strip()))
             continue
 
         flag, country_code = config_meta.get(url, ("🌐", ""))
@@ -4135,13 +4242,16 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
         else:
             block = f"<pre>{modified_url}</pre>"
             config_blocks.append((header + "\n" if header else "") + block)
-        posted_entries.append((modified_url, source_for_seen))
+        posted_entries.append((modified_url, source_for_seen, url))
 
     if config_mode == 1:
-        configs_text = "<blockquote expandable>\n" + "\n".join(
-            f"<code>{line}</code>" for line in config_blocks
-        ) + "\n</blockquote>"
+        # Quote mode ONLY: one expandable quote + one code block for ALL configs.
+        # This makes the whole group one copyable payload and removes blank lines
+        # before/after the first/last config inside the quote.
+        quote_payload = "\n".join(config_blocks)
+        configs_text = f"<blockquote expandable><code>{quote_payload}</code></blockquote>"
     else:
+        # Normal mode is intentionally unchanged.
         configs_text = "\n\n".join(config_blocks)
     try:
         full_text = banner_template.format(configs=configs_text)
@@ -4162,6 +4272,7 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
     reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
 
     html_messages = [full_text]
+    message_entry_batches = [list(posted_entries)]
     if config_mode == 1 and len(full_text) > 4096:
         marker = "__CONFIGS__"
         try:
@@ -4172,52 +4283,66 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
         if not sep:
             before, after = "", ""
         html_messages = []
+        message_entry_batches = []
         batch = []
-        for line in config_blocks:
+        entry_batch = []
+        for line, entry in zip(config_blocks, posted_entries):
             candidate = batch + [line]
-            quote_block = "<blockquote expandable>\n" + "\n".join(f"<code>{x}</code>" for x in candidate) + "\n</blockquote>"
+            quote_block = "<blockquote expandable><code>" + "\n".join(candidate) + "</code></blockquote>"
             if batch and len(before + quote_block + after) > 4096:
-                quote_block = "<blockquote expandable>\n" + "\n".join(f"<code>{x}</code>" for x in batch) + "\n</blockquote>"
+                quote_block = "<blockquote expandable><code>" + "\n".join(batch) + "</code></blockquote>"
                 html_messages.append(before + quote_block + after)
+                message_entry_batches.append(list(entry_batch))
                 batch = [line]
+                entry_batch = [entry]
             else:
                 batch = candidate
+                entry_batch.append(entry)
         if batch:
-            quote_block = "<blockquote expandable>\n" + "\n".join(f"<code>{x}</code>" for x in batch) + "\n</blockquote>"
+            quote_block = "<blockquote expandable><code>" + "\n".join(batch) + "</code></blockquote>"
             html_messages.append(before + quote_block + after)
+            message_entry_batches.append(list(entry_batch))
 
     ok = True
+    sent_count = 0
     for idx, message_text in enumerate(html_messages):
-        sent = await send_with_retry(
+        sent_message = await send_with_retry(
             bot, dest, message_text,
             parse_mode="HTML",
-            reply_markup=reply_markup if idx == 0 else None,
+            reply_markup=reply_markup,
             disable_web_page_preview=True,
-            max_retries=3
+            max_retries=3,
+            return_message=True
         )
-        if not sent:
+        if not sent_message:
             plain_text = re.sub(r'<[^>]+>', '', message_text)
-            sent = await send_with_retry(
+            sent_message = await send_with_retry(
                 bot, dest, plain_text[:4096],
                 parse_mode=None,
-                reply_markup=reply_markup if idx == 0 else None,
+                reply_markup=reply_markup,
                 disable_web_page_preview=True,
-                max_retries=2
+                max_retries=2,
+                return_message=True
             )
-        if not sent:
+        if not sent_message:
             ok = False
             break
+        record_channel_post(profile_id, sent_message)
+        # Record ONLY the configs contained in this Telegram message, and only
+        # after Telegram confirmed that message was sent. If a later chunk fails,
+        # earlier successful chunks remain permanently deduplicated.
+        batch_entries = message_entry_batches[idx] if idx < len(message_entry_batches) else []
+        if batch_entries:
+            mark_configs_posted_batch(profile_id, batch_entries)
+            sent_count += len(batch_entries)
         if idx < len(html_messages) - 1:
             await asyncio.sleep(0.25)
 
     if not ok:
-        log.error(f"❌ Failed to send configs after all retries")
-        return 0
-
-    # Ledger is updated ONLY after every Telegram message in this batch has
-    # succeeded. Only entries that were actually rendered are recorded.
-    sent_count = len(posted_entries)
-    mark_configs_posted_batch(profile_id, posted_entries)
+        log.error(f"❌ Config send stopped after partial success: sent={sent_count}")
+        if sent_count > 0:
+            set_profile_last_num(profile_id, last_n + sent_count)
+        return sent_count
 
     if sent_count > 0:
         set_profile_last_num(profile_id, last_n + sent_count)
@@ -4241,6 +4366,7 @@ async def post_proxies(bot, profile_id, proxies_with_ping, is_instant=False, max
     country_display = get_profile_country_display(profile_id)
     selected = []
     entries = []
+    local_proxy_keys = set()
     for item in proxies_with_ping:
         try:
             raw = item[0]
@@ -4251,6 +4377,10 @@ async def post_proxies(bot, profile_id, proxies_with_ping, is_instant=False, max
         norm = canonical_telegram_proxy_url(raw)
         if not norm or is_proxy_posted(profile_id, norm):
             continue
+        proxy_identity_hash = _proxy_identity_hash(norm)
+        if any(proxy_identity_hash == existing for existing in local_proxy_keys):
+            continue
+        local_proxy_keys.add(proxy_identity_hash)
         if len(entries) >= max_proxies:
             break
         channel = get_profile_channel_link(profile_id)
@@ -4347,7 +4477,7 @@ def get_best_sponsor(profile_id, apply_type="both"):
 # ======================================================================
 # چرخه اصلی (با بهبود پروکسی و تست)
 # ======================================================================
-async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_proxies=True, is_instant=False):
+async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, enable_proxies=True, is_instant=False):
     log.info("=" * 50)
     log.info(f"🔄 run_cycle for profile {profile_id} (cfg={enable_configs}, prx={enable_proxies}, instant={is_instant})")
 
@@ -4653,6 +4783,24 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
     log.info(f"✅ Cycle result for profile {profile_id}: {result_msg}")
     log.info("=" * 50)
     return total_configs + total_proxies, result_msg
+
+# One cycle at a time per profile. Automatic and manual triggers share this
+# lock, so two callers can never publish the same candidate concurrently.
+_PROFILE_CYCLE_LOCKS = {}
+
+async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_proxies=True, is_instant=False):
+    pid = int(profile_id)
+    lock = _PROFILE_CYCLE_LOCKS.get(pid)
+    if lock is None:
+        lock = asyncio.Lock()
+        _PROFILE_CYCLE_LOCKS[pid] = lock
+    if lock.locked():
+        log.warning("⏭️ [profile=%s] cycle already running; duplicate trigger skipped", pid)
+        return 0, "cycle already running"
+    async with lock:
+        return await _run_cycle_for_profile_unlocked(
+            bot, pid, enable_configs=enable_configs, enable_proxies=enable_proxies, is_instant=is_instant
+        )
 
 # ======================================================================
 # حلقه‌های خودکار (با مدیریت بهتر)
@@ -5560,6 +5708,16 @@ def protocol_toggle_kb(profile_id, kind):
     rows.append([InlineKeyboardButton("↩️ بازگشت", callback_data=f"proto_menu_{profile_id}", style="primary")])
     return InlineKeyboardMarkup(rows)
 
+def channel_delete_kb(profile_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑 حذف ۱۰۰ پست آخر", callback_data=f"delposts_{profile_id}_100", style="danger")],
+        [InlineKeyboardButton("🗑 حذف ۵۰۰ پست آخر", callback_data=f"delposts_{profile_id}_500", style="danger")],
+        [InlineKeyboardButton("🗑 حذف ۱۰۰۰ پست آخر", callback_data=f"delposts_{profile_id}_1000", style="danger")],
+        [InlineKeyboardButton("🔢 تعداد دلخواه", callback_data=f"delposts_custom_{profile_id}", style="primary")],
+        [InlineKeyboardButton("↩️ بازگشت", callback_data=f"prof_{profile_id}", style="primary")],
+    ])
+
+
 def profile_admin_kb(profile_id):
     prof = get_profile(profile_id)
     if not prof:
@@ -5647,6 +5805,7 @@ def profile_admin_kb(profile_id):
          InlineKeyboardButton(msg("btn_instant"), callback_data=f"instant_{profile_id}", style="primary")],
         [InlineKeyboardButton(msg("btn_manual_send"), callback_data=f"manual_{profile_id}", style="primary"),
          InlineKeyboardButton("📋 صف ارسال دستی", callback_data=f"mq_list_{profile_id}", style="primary")],
+        [InlineKeyboardButton("🗑 حذف پست‌های کانال", callback_data=f"delposts_menu_{profile_id}", style="danger")],
         [InlineKeyboardButton(msg("btn_blacklist"), callback_data=f"bl_list_{profile_id}", style="danger")],
         [InlineKeyboardButton(msg("btn_set_schedule_cron"), callback_data=f"setcron_{profile_id}", style="primary"),
          InlineKeyboardButton(msg("btn_backup"), callback_data=f"backup_{profile_id}", style="success")],
@@ -6281,6 +6440,29 @@ def clear_pending_input_state(ctx):
         ctx.user_data.pop(key, None)
 
 
+async def _run_channel_delete_job(bot, q, profile_id, count):
+    try:
+        deleted, failed = await delete_latest_channel_posts(bot, profile_id, count)
+        result = f"⚠️ {deleted} پست حذف شد؛ {failed} مورد حذف نشد." if failed else f"✅ {deleted} پست آخر حذف شد."
+        await q.message.reply_text(result + "\nترتیب: از جدیدترین پست‌ها به سمت قدیمی‌تر.", reply_markup=channel_delete_kb(profile_id))
+    except Exception as exc:
+        log.exception("[CHANNEL-DELETE] background job failed")
+        try:
+            await q.message.reply_text(f"❌ خطا در حذف پست‌ها: {str(exc)[:200]}", reply_markup=channel_delete_kb(profile_id))
+        except Exception:
+            pass
+
+
+async def _run_channel_delete_job_from_message(u, profile_id, count):
+    try:
+        deleted, failed = await delete_latest_channel_posts(u.get_bot(), profile_id, count)
+        result = f"⚠️ {deleted} پست حذف شد؛ {failed} مورد حذف نشد." if failed else f"✅ {deleted} پست آخر حذف شد."
+        await u.message.reply_text(result + "\nترتیب: از جدیدترین پست‌ها به سمت قدیمی‌تر.", reply_markup=channel_delete_kb(profile_id))
+    except Exception as exc:
+        log.exception("[CHANNEL-DELETE] custom job failed")
+        await u.message.reply_text(f"❌ خطا در حذف پست‌ها: {str(exc)[:200]}")
+
+
 async def _on_callback_impl(u, ctx):
     q = u.callback_query
     try:
@@ -6304,7 +6486,7 @@ async def _on_callback_impl(u, ctx):
         navigation_prefixes = (
             "back_", "prof_", "profiles_list", "general_settings", "manage_admins",
             "list_admins", "sponsor_list_", "sp_detail_", "sp_delete_",
-            "src_list_", "dl_", "bl_list_", "backup_", "ast_", "home_"
+            "src_list_", "dl_", "bl_list_", "backup_", "ast_", "home_", "delposts_"
         )
         if ("cancel" in d.lower() or "back" in d.lower() or d in ("back_home", "profiles_list", "general_settings", "manage_admins", "list_admins")
                 or any(d.startswith(p) for p in navigation_prefixes)):
@@ -6601,6 +6783,53 @@ async def _on_callback_impl(u, ctx):
             else:
                 await q.answer("⚠️ خطا در داده")
             return
+
+        # ===================== PER-PROFILE CHANNEL POST DELETE =====================
+        if d.startswith("delposts_menu_"):
+            try:
+                profile_id = int(d.rsplit("_", 1)[1])
+            except Exception:
+                await q.answer("⚠️ شناسه نامعتبر", show_alert=True); return
+            if not get_profile(profile_id):
+                await q.answer("⚠️ پروفایل یافت نشد", show_alert=True); return
+            await q.edit_message_text(
+                "🗑 <b>حذف پست‌های کانال</b>\n\n"
+                "حذف از <b>جدیدترین پست‌ها</b> شروع می‌شود.\n"
+                "این ابزار پیام‌هایی را حذف می‌کند که همین بات برای این پروفایل ارسال و ثبت کرده است.",
+                parse_mode="HTML", reply_markup=channel_delete_kb(profile_id)
+            )
+            return
+
+        if d.startswith("delposts_custom_"):
+            try:
+                profile_id = int(d.rsplit("_", 1)[1])
+            except Exception:
+                await q.answer("⚠️ شناسه نامعتبر", show_alert=True); return
+            if not get_profile(profile_id):
+                await q.answer("⚠️ پروفایل یافت نشد", show_alert=True); return
+            ctx.user_data["action"] = f"delete_channel_posts_{profile_id}"
+            await q.edit_message_text(
+                "🔢 تعداد پست را وارد کن.\n\nمثال: <code>250</code>\n"
+                "حداکثر 5000؛ حذف دقیقاً از جدیدترین پست‌های ثبت‌شده شروع می‌شود.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ لغو", callback_data=f"delposts_menu_{profile_id}", style="primary")]])
+            )
+            return
+
+        if d.startswith("delposts_"):
+            parts = d.split("_")
+            if len(parts) == 3:
+                try:
+                    profile_id = int(parts[1]); count = int(parts[2])
+                except ValueError:
+                    await q.answer("⚠️ مقدار نامعتبر", show_alert=True); return
+                if count not in (100, 500, 1000):
+                    await q.answer("⚠️ مقدار نامعتبر", show_alert=True); return
+                if not get_profile(profile_id):
+                    await q.answer("⚠️ پروفایل یافت نشد", show_alert=True); return
+                await q.answer(f"⏳ حذف {count} پست آخر شروع شد…")
+                asyncio.create_task(_run_channel_delete_job(u.get_bot(), q, profile_id, count), name=f"delete_posts_{profile_id}_{count}")
+                return
 
         if d.startswith("sp_delete_"):
             parts = d.split("_")
@@ -8746,6 +8975,20 @@ async def _on_text_impl(u, ctx):
 
     t = u.message.text.strip()
 
+    if a.startswith("delete_channel_posts_"):
+        try:
+            profile_id = int(a.rsplit("_", 1)[1])
+            count = int(t)
+            if not (1 <= count <= 5000):
+                raise ValueError
+        except ValueError:
+            await u.message.reply_text("❌ تعداد باید بین 1 تا 5000 باشد.")
+            return
+        ctx.user_data.pop("action", None)
+        await u.message.reply_text(f"⏳ حذف {count} پست آخر از جدیدترین‌ها شروع شد…")
+        asyncio.create_task(_run_channel_delete_job_from_message(u, profile_id, count), name=f"delete_posts_custom_{profile_id}")
+        return
+
     if a.startswith("setbackupinterval_"):
         profile_id = int(a.split("_")[1])
         try:
@@ -9329,6 +9572,16 @@ def automatic_database_cleanup():
         except sqlite3.Error:
             deleted["processed_messages"] = 0
         try:
+            cur.execute("""DELETE FROM channel_posts WHERE rowid IN (
+                SELECT rowid FROM (
+                    SELECT rowid, ROW_NUMBER() OVER (PARTITION BY profile_id ORDER BY message_id DESC) AS rn
+                    FROM channel_posts
+                ) WHERE rn > 5000
+            )""")
+            deleted["channel_posts"] = max(0, cur.rowcount)
+        except sqlite3.Error:
+            deleted["channel_posts"] = 0
+        try:
             cur.execute("DELETE FROM country_cache")
             deleted["country_cache"] = max(0, cur.rowcount)
         except sqlite3.Error:
@@ -9385,12 +9638,15 @@ async def database_compact_worker():
         log.exception("[DB COMPACT] worker failed")
 
 async def database_cleanup_worker():
-    log.info('[DB CLEANER] worker started | retention=24h')
+    log.info('[DB CLEANER] worker started | retention=24h | compact-after-cleanup')
     # Never compete with startup/callback initialization.
     await asyncio.sleep(10)
     while True:
         try:
+            # Delete disposable rows first, then physically reclaim the space.
+            # Both operations run in a worker thread, never on the Telegram event loop.
             await asyncio.to_thread(automatic_database_cleanup)
+            await asyncio.to_thread(compact_database_once)
         except Exception:
             log.exception('[DB CLEANER] worker error')
         await asyncio.sleep(DB_CLEAN_INTERVAL)
@@ -9510,7 +9766,6 @@ async def post_init(app):
         log.info("⏰ Precise automatic scheduler started: config/proxy are fully independent")
 
     start_worker(app, "cleanup", lambda: periodic_cleanup())
-    start_worker(app, "database_compactor", lambda: database_compact_worker())
     start_worker(app, "database_cleaner", lambda: database_cleanup_worker())
     start_worker(app, "watchdog", lambda: worker_watchdog())
     log.info("🧹 Periodic cleanup task started")
