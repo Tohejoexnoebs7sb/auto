@@ -1,9 +1,9 @@
-# bot.py — 4.1.3
-APP_VERSION = "4.1.3"
+# bot.py — 4.1.4
+APP_VERSION = "4.1.5"
 APP_VERSION_MAJOR = 4
 APP_VERSION_MINOR = 1
-APP_VERSION_PATCH = 3
-APP_VERSION_LABEL = "4.1.3-stable"
+APP_VERSION_PATCH = 5
+APP_VERSION_LABEL = "4.1.5-stable"
 BOT_VERSION = APP_VERSION
 import os
 import re
@@ -371,6 +371,13 @@ def prepare_replaced_database():
     ensure_column("profiles", "config_header_enabled", "INTEGER DEFAULT 1", 1)
     ensure_column("profiles", "config_header_template", "TEXT DEFAULT '[Protocol] [Flag] [Country]'", "[Protocol] [Flag] [Country]")
     ensure_column("profiles", "low_cost_mode", "INTEGER DEFAULT 1", 1)
+# Optional smart batch posting. MUST default to OFF for every new/existing profile.
+ensure_column("profiles", "batch_posting", "INTEGER DEFAULT 0", 0)
+try:
+    c.execute("UPDATE profiles SET batch_posting=0 WHERE batch_posting IS NULL")
+    conn.commit()
+except Exception:
+    pass
     conn.commit()
 
 async def replace_database_from_file(update, source_path, original_name="database"):
@@ -709,6 +716,11 @@ c.execute("""CREATE TABLE IF NOT EXISTS channel_posts (
     UNIQUE(chat_id, message_id))""")
 c.execute("CREATE INDEX IF NOT EXISTS idx_channel_posts_profile_latest ON channel_posts(profile_id, message_id DESC)")
 c.execute("CREATE INDEX IF NOT EXISTS idx_channel_posts_chat_latest ON channel_posts(chat_id, message_id DESC)")
+ensure_column("channel_posts", "deleted_at", "TEXT", None)
+try:
+    c.execute("CREATE INDEX IF NOT EXISTS idx_channel_posts_active_latest ON channel_posts(profile_id, deleted_at, message_id DESC)")
+except sqlite3.Error:
+    pass
 conn.commit()
 
 # Performance indexes and lightweight maintenance for long-running Railway workers.
@@ -723,7 +735,7 @@ for _idx in [
         log.exception("index creation failed")
 conn.commit()
 
-# High-value indexes: keep duplicate checks and 24h cleanup O(log n).
+# High-value indexes: keep duplicate checks and 7-day cleanup O(log n).
 for _idx in [
     "CREATE INDEX IF NOT EXISTS idx_seen_profile_uuid_address ON seen(profile_id, uuid, address)",
     "CREATE INDEX IF NOT EXISTS idx_seen_profile_last_posted ON seen(profile_id, last_posted)",
@@ -1402,11 +1414,11 @@ async def _send_manual_queue_batch(bot, job):
     return len(selected)
 
 
-DB_RETENTION_HOURS = 24
+DB_RETENTION_HOURS = 24 * 7
 
 def cleanup_expired_runtime_data():
-    """Remove disposable runtime history after 24h; profiles/settings and permanent dedup ledgers stay forever."""
-    cutoff = (datetime.now() - timedelta(hours=DB_RETENTION_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+    """Remove disposable runtime history after 7 days; profiles/settings and permanent dedup ledgers stay forever."""
+    cutoff = (datetime.now(TEHRAN_TZ) - timedelta(hours=DB_RETENTION_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
     deleted = {}
     for table, where in (("posts", "created_at < ?"), ("processed_messages", "updated_at < ?"), ("manual_send_queue", "status IN (\'done\',\'cancelled\',\'failed\') AND updated_at < ?")):
         try:
@@ -1603,7 +1615,7 @@ def update_profile(profile_id, **kwargs):
                "schedule_cron", "last_backup_count", "timer_expiry", "timer_duration",
                "backup_interval", "interval_config", "interval_proxy", "max_post_config", "max_post_proxy",
                "naming_template", "channel_link", "ping_enabled", "profile_enabled",
-               "country_display", "show_ping", "proxy_banner_template", "proxy_post_mode", "config_post_mode", "ping_testing", "config_header_enabled", "config_header_template", "low_cost_mode"]
+               "country_display", "show_ping", "proxy_banner_template", "proxy_post_mode", "config_post_mode", "ping_testing", "config_header_enabled", "config_header_template", "low_cost_mode", "batch_posting"]
     for key, value in kwargs.items():
         if key in allowed:
             c.execute(f"UPDATE profiles SET {key}=? WHERE id=?", (value, profile_id))
@@ -1902,6 +1914,15 @@ def get_profile_low_cost_mode(profile_id):
 
 def set_profile_low_cost_mode(profile_id, enabled):
     update_profile(profile_id, low_cost_mode=int(bool(enabled)))
+
+# Smart batch mode: independently stored per profile and OFF by default.
+def get_profile_batch_posting(profile_id):
+    prof = get_profile(profile_id)
+    return bool(prof.get("batch_posting", 0)) if prof else False
+
+def set_profile_batch_posting(profile_id, enabled):
+    update_profile(profile_id, batch_posting=int(bool(enabled)))
+    return bool(enabled)
 
 def render_naming_template(template, *, protocol, flag, country_code, channel_link, count):
     """Render {TOKEN} and [TOKEN] placeholders."""
@@ -3218,8 +3239,8 @@ def extract_uuid_and_address(url):
     except Exception:
         return "", ""
 
-def canonical_config_identity(url):
-    """Identity includes UUID/credentials, host, port, path and transport settings; display fragment is ignored."""
+def _legacy_canonical_config_identity(url):
+    """Compatibility identity used only for hashes created by <=4.1.3."""
     try:
         url = clean_config_url(url or "").strip()
         p = urlparse(url)
@@ -3240,6 +3261,77 @@ def canonical_config_identity(url):
     except Exception:
         return clean_config_url(url or "").split("#", 1)[0].strip()
 
+def _q_first(q, *names):
+    for name in names:
+        for key in (name, name.lower(), name.upper()):
+            if key in q:
+                vals = q.get(key) or [""]
+                return str(vals[0] or "").strip()
+    return ""
+
+def canonical_config_identity(url):
+    """Strict connection identity.
+
+    Display-only fragment and the bot's Telegram tagging query are ignored.
+    The identity contains protocol, credential/UUID, ADDRESS, PORT, NETWORK and
+    the remaining connection parameters. Therefore two links with the same real
+    connection details are duplicates even if their Telegram/name tag differs.
+    """
+    try:
+        u = clean_config_url(url or "").strip()
+        p = urlparse(u)
+        scheme = p.scheme.lower()
+        if scheme == "vmess":
+            raw = unquote(p.netloc + p.path)
+            raw += "=" * (-len(raw) % 4)
+            try:
+                obj = json.loads(base64.b64decode(raw).decode("utf-8", errors="ignore"))
+                # ps/name is display-only. Keep all transport/auth fields that
+                # can affect the actual connection.
+                ignored = {"ps", "name", "remarks", "remark"}
+                fields = {}
+                for k, v in obj.items():
+                    lk = str(k).strip().lower()
+                    if lk in ignored:
+                        continue
+                    if v is None:
+                        v = ""
+                    fields[lk] = str(v).strip()
+                fields["protocol"] = "vmess"
+                fields["address"] = str(obj.get("add", "") or "").strip().lower()
+                fields["port"] = str(obj.get("port", "") or "").strip()
+                fields["uuid"] = str(obj.get("id", obj.get("uuid", "")) or "").strip().lower()
+                fields["network"] = str(obj.get("net", obj.get("type", "")) or "").strip().lower()
+                return json.dumps(fields, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            except Exception:
+                # Fall through to a normalized URI identity; still ignore fragment.
+                pass
+        q = parse_qs(p.query, keep_blank_values=True)
+        # Telegram channel/tag parameters are display metadata, not connection identity.
+        ignored_query = {"telegram", "name", "remark", "remarks"}
+        clean_q = []
+        for k, vals in q.items():
+            if str(k).strip().lower() in ignored_query:
+                continue
+            for v in vals:
+                clean_q.append((str(k).strip().lower(), str(v).strip()))
+        clean_q.sort()
+        fields = {
+            "protocol": scheme,
+            "uuid": unquote(str(p.username or "")).strip().lower(),
+            "password": unquote(str(p.password or "")).strip(),
+            "address": str(p.hostname or "").strip().lower(),
+            "port": str(p.port or "").strip(),
+            "network": _q_first(q, "type", "net").lower(),
+            "query": clean_q,
+        }
+        # For SOCKS/SS, credentials are part of the connection and already live
+        # in username/password. For every protocol, the normalized query carries
+        # path/host/security/reality/etc. exactly as configured.
+        return json.dumps(fields, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    except Exception:
+        return clean_config_url(url or "").split("#", 1)[0].strip().lower()
+
 # Hot-path deduplication cache. The posting workers never query SQLite for each
 # candidate; permanent identity hashes are loaded once and checked in O(1).
 _SEEN_CONFIG_KEYS = set()
@@ -3248,6 +3340,9 @@ _DEDUP_CACHE_READY = False
 
 def _config_identity_hash(url):
     return hashlib.sha256(canonical_config_identity(url).encode("utf-8", errors="ignore")).hexdigest()
+
+def _legacy_config_identity_hash(url):
+    return hashlib.sha256(_legacy_canonical_config_identity(url).encode("utf-8", errors="ignore")).hexdigest()
 
 def _proxy_identity_hash(url):
     return hashlib.sha256(canonical_proxy_identity(url).encode("utf-8", errors="ignore")).hexdigest()
@@ -3295,10 +3390,16 @@ def load_dedup_cache():
 
 def is_already_posted(profile_id, url):
     try:
-        key = (int(profile_id), _config_identity_hash(url))
+        pid = int(profile_id)
+        new_hash = _config_identity_hash(url)
+        legacy_hash = _legacy_config_identity_hash(url)
         if _DEDUP_CACHE_READY:
-            return key in _SEEN_CONFIG_KEYS
-        return c.execute("SELECT 1 FROM posted_config_keys WHERE profile_id=? AND identity_hash=? LIMIT 1", key).fetchone() is not None
+            return ((pid, new_hash) in _SEEN_CONFIG_KEYS or
+                    (pid, legacy_hash) in _SEEN_CONFIG_KEYS)
+        return c.execute(
+            "SELECT 1 FROM posted_config_keys WHERE profile_id=? AND identity_hash IN (?,?) LIMIT 1",
+            (pid, new_hash, legacy_hash)
+        ).fetchone() is not None
     except sqlite3.Error as exc:
         log.warning("config duplicate check failed: %s", exc)
         return False
@@ -3913,7 +4014,7 @@ def record_channel_post(profile_id, message):
         message_id = getattr(message, "message_id", None)
         if chat_id is None or message_id is None:
             return
-        c.execute("INSERT OR IGNORE INTO channel_posts(profile_id,chat_id,message_id,sent_at) VALUES (?,?,?,?)",
+        c.execute("INSERT OR IGNORE INTO channel_posts(profile_id,chat_id,message_id,sent_at,deleted_at) VALUES (?,?,?,?,NULL)",
                   (int(profile_id), int(chat_id), int(message_id), get_tehran_time()))
         conn.commit()
     except Exception:
@@ -3922,7 +4023,7 @@ def record_channel_post(profile_id, message):
 async def delete_latest_channel_posts(bot, profile_id, count):
     count = max(1, min(int(count), 5000))
     rows = c.execute(
-        "SELECT chat_id,message_id FROM channel_posts WHERE profile_id=? ORDER BY message_id DESC LIMIT ?",
+        "SELECT chat_id,message_id FROM channel_posts WHERE profile_id=? AND deleted_at IS NULL ORDER BY message_id DESC LIMIT ?",
         (int(profile_id), count)
     ).fetchall()
     if not rows:
@@ -3932,20 +4033,20 @@ async def delete_latest_channel_posts(bot, profile_id, count):
         try:
             await bot.delete_message(chat_id=int(chat_id), message_id=int(message_id))
             deleted += 1
-            c.execute("DELETE FROM channel_posts WHERE chat_id=? AND message_id=?", (int(chat_id), int(message_id)))
+            c.execute("UPDATE channel_posts SET deleted_at=? WHERE chat_id=? AND message_id=?", (get_tehran_time(), int(chat_id), int(message_id)))
         except RetryAfter as exc:
             await asyncio.sleep(float(exc.retry_after) + 0.5)
             try:
                 await bot.delete_message(chat_id=int(chat_id), message_id=int(message_id))
                 deleted += 1
-                c.execute("DELETE FROM channel_posts WHERE chat_id=? AND message_id=?", (int(chat_id), int(message_id)))
+                c.execute("UPDATE channel_posts SET deleted_at=? WHERE chat_id=? AND message_id=?", (get_tehran_time(), int(chat_id), int(message_id)))
             except Exception as retry_exc:
                 failed += 1
                 log.warning("[CHANNEL-DELETE] retry failed profile=%s message=%s: %s", profile_id, message_id, retry_exc)
         except BadRequest as exc:
             text = str(exc).lower()
             if "message to delete not found" in text or "message can't be deleted" in text or "message not found" in text:
-                c.execute("DELETE FROM channel_posts WHERE chat_id=? AND message_id=?", (int(chat_id), int(message_id)))
+                c.execute("UPDATE channel_posts SET deleted_at=? WHERE chat_id=? AND message_id=?", (get_tehran_time(), int(chat_id), int(message_id)))
             else:
                 failed += 1
                 log.warning("[CHANNEL-DELETE] profile=%s message=%s failed: %s", profile_id, message_id, exc)
@@ -4538,27 +4639,33 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
 
     # Low-cost mode reduces Railway network/CPU usage.
     low_cost_mode=get_profile_low_cost_mode(profile_id)
+    batch_posting = get_profile_batch_posting(profile_id)
+    log.info(f"📦 [profile={profile_id}] smart_batch={batch_posting} (default OFF)")
     # Responsive incremental scan. A cycle must never walk hundreds of historical
     # Telegram pages. Four pages per source are enough for normal interval runs;
     # an unfinished backlog remains behind the stream cursor and is picked up by
     # the next cycle. This keeps manual/automatic execution bounded and stable.
     scrape_pages = 1
     config_test_limit = None
-    # Scrape all sources in parallel
+    # Scrape concurrently, but with a hard per-cycle limit. Launching 100+
+    # HTTP requests at the same millisecond (as seen in the log) can saturate
+    # Railway/network sockets and make the whole bot look frozen.
+    scrape_sem = asyncio.Semaphore(32 if low_cost_mode else 48)
     async def scrape_one(src):
-        last_exc = None
-        for attempt in range(1, 3):
-            try:
-                config_links, proxy_links, newest_id = await scrape_channel_paginated(
-                    profile_id, src, max_pages=scrape_pages, stream=stream
-                )
-                return src, config_links, proxy_links, newest_id
-            except Exception as exc:
-                last_exc = exc
-                log.warning(f"⚠️ [profile={profile_id}] source={src} scrape attempt {attempt}/3 failed: {exc}")
-                if attempt < 2:
-                    await asyncio.sleep(1)
-        raise RuntimeError(f"source {src} failed after 3 attempts: {last_exc}")
+        async with scrape_sem:
+            last_exc = None
+            for attempt in range(1, 3):
+                try:
+                    config_links, proxy_links, newest_id = await scrape_channel_paginated(
+                        profile_id, src, max_pages=scrape_pages, stream=stream
+                    )
+                    return src, config_links, proxy_links, newest_id
+                except Exception as exc:
+                    last_exc = exc
+                    log.warning(f"⚠️ [profile={profile_id}] source={src} scrape attempt {attempt}/2 failed: {exc}")
+                    if attempt < 2:
+                        await asyncio.sleep(0.5)
+            raise RuntimeError(f"source {src} failed after 2 attempts: {last_exc}")
 
     scrape_tasks = [scrape_one(src) for src in sources]
     results = await asyncio.gather(*scrape_tasks, return_exceptions=True)
@@ -4606,18 +4713,9 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
 
     working = []
     if enable_configs and new_configs:
-        log.info(f"[AUTO-CONFIG] profile={profile_id} candidates={len(new_configs)} max_post={get_profile_max_post_config(profile_id)} ping={ping_testing}")
-        # Test configs in batches
-        # Test only enough candidates to fill this post plus a small safety
-        # buffer. This dramatically reduces manual/automatic latency while
-        # preserving correctness: anything not tested remains unconsumed and
-        # will be retried on the next cycle.
         desired = max(1, int(get_profile_max_post_config(profile_id) or 1))
-        adaptive_limit = max(desired * 2, desired + 8)
-        test_limit = min(len(new_configs), adaptive_limit) if config_test_limit is None else min(len(new_configs), config_test_limit)
-        to_test=new_configs[:test_limit]
-        log.info(f"📊 Testing {len(to_test)} configs... low_cost={low_cost_mode}")
-        sem=asyncio.Semaphore(40 if low_cost_mode else 100)
+        log.info(f"[AUTO-CONFIG] profile={profile_id} candidates={len(new_configs)} max_post={desired} ping={ping_testing} smart_batch={batch_posting}")
+        sem=asyncio.Semaphore(24 if low_cost_mode else 60)
 
         async def _check(item):
             u, src = item
@@ -4626,25 +4724,39 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
                     if ping_testing:
                         ping, ok, cnt = await check_full_link_ping(u, config_ping_mode, perform_ping=True)
                     else:
-                        # Ping testing OFF: never suppress a discovered config.
-                        ping = 0
-                        ok = True
-                        cnt = 0
-                    if ok:
-                        return u, True, ping, cnt, src
-                    else:
-                        return u, False, 0, 0, src
+                        ping, ok, cnt = 0, True, 0
+                    return u, bool(ok), ping, cnt, src
                 except Exception as e:
                     log.debug(f"ping failed for {u[:30]}: {e}")
                     return u, False, 0, 0, src
 
-        rs = await asyncio.gather(*[_check(item) for item in to_test], return_exceptions=True)
-        for r in rs:
-            if isinstance(r, Exception):
-                continue
-            if r[1]:
-                working.append((r[0], r[2], r[3]))
-        log.info(f"📊 Working configs: {len(working)}")
+        if batch_posting:
+            # Smart batch: keep testing until the configured maximum is filled,
+            # or until the current new set is exhausted. If only 3 usable servers
+            # exist while max=5, publish those 3; never invent/wait forever.
+            test_cap = min(len(new_configs), max(24, min(120, desired * 12)))
+            batch_size = min(12, test_cap)
+            tested = 0
+            while tested < test_cap and len(working) < desired:
+                chunk = new_configs[tested:min(tested + batch_size, test_cap)]
+                rs = await asyncio.gather(*[_check(item) for item in chunk], return_exceptions=True)
+                for r in rs:
+                    if not isinstance(r, Exception) and r[1]:
+                        working.append((r[0], r[2], r[3]))
+                        if len(working) >= desired:
+                            break
+                tested += len(chunk)
+            log.info(f"📦 [AUTO-CONFIG] smart batch tested={tested}/{len(new_configs)} working={len(working)} target={desired}")
+        else:
+            adaptive_limit = max(desired * 2, desired + 8)
+            test_limit = min(len(new_configs), adaptive_limit)
+            to_test=new_configs[:test_limit]
+            log.info(f"📊 Testing {len(to_test)} configs... low_cost={low_cost_mode}")
+            rs = await asyncio.gather(*[_check(item) for item in to_test], return_exceptions=True)
+            for r in rs:
+                if not isinstance(r, Exception) and r[1]:
+                    working.append((r[0], r[2], r[3]))
+            log.info(f"📊 Working configs: {len(working)}")
         if not working:
             log.warning(f"[AUTO-CONFIG] profile={profile_id} no publishable configs in current window; cursor retained")
     else:
@@ -4654,18 +4766,14 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
     if enable_proxies and new_proxies:
         valid_proxies = [p for p in new_proxies if is_telegram_proxy_url(p)]
         if valid_proxies:
-            log.info(f"📊 Processing {len(valid_proxies)} proxies...")
-            sem = asyncio.Semaphore(50)
+            desired_proxy = max(1, int(get_profile_max_post_proxy(profile_id) or 1))
+            log.info(f"📊 Processing proxies: candidates={len(valid_proxies)} target={desired_proxy} smart_batch={batch_posting}")
+            sem = asyncio.Semaphore(24 if low_cost_mode else 60)
 
             async def check_proxy(proxy_url):
                 async with sem:
-                    # A Telegram proxy URL is a Telegram MTProto proxy link.
-                    # For posting, structural validity is the gate; the old
-                    # generic config ping test was incorrectly filtering most
-                    # proxies and made proxy posting appear broken.
                     host, port = extract_host(proxy_url)
-                    flag = "🌐"
-                    country_code = ""
+                    flag, country_code = "🌐", ""
                     if host:
                         try:
                             ip = await host_to_ip(host)
@@ -4686,13 +4794,28 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
                             return proxy_url, 0, flag, country_code
                     return proxy_url, 0, flag, country_code
 
-            results = await asyncio.gather(
-                *[check_proxy(p) for p in valid_proxies], return_exceptions=True)
-            for r in results:
-                if isinstance(r, Exception):
-                    continue
-                proxy_with_ping.append(r)
-            log.info(f"📊 Valid Telegram proxies ready for posting: {len(proxy_with_ping)}")
+            if batch_posting:
+                # Same smart-batch rule as configs: stop as soon as max is filled;
+                # if fewer working proxies exist, send the smaller available set.
+                test_cap = min(len(valid_proxies), max(24, min(120, desired_proxy * 12)))
+                batch_size = min(12, test_cap)
+                tested = 0
+                while tested < test_cap and len(proxy_with_ping) < desired_proxy:
+                    chunk = valid_proxies[tested:min(tested + batch_size, test_cap)]
+                    results = await asyncio.gather(*[check_proxy(p) for p in chunk], return_exceptions=True)
+                    for r in results:
+                        if not isinstance(r, Exception):
+                            proxy_with_ping.append(r)
+                            if len(proxy_with_ping) >= desired_proxy:
+                                break
+                    tested += len(chunk)
+                log.info(f"📦 [AUTO-PROXY] smart batch tested={tested}/{len(valid_proxies)} working={len(proxy_with_ping)} target={desired_proxy}")
+            else:
+                results = await asyncio.gather(*[check_proxy(p) for p in valid_proxies], return_exceptions=True)
+                for r in results:
+                    if not isinstance(r, Exception):
+                        proxy_with_ping.append(r)
+                log.info(f"📊 Valid Telegram proxies ready for posting: {len(proxy_with_ping)}")
         else:
             log.info("ℹ️ No valid Telegram proxies found.")
 
@@ -4704,9 +4827,10 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
     # In combined mode, glass proxies are attached directly BELOW the config
     # message. Build the proxy payload first, but do not send it separately.
     combined_glass = (enable_configs and enable_proxies and get_profile_proxy_post_mode(profile_id) == 1)
-    if combined_glass and proxy_with_ping:
+    combined_proxy_ready = bool(proxy_with_ping) and (not batch_posting or len(proxy_with_ping) >= desired_proxy) if enable_proxies and new_proxies else False
+    if combined_glass and proxy_with_ping and combined_proxy_ready:
         pcnt, ppayload, selected_proxy_urls = await post_proxies(
-            bot, profile_id, proxy_with_ping, is_instant=is_instant
+            bot, profile_id, proxy_with_ping[:desired_proxy] if batch_posting else proxy_with_ping, is_instant=is_instant
         )
         if pcnt > 0 and ppayload:
             _proxy_preview_text, all_proxy_rows = ppayload
@@ -4720,9 +4844,21 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
             glass_proxy_rows = None
             selected_proxy_urls = []
 
-    if working and enable_configs:
+    # Strict smart-batch rule:
+    # When enabled, NEVER publish a partial batch. The configured maximum is a
+    # required batch size, not merely a ceiling. If fewer healthy, non-duplicate
+    # configs are ready, keep the stream cursor unchanged and wait for the next
+    # cycle to collect the missing items. The normal mode remains unchanged.
+    config_batch_ready = bool(working) and (not batch_posting or len(working) >= desired)
+    if batch_posting and enable_configs and working and len(working) < desired:
+        log.info(
+            f"📦 [AUTO-CONFIG] strict batch WAIT profile={profile_id}: "
+            f"ready={len(working)}/{desired}; nothing will be posted until the batch is full"
+        )
+    if config_batch_ready and enable_configs:
         total_configs = await post_configs(
-            bot, profile_id, working, source_for_seen="auto", is_instant=is_instant,
+            bot, profile_id, working[:desired] if batch_posting else working,
+            source_for_seen="auto", is_instant=is_instant,
             extra_button_rows=glass_proxy_rows
         )
         # If the config message containing the glass proxy buttons was delivered,
@@ -4740,9 +4876,15 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
     # If glass mode was selected but there is no config message to attach to (or
     # the config send failed), fall back to a standalone proxy post so proxies
     # are never silently lost.
-    if proxy_with_ping and enable_proxies and (not combined_glass or total_configs == 0):
+    proxy_batch_ready = bool(proxy_with_ping) and (not batch_posting or len(proxy_with_ping) >= desired_proxy) if enable_proxies and new_proxies else False
+    if batch_posting and enable_proxies and proxy_with_ping and len(proxy_with_ping) < desired_proxy:
+        log.info(
+            f"📦 [AUTO-PROXY] strict batch WAIT profile={profile_id}: "
+            f"ready={len(proxy_with_ping)}/{desired_proxy}; nothing will be posted until the batch is full"
+        )
+    if proxy_with_ping and enable_proxies and proxy_batch_ready and (not combined_glass or total_configs == 0):
         cnt, payload, selected_proxy_urls = await post_proxies(
-            bot, profile_id, proxy_with_ping, is_instant=is_instant
+            bot, profile_id, proxy_with_ping[:desired_proxy] if batch_posting else proxy_with_ping, is_instant=is_instant
         )
         if cnt > 0 and payload:
             text, buttons = payload
@@ -5717,6 +5859,12 @@ def channel_delete_kb(profile_id):
         [InlineKeyboardButton("↩️ بازگشت", callback_data=f"prof_{profile_id}", style="primary")],
     ])
 
+def channel_delete_confirm_kb(profile_id, count):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"✅ تایید حذف {count} پست", callback_data=f"delconfirm_{profile_id}_{count}", style="danger")],
+        [InlineKeyboardButton("❌ لغو", callback_data=f"delcancel_{profile_id}", style="primary")],
+    ])
+
 
 def profile_admin_kb(profile_id):
     prof = get_profile(profile_id)
@@ -5783,6 +5931,7 @@ def profile_admin_kb(profile_id):
         )],
         [InlineKeyboardButton(f"🌐 حالت انتشار پروکسی: {'شیشه‌ای' if get_profile_proxy_post_mode(profile_id) == 1 else 'عادی'}", callback_data=f"tgl_prx_mode_{profile_id}", style="primary"),
          InlineKeyboardButton(f"📡 تست Ping: {'✅' if ping_testing else '❌'}", callback_data=f"tgl_ping_test_{profile_id}", style="primary")],
+        [InlineKeyboardButton(f"📦 تست و ارسال تجمیعی: {'✅ فعال' if get_profile_batch_posting(profile_id) else '❌ خاموش'}", callback_data=f"tgl_batch_post_{profile_id}", style="success" if get_profile_batch_posting(profile_id) else "danger")],
         [InlineKeyboardButton(
             f"🧩 حالت انتشار کانفیگ: {'عادی (COPY CODE)' if get_profile_config_post_mode(profile_id) == 0 else 'Quote جمع‌شونده'}  🔄",
             callback_data=f"tgl_cfg_post_mode_{profile_id}", style="primary"
@@ -6827,9 +6976,37 @@ async def _on_callback_impl(u, ctx):
                     await q.answer("⚠️ مقدار نامعتبر", show_alert=True); return
                 if not get_profile(profile_id):
                     await q.answer("⚠️ پروفایل یافت نشد", show_alert=True); return
-                await q.answer(f"⏳ حذف {count} پست آخر شروع شد…")
-                asyncio.create_task(_run_channel_delete_job(u.get_bot(), q, profile_id, count), name=f"delete_posts_{profile_id}_{count}")
+                await q.edit_message_text(
+                    f"⚠️ <b>تأیید حذف پست‌ها</b>\n\n"
+                    f"تعداد: <b>{count}</b>\n"
+                    "ترتیب حذف: <b>جدیدترین پست‌های کانال → قدیمی‌تر</b>.\n\n"
+                    "آیا مطمئنی؟",
+                    parse_mode="HTML", reply_markup=channel_delete_confirm_kb(profile_id, count)
+                )
                 return
+
+        if d.startswith("delconfirm_"):
+            parts = d.split("_")
+            if len(parts) != 3:
+                await q.answer("⚠️ داده نامعتبر", show_alert=True); return
+            try:
+                profile_id, count = int(parts[1]), int(parts[2])
+            except ValueError:
+                await q.answer("⚠️ داده نامعتبر", show_alert=True); return
+            if not get_profile(profile_id) or not (1 <= count <= 5000):
+                await q.answer("⚠️ مقدار نامعتبر", show_alert=True); return
+            await q.answer(f"⏳ حذف {count} پست تأیید شد…")
+            asyncio.create_task(_run_channel_delete_job(u.get_bot(), q, profile_id, count), name=f"delete_posts_{profile_id}_{count}")
+            return
+
+        if d.startswith("delcancel_"):
+            try:
+                profile_id = int(d.rsplit("_", 1)[1])
+            except ValueError:
+                await q.answer("⚠️ شناسه نامعتبر", show_alert=True); return
+            await q.answer("❌ حذف لغو شد")
+            await show_profile_admin(q.message, profile_id)
+            return
 
         if d.startswith("sp_delete_"):
             parts = d.split("_")
@@ -7620,6 +7797,20 @@ async def _on_callback_impl(u, ctx):
                 await show_profile_admin(q.message, profile_id)
             else:
                 await q.answer("⚠️ خطا در داده")
+            return
+
+        if d.startswith("tgl_batch_post_"):
+            try:
+                profile_id = int(d.rsplit("_", 1)[1])
+            except ValueError:
+                await q.answer("⚠️ شناسه نامعتبر", show_alert=True); return
+            if not get_profile(profile_id):
+                await q.answer("⚠️ پروفایل یافت نشد", show_alert=True); return
+            current = get_profile_batch_posting(profile_id)
+            new_val = not current
+            set_profile_batch_posting(profile_id, new_val)
+            await q.answer("📦 ارسال تجمیعی فعال شد." if new_val else "📦 ارسال تجمیعی خاموش شد.")
+            await show_profile_admin(q.message, profile_id)
             return
 
         if d.startswith("tgl_profile_"):
@@ -8985,8 +9176,11 @@ async def _on_text_impl(u, ctx):
             await u.message.reply_text("❌ تعداد باید بین 1 تا 5000 باشد.")
             return
         ctx.user_data.pop("action", None)
-        await u.message.reply_text(f"⏳ حذف {count} پست آخر از جدیدترین‌ها شروع شد…")
-        asyncio.create_task(_run_channel_delete_job_from_message(u, profile_id, count), name=f"delete_posts_custom_{profile_id}")
+        await u.message.reply_text(
+            f"⚠️ <b>تأیید حذف</b>\n\nتعداد: <b>{count}</b> پست\n"
+            "حذف از <b>جدیدترین پست‌های کانال</b> شروع می‌شود.\n\nآیا مطمئنی؟",
+            parse_mode="HTML", reply_markup=channel_delete_confirm_kb(profile_id, count)
+        )
         return
 
     if a.startswith("setbackupinterval_"):
@@ -9546,18 +9740,14 @@ def automatic_database_cleanup():
     try:
         db = get_conn()
         cur = db.cursor()
-        cutoff = (datetime.now(TEHRAN_TZ) - timedelta(hours=DB_RETENTION_HOURS)).isoformat()
+        cutoff = (datetime.now(TEHRAN_TZ) - timedelta(hours=DB_RETENTION_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
         deleted = {}
-        for table, where in ((
-            "posts", "created_at < ?"),
-            ("manual_send_queue", "status IN ('done','cancelled','failed') AND updated_at < ?"),
-        ):
-            try:
-                cur.execute(f"DELETE FROM {table} WHERE {where}", (cutoff,))
-                deleted[table] = max(0, cur.rowcount)
-            except sqlite3.Error:
-                deleted[table] = 0
-        # URL history is disposable after 24h. Permanent once-only hashes remain.
+        try:
+            cur.execute("DELETE FROM manual_send_queue WHERE status IN ('done','cancelled','failed') AND updated_at < ?", (cutoff,))
+            deleted["manual_send_queue"] = max(0, cur.rowcount)
+        except sqlite3.Error:
+            deleted["manual_send_queue"] = 0
+        # URL history is disposable after 7 days. Permanent once-only hashes remain.
         for table, col in (("seen", "last_posted"), ("proxies_seen", "last_posted")):
             try:
                 cur.execute(f"DELETE FROM {table} WHERE {col} IS NOT NULL AND {col} < ?", (cutoff,))
@@ -9565,27 +9755,32 @@ def automatic_database_cleanup():
             except sqlite3.Error:
                 deleted[table] = 0
 
-        # processed_messages is disposable; retain only a bounded recent tail.
-        try:
-            cur.execute("DELETE FROM processed_messages WHERE rowid NOT IN (SELECT rowid FROM processed_messages ORDER BY rowid DESC LIMIT 5000)")
-            deleted["processed_messages"] = max(0, cur.rowcount)
-        except sqlite3.Error:
-            deleted["processed_messages"] = 0
-        try:
-            cur.execute("""DELETE FROM channel_posts WHERE rowid IN (
-                SELECT rowid FROM (
-                    SELECT rowid, ROW_NUMBER() OVER (PARTITION BY profile_id ORDER BY message_id DESC) AS rn
-                    FROM channel_posts
-                ) WHERE rn > 5000
-            )""")
-            deleted["channel_posts"] = max(0, cur.rowcount)
-        except sqlite3.Error:
-            deleted["channel_posts"] = 0
         try:
             cur.execute("DELETE FROM country_cache")
             deleted["country_cache"] = max(0, cur.rowcount)
         except sqlite3.Error:
             deleted["country_cache"] = 0
+        # These legacy tables are no longer part of the posting decision path.
+        # Keep the table definitions for compatibility, but remove their rows.
+        for table in ("processed_messages", "last_scrape", "posts"):
+            try:
+                cur.execute(f"DELETE FROM {table}")
+                deleted[table] = max(0, cur.rowcount)
+            except sqlite3.Error:
+                deleted[table] = 0
+        # Admin activity is useful, but only recent 7-day activity is needed.
+        try:
+            cur.execute("DELETE FROM admin_activity WHERE created_at < ?", (cutoff,))
+            deleted["admin_activity"] = max(0, cur.rowcount)
+        except sqlite3.Error:
+            deleted["admin_activity"] = 0
+        # channel_posts is the authoritative 7-day record of messages actually
+        # sent by each profile, including messages that were later deleted.
+        try:
+            cur.execute("DELETE FROM channel_posts WHERE sent_at < ?", (cutoff,))
+            deleted["channel_posts"] = max(0, cur.rowcount)
+        except sqlite3.Error:
+            deleted["channel_posts"] = 0
         db.commit()
         cur.execute("PRAGMA optimize")
         try:
@@ -9614,8 +9809,8 @@ def compact_database_once():
         row = db.execute("PRAGMA freelist_count").fetchone()
         free_pages = int(row[0] or 0) if row else 0
         page_size = int((db.execute("PRAGMA page_size").fetchone() or [4096])[0])
-        if free_pages * page_size < 8 * 1024 * 1024:
-            log.info("[DB COMPACT] skipped; reclaimable space below 8 MiB")
+        if free_pages * page_size < 256 * 1024:
+            log.info("[DB COMPACT] skipped; reclaimable space below 256 KiB")
             return False
         log.info("[DB COMPACT] starting one-time compaction: reclaimable=%d MiB", (free_pages * page_size) // (1024 * 1024))
         db.execute("VACUUM")
@@ -9638,7 +9833,7 @@ async def database_compact_worker():
         log.exception("[DB COMPACT] worker failed")
 
 async def database_cleanup_worker():
-    log.info('[DB CLEANER] worker started | retention=24h | compact-after-cleanup')
+    log.info('[DB CLEANER] worker started | retention=7d | compact-after-cleanup')
     # Never compete with startup/callback initialization.
     await asyncio.sleep(10)
     while True:
