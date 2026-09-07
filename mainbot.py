@@ -1,5 +1,5 @@
-# bot.py — Version: 0.1.25-CONFIG-MODES
-APP_VERSION = "0.1.25-CONFIG-MODES"
+# bot.py — Version 1
+APP_VERSION = "1"
 BOT_VERSION = APP_VERSION
 import os
 import re
@@ -1900,6 +1900,22 @@ def set_profile_proxy_post_mode(profile_id, mode):
     update_profile(profile_id, proxy_post_mode=mode)
     return mode
 
+# Config post mode: 0 = normal COPY CODE/pre blocks, 1 = one collapsed expandable quote
+# with one copyable <code> config per line. Default is always normal.
+def get_profile_config_post_mode(profile_id):
+    prof = get_profile(profile_id)
+    if not prof:
+        return 0
+    try:
+        return 1 if int(prof.get("config_post_mode", 0) or 0) == 1 else 0
+    except (TypeError, ValueError):
+        return 0
+
+def set_profile_config_post_mode(profile_id, mode):
+    mode = 1 if int(mode) else 0
+    update_profile(profile_id, config_post_mode=mode)
+    return mode
+
 # New sponsor functions
 def get_sponsors(profile_id, apply_type="both", include_disabled=False):
     """Return sponsors for admin or active selection. Disabled sponsors remain editable."""
@@ -3325,7 +3341,7 @@ async def test_tcp_ping(host, port):
         start = loop.time()
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port),
-            timeout=1.0
+            timeout=0.8
         )
         writer.close()
         await writer.wait_closed()
@@ -3341,7 +3357,7 @@ async def ping_from_iran_only(host, port=None, allow_tcp_fallback=True):
     target = ip
 
     try:
-        async with httpx.AsyncClient(timeout=4) as cl:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(2.5, connect=1.5), limits=httpx.Limits(max_connections=50, max_keepalive_connections=20)) as cl:
             r = await cl.get(
                 f"https://check-host.net/check-ping?host={target}&json=1",
                 headers={"User-Agent": "Mozilla/5.0"},
@@ -3415,7 +3431,9 @@ async def check_full_link_ping(url, ping_mode="global", perform_ping=True):
     if not host:
         return 0, False, 0
     allow_tcp = (ping_mode != "iran")
-    ping, ok, cnt = await ping_from_iran_only(host, port, allow_tcp_fallback=allow_tcp)
+    ping, ok, cnt = await asyncio.wait_for(
+        ping_from_iran_only(host, port, allow_tcp_fallback=allow_tcp), timeout=3.5
+    )
     return ping, ok, cnt
 
 # ======================================================================
@@ -3529,7 +3547,8 @@ async def scrape_channel_paginated(profile_id, channel, max_pages=5, stream="com
         else:
             break
 
-        await asyncio.sleep(0.25)
+        # No fixed per-page delay: source requests are already rate-limited by Telegram.
+        await asyncio.sleep(0)
 
     all_configs = list(dict.fromkeys(all_configs))
     all_proxies = list(dict.fromkeys(all_proxies))
@@ -3551,11 +3570,11 @@ async def _scrape_single_page_with_messages(url, channel):
         "Pragma": "no-cache",
     }
 
-    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as cl:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(7.0, connect=3.0), follow_redirects=True, limits=httpx.Limits(max_connections=50, max_keepalive_connections=20)) as cl:
         r = await cl.get(url, headers=headers)
         if r.status_code == 429:
             log.warning(f"Rate limit for {channel}, waiting 10s")
-            await asyncio.sleep(10)
+            await asyncio.sleep(2)
             r = await cl.get(url, headers=headers)
         if r.status_code != 200:
             log.warning(f"⚠️ {channel} returned status {r.status_code} for url {url}")
@@ -3735,8 +3754,7 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
         return 0
 
     max_post = max_post_override if max_post_override is not None else get_profile_max_post_config(profile_id)
-    if is_instant:
-        max_post = min(max_post, 5)
+    # Instant/manual execution must respect the configured max-post exactly.
 
     blacklist_words = get_blacklist(profile_id)
     filtered_working = []
@@ -4164,8 +4182,8 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
     low_cost_mode=get_profile_low_cost_mode(profile_id)
     # Exhaustive source scan: keep paging until the stored cursor or channel history ends.
     # Low-cost mode now controls ping/test intensity only; it must never hide source messages.
-    scrape_pages=None
-    config_test_limit = None  # exhaustive source processing; never hide configs behind a 10/30-item scan cap
+    scrape_pages = 12 if is_instant else None
+    config_test_limit = None  # no artificial item cap; Telegram max_post still controls publication
     # Scrape all sources in parallel
     async def scrape_one(src):
         last_exc = None
@@ -4223,10 +4241,10 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
     working = []
     if enable_configs and new_configs:
         # Test configs in batches
-        test_limit=len(new_configs) if config_test_limit is None else min(len(new_configs), config_test_limit)
+        test_limit=(min(len(new_configs), max(30, int(get_profile_max_post_config(profile_id) or 1) * 3)) if is_instant and config_test_limit is None else (len(new_configs) if config_test_limit is None else min(len(new_configs), config_test_limit)))
         to_test=new_configs[:test_limit]
         log.info(f"📊 Testing {len(to_test)} configs... low_cost={low_cost_mode}")
-        sem=asyncio.Semaphore(20 if low_cost_mode else 50)
+        sem=asyncio.Semaphore(40 if low_cost_mode else 100)
 
         async def _check(item):
             u, src = item
@@ -4545,7 +4563,7 @@ async def profile_loop_proxy(bot, profile_id):
 
 
 # ======================================================================
-# v0.1.16 redesigned scheduler
+# stable scheduler
 # - fixed interval scheduling using monotonic next_run timestamps
 # - auto loops are independent from manual queue worker
 # - slow source scan no longer shifts the next execution window
@@ -6946,13 +6964,34 @@ async def _on_callback_impl(u, ctx):
                 if not get_profile_enabled(profile_id):
                     await q.answer("⛔ پروفایل غیرفعال است!", show_alert=True)
                     return
-                p = await q.edit_message_text("⏳ در حال اجرا...")
+                await q.answer("🚀 اجرا شروع شد؛ نتیجه بعد از پایان ارسال می‌شود.")
                 try:
-                    n, m = await run_cycle_for_profile(u.get_bot(), profile_id, enable_configs=True, enable_proxies=True, is_instant=False)
-                    await p.edit_text(f"✅ Done: {n} - {m}")
-                except Exception as e:
-                    log.error(f"❌ runnow error: {e}")
-                    await p.edit_text(f"❌ {str(e)[:200]}")
+                    await q.edit_message_text("⏳ اجرای دستی شروع شد...\n\n⚡ پردازش سریع فعال است؛ بات در حال کار است و پنل را قفل نمی‌کند.")
+                except Exception:
+                    pass
+                async def _run_manual_fast():
+                    try:
+                        n, m = await asyncio.wait_for(
+                            run_cycle_for_profile(u.get_bot(), profile_id, enable_configs=True, enable_proxies=True, is_instant=True),
+                            timeout=110.0
+                        )
+                        try:
+                            await u.get_bot().send_message(MAIN_ADMIN_ID, f"✅ اجرای دستی تمام شد\n📊 {n}\n📝 {m}")
+                        except Exception:
+                            pass
+                    except asyncio.TimeoutError:
+                        log.error(f"❌ runnow timeout for profile {profile_id}")
+                        try:
+                            await u.get_bot().send_message(MAIN_ADMIN_ID, "⚠️ اجرای دستی بیش از ۱۱۰ ثانیه طول کشید و برای جلوگیری از کرش متوقف شد.\nجزئیات در لاگ ثبت شده است.")
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        log.exception(f"❌ runnow error for profile {profile_id}")
+                        try:
+                            await u.get_bot().send_message(MAIN_ADMIN_ID, f"❌ خطای اجرای دستی: {str(e)[:300]}")
+                        except Exception:
+                            pass
+                asyncio.create_task(_run_manual_fast())
             else:
                 await q.answer("⚠️ خطا در داده")
             return
