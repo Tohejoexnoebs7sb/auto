@@ -1,5 +1,5 @@
-# bot.py — 2
-APP_VERSION = "2"
+# bot.py — 4.0.0
+APP_VERSION = "4.0.0"
 BOT_VERSION = APP_VERSION
 import os
 import re
@@ -1358,8 +1358,8 @@ def sqlite_maintenance_cycle():
         conn.commit()
         # Only compact when SQLite has a large amount of free pages.
         free_pages = c.execute("PRAGMA freelist_count").fetchone()[0]
-        if free_pages and free_pages > 1000:
-            c.execute("VACUUM")
+        # Do not VACUUM while the bot is serving callbacks/schedulers.
+        pass
     except Exception:
         log.exception("sqlite maintenance failed")
 
@@ -3975,16 +3975,16 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
         batch = []
         for line in config_blocks:
             candidate = batch + [line]
-            quote = "<blockquote expandable>\n" + "\n".join(f"<code>{x}</code>" for x in candidate) + "\n</blockquote>"
-            if batch and len(before + quote + after) > 4096:
-                quote = "<blockquote expandable>\n" + "\n".join(f"<code>{x}</code>" for x in batch) + "\n</blockquote>"
-                html_messages.append(before + quote + after)
+            quote_block = "<blockquote expandable>\n" + "\n".join(f"<code>{x}</code>" for x in candidate) + "\n</blockquote>"
+            if batch and len(before + quote_block + after) > 4096:
+                quote_block = "<blockquote expandable>\n" + "\n".join(f"<code>{x}</code>" for x in batch) + "\n</blockquote>"
+                html_messages.append(before + quote_block + after)
                 batch = [line]
             else:
                 batch = candidate
         if batch:
-            quote = "<blockquote expandable>\n" + "\n".join(f"<code>{x}</code>" for x in batch) + "\n</blockquote>"
-            html_messages.append(before + quote + after)
+            quote_block = "<blockquote expandable>\n" + "\n".join(f"<code>{x}</code>" for x in batch) + "\n</blockquote>"
+            html_messages.append(before + quote_block + after)
 
     ok = True
     for idx, message_text in enumerate(html_messages):
@@ -4223,10 +4223,12 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
 
     # Low-cost mode reduces Railway network/CPU usage.
     low_cost_mode=get_profile_low_cost_mode(profile_id)
-    # Exhaustive source scan: keep paging until the stored cursor or channel history ends.
-    # Low-cost mode now controls ping/test intensity only; it must never hide source messages.
-    scrape_pages = None
-    config_test_limit = None  # no artificial item cap; Telegram max_post still controls publication
+    # Responsive incremental scan. A cycle must never walk hundreds of historical
+    # Telegram pages. Four pages per source are enough for normal interval runs;
+    # an unfinished backlog remains behind the stream cursor and is picked up by
+    # the next cycle. This keeps manual/automatic execution bounded and stable.
+    scrape_pages = 4
+    config_test_limit = None
     # Scrape all sources in parallel
     async def scrape_one(src):
         last_exc = None
@@ -4283,6 +4285,7 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
 
     working = []
     if enable_configs and new_configs:
+        log.info(f"[AUTO-CONFIG] profile={profile_id} candidates={len(new_configs)} max_post={get_profile_max_post_config(profile_id)} ping={ping_testing}")
         # Test configs in batches
         # Test only enough candidates to fill this post plus a small safety
         # buffer. This dramatically reduces manual/automatic latency while
@@ -4321,6 +4324,8 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
             if r[1]:
                 working.append((r[0], r[2], r[3]))
         log.info(f"📊 Working configs: {len(working)}")
+        if not working:
+            log.warning(f"[AUTO-CONFIG] profile={profile_id} no publishable configs in current window; cursor retained")
     else:
         log.info("ℹ️ No configs to test")
 
@@ -4435,8 +4440,11 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
     # every publishable candidate for that stream was actually delivered.
     # IMPORTANT: an existing/new candidate that failed validation or Telegram
     # delivery must remain behind the cursor so the next automatic cycle retries it.
-    config_ok = (not enable_configs) or (not new_configs) or (total_configs > 0)
-    proxy_ok = (not enable_proxies) or (not new_proxies) or (total_proxies > 0)
+    # Never move a stream cursor past unpublished candidates. If the current
+    # window contains more new items than the configured per-post limit, the
+    # next cycle must revisit the same window and publish the remainder.
+    config_ok = (not enable_configs) or (not new_configs) or (total_configs >= len(new_configs))
+    proxy_ok = (not enable_proxies) or (not new_proxies) or (total_proxies >= len(new_proxies))
     for src, newest_id in source_newest_ids.items():
         if not newest_id:
             continue
@@ -4724,7 +4732,7 @@ async def _profile_scheduler_v16(bot, profile_id, mode):
                 started = datetime.now(TEHRAN_TZ)
                 log.info(f"[SCHEDULER] AUTO TICK {key} at {started.isoformat()} (instant mode)")
                 await _run_scheduled_profile_cycle(bot, profile_id, mode)
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(1.0)
                 continue
 
             seconds = float(interval_minutes * 60)
@@ -4734,6 +4742,8 @@ async def _profile_scheduler_v16(bot, profile_id, mode):
                 # interval), then every configured interval from that fixed
                 # anchor. This also keeps the cadence independent of scrape time.
                 interval_seconds = seconds
+                # First automatic run is immediate. Future runs use a fixed
+                # monotonic cadence independent of network duration.
                 next_deadline = loop.time()
 
             wait = next_deadline - loop.time()
@@ -5428,7 +5438,7 @@ def profile_admin_kb(profile_id):
         [InlineKeyboardButton(f"🌐 حالت انتشار پروکسی: {'شیشه‌ای' if get_profile_proxy_post_mode(profile_id) == 1 else 'عادی'}", callback_data=f"tgl_prx_mode_{profile_id}", style="primary"),
          InlineKeyboardButton(f"📡 تست Ping: {'✅' if ping_testing else '❌'}", callback_data=f"tgl_ping_test_{profile_id}", style="primary")],
         [InlineKeyboardButton(
-            f"🧩 حالت کانفیگ: {'عادی (COPY CODE)' if get_profile_config_post_mode(profile_id) == 0 else 'Quote جمع‌شونده'} 🔄",
+            f"🧩 حالت انتشار کانفیگ: {'عادی (COPY CODE)' if get_profile_config_post_mode(profile_id) == 0 else 'Quote جمع‌شونده'}  🔄",
             callback_data=f"tgl_cfg_post_mode_{profile_id}", style="primary"
         )],
         [InlineKeyboardButton(f"👁 نمایش Ping: {'✅' if prof.get('show_ping', 1) else '❌'}", callback_data=f"tgl_show_ping_{profile_id}", style="primary"),
@@ -7062,7 +7072,15 @@ async def _on_callback_impl(u, ctx):
                             await u.get_bot().send_message(MAIN_ADMIN_ID, f"❌ خطای اجرای دستی: {str(e)[:300]}")
                         except Exception:
                             pass
-                asyncio.create_task(_run_manual_fast())
+                task_key = f"manual_runnow_{profile_id}"
+                existing = _WORKER_TASKS.get(task_key)
+                if existing is None or existing.done():
+                    _WORKER_TASKS[task_key] = asyncio.create_task(_run_manual_fast())
+                else:
+                    try:
+                        await u.get_bot().send_message(MAIN_ADMIN_ID, f"⚠️ اجرای دستی پروفایل {profile_id} هنوز در حال انجام است؛ اجرای تکراری شروع نشد.")
+                    except Exception:
+                        pass
             else:
                 await q.answer("⚠️ خطا در داده")
             return
@@ -7221,19 +7239,6 @@ async def _on_callback_impl(u, ctx):
                 await q.answer("⚠️ خطا در داده")
             return
 
-        if d.startswith("set_cfg_post_mode_"):
-            parts = d.split("_")
-            try:
-                mode = int(parts[4])
-                profile_id = int(parts[5])
-            except Exception:
-                await q.answer("⚠️ داده نامعتبر")
-                return
-            set_profile_config_post_mode(profile_id, mode)
-            await q.answer("✅ حالت عادی فعال شد." if mode == 0 else "✅ Quote جمع‌شونده فعال شد.")
-            await show_profile_admin(q.message, profile_id)
-            return
-
         if d.startswith("tgl_cfg_post_mode_"):
             try:
                 profile_id = int(d.rsplit("_", 1)[1])
@@ -7243,7 +7248,11 @@ async def _on_callback_impl(u, ctx):
             current = get_profile_config_post_mode(profile_id)
             new_mode = 0 if current == 1 else 1
             set_profile_config_post_mode(profile_id, new_mode)
-            await q.answer("🧩 حالت Quote جمع‌شونده فعال شد." if new_mode else "🧩 حالت انتشار عادی فعال شد.")
+            persisted = get_profile_config_post_mode(profile_id)
+            if persisted != new_mode:
+                await q.answer("❌ ذخیره حالت انجام نشد.", show_alert=True)
+                return
+            await q.answer("🧩 Quote جمع‌شونده فعال شد." if persisted else "🧩 حالت عادی فعال شد.")
             await show_profile_admin(q.message, profile_id)
             return
 
@@ -9146,8 +9155,9 @@ def automatic_database_cleanup():
         cur.execute('PRAGMA wal_checkpoint(TRUNCATE)')
 
         free_pages = cur.execute('PRAGMA freelist_count').fetchone()[0]
-        if free_pages and free_pages > 2000:
-            cur.execute('VACUUM')
+        # VACUUM is intentionally disabled in the live bot; it can lock SQLite
+        # and freeze callbacks/queues for a long time. WAL/PRAGMA optimize is enough.
+        pass
 
         db.commit()
         log.info(f'[DB CLEANER] completed free_pages={free_pages}')
@@ -9361,10 +9371,9 @@ async def on_document(u, ctx):
         except Exception: log.exception("document audit wrapper failed")
 
 def main():
-    try:
-        optimize_database()
-    except Exception:
-        log.exception("startup database optimization failed")
+    # Never perform database cleanup/VACUUM before polling starts. A large
+    # SQLite file can otherwise block the entire bot for minutes and make the
+    # bot look dead. Maintenance runs in its own worker after startup.
     app = Application.builder().token(TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("admin", cmd_admin))
