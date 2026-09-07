@@ -4284,7 +4284,13 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
     working = []
     if enable_configs and new_configs:
         # Test configs in batches
-        test_limit=(min(len(new_configs), max(30, int(get_profile_max_post_config(profile_id) or 1) * 3)) if is_instant and config_test_limit is None else (len(new_configs) if config_test_limit is None else min(len(new_configs), config_test_limit)))
+        # Test only enough candidates to fill this post plus a small safety
+        # buffer. This dramatically reduces manual/automatic latency while
+        # preserving correctness: anything not tested remains unconsumed and
+        # will be retried on the next cycle.
+        desired = max(1, int(get_profile_max_post_config(profile_id) or 1))
+        adaptive_limit = max(desired * 2, desired + 8)
+        test_limit = min(len(new_configs), adaptive_limit) if config_test_limit is None else min(len(new_configs), config_test_limit)
         to_test=new_configs[:test_limit]
         log.info(f"📊 Testing {len(to_test)} configs... low_cost={low_cost_mode}")
         sem=asyncio.Semaphore(40 if low_cost_mode else 100)
@@ -5421,8 +5427,10 @@ def profile_admin_kb(profile_id):
         )],
         [InlineKeyboardButton(f"🌐 حالت انتشار پروکسی: {'شیشه‌ای' if get_profile_proxy_post_mode(profile_id) == 1 else 'عادی'}", callback_data=f"tgl_prx_mode_{profile_id}", style="primary"),
          InlineKeyboardButton(f"📡 تست Ping: {'✅' if ping_testing else '❌'}", callback_data=f"tgl_ping_test_{profile_id}", style="primary")],
-        [InlineKeyboardButton(f"🧩 کانفیگ: {'✅ عادی' if get_profile_config_post_mode(profile_id) == 0 else 'عادی'}", callback_data=f"set_cfg_post_mode_0_{profile_id}", style="success" if get_profile_config_post_mode(profile_id) == 0 else "primary"),
-         InlineKeyboardButton(f"🧩 کانفیگ: {'✅ Quote جمع‌شونده' if get_profile_config_post_mode(profile_id) == 1 else 'Quote جمع‌شونده'}", callback_data=f"set_cfg_post_mode_1_{profile_id}", style="success" if get_profile_config_post_mode(profile_id) == 1 else "primary")],
+        [InlineKeyboardButton(
+            f"🧩 حالت کانفیگ: {'عادی (COPY CODE)' if get_profile_config_post_mode(profile_id) == 0 else 'Quote جمع‌شونده'} 🔄",
+            callback_data=f"tgl_cfg_post_mode_{profile_id}", style="primary"
+        )],
         [InlineKeyboardButton(f"👁 نمایش Ping: {'✅' if prof.get('show_ping', 1) else '❌'}", callback_data=f"tgl_show_ping_{profile_id}", style="primary"),
          InlineKeyboardButton("📍 تنظیم مناطق Ping", callback_data=f"ping_regions_{profile_id}", style="primary")],
         [InlineKeyboardButton(f"📍 Ping ویتوری: {'🇮🇷 ایران' if get_profile_config_ping_mode(profile_id) == 'iran' else '🌍 جهانی'}", callback_data=f"ping_region_config_{profile_id}", style="primary"),
@@ -8650,10 +8658,13 @@ async def _on_text_impl(u, ctx):
         await u.message.reply_text(msg("profile_added", name=dest_name))
         del ctx.user_data["action"]
         if ENABLE_AUTO:
-            app = u.get_bot()
-            app.create_task(profile_loop_config(app, new_id))
-            app.create_task(profile_loop_proxy(app, new_id))
-            log.info(f"⏰ Started auto loops for new profile {new_id}")
+            bot = u.get_bot()
+            # A new profile must use the same precise scheduler as profiles
+            # loaded at startup. Do not call Bot.create_task (Bot has no such
+            # API); schedule these coroutines on the running event loop.
+            asyncio.create_task(_profile_scheduler_v16(bot, new_id, "config"), name=f"auto_config_{new_id}")
+            asyncio.create_task(_profile_scheduler_v16(bot, new_id, "proxy"), name=f"auto_proxy_{new_id}")
+            log.info(f"⏰ Started precise auto schedulers for new profile {new_id}")
         await show_profiles_list(u.message)
         return
 
@@ -9252,12 +9263,17 @@ async def post_init(app):
     log.info("⏱️ Manual queue scheduler enabled")
 
     if ENABLE_AUTO:
+        # Use the fixed-deadline scheduler as the ONLY automatic scheduler.
+        # The legacy profile_loop_* workers used relative sleeps after each
+        # cycle and are intentionally not started: two schedulers for the same
+        # profile can race on cursors and make config posting appear broken.
         for prof in profiles:
-            log.info(f"⏰ Creating config loop for profile {prof['id']} ({prof['dest_name']})")
-            start_worker(app, f"config_{prof['id']}", lambda pid=prof["id"]: profile_loop_config(app.bot, pid))
-            log.info(f"⏰ Creating proxy loop for profile {prof['id']} ({prof['dest_name']})")
-            start_worker(app, f"proxy_{prof['id']}", lambda pid=prof["id"]: profile_loop_proxy(app.bot, pid))
-        log.info("⏰ Scheduler started for all profiles (config and proxy loops)")
+            pid = int(prof["id"])
+            log.info(f"⏰ Creating precise config scheduler for profile {pid} ({prof['dest_name']})")
+            start_worker(app, f"auto_config_{pid}", lambda pid=pid: _profile_scheduler_v16(app.bot, pid, "config"))
+            log.info(f"⏰ Creating precise proxy scheduler for profile {pid} ({prof['dest_name']})")
+            start_worker(app, f"auto_proxy_{pid}", lambda pid=pid: _profile_scheduler_v16(app.bot, pid, "proxy"))
+        log.info("⏰ Precise automatic scheduler started: config/proxy are fully independent")
 
     start_worker(app, "cleanup", lambda: periodic_cleanup())
     start_worker(app, "database_cleaner", lambda: database_cleanup_worker())
