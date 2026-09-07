@@ -1,5 +1,5 @@
-# bot.py — Version: 0.1.23-PRO
-APP_VERSION = "0.1.23-PRO"
+# bot.py — Version: 0.1.24-STABLE
+APP_VERSION = "0.1.24-STABLE"
 BOT_VERSION = APP_VERSION
 import os
 import re
@@ -1269,7 +1269,10 @@ def _manual_queue_commit_batch(job_id, profile_id, sent_items, error=""):
         update_manual_queue_job(job_id, profile_id, items_json="[]", status="done",
                                 sent_count=sent_count, last_error="")
     else:
-        next_run = _queue_now() + timedelta(minutes=max(0, int(job.get("interval_minutes") or 0)))
+        interval_minutes = max(0, int(job.get("interval_minutes") or 0))
+        # Keep the configured cadence anchored to the actual successful send time.
+        # For interval=0 the queue completes in one send; never spin forever.
+        next_run = _queue_now() + timedelta(minutes=interval_minutes)
         update_manual_queue_job(
             job_id, profile_id,
             items_json=json.dumps(remaining, ensure_ascii=False),
@@ -1355,66 +1358,78 @@ def sqlite_maintenance_cycle():
         log.exception("sqlite maintenance failed")
 
 async def manual_queue_worker(bot):
-    """Persistent scheduler: wakes on the nearest due job, so edits take effect immediately."""
-    log.info("⏱️ Persistent manual-send scheduler started")
-    log.info("[WATCHDOG] manual_queue heartbeat online")
-    last_heartbeat = time.time()
+    """Persistent manual scheduler with second-level deadline accuracy.
+
+    Queue timestamps are stored as timezone-aware Tehran ISO timestamps. Sleeping
+    uses the event loop's monotonic clock so NTP/system-clock changes cannot make
+    a due job wait an extra polling interval.
+    """
+    log.info("⏱️ Persistent manual-send scheduler started | timezone=Asia/Tehran")
+    loop = asyncio.get_running_loop()
     while True:
         try:
-            # Recover jobs left locked by a crashed worker.
-            c.execute("UPDATE manual_send_queue SET status='pending', next_run_at=? WHERE status='running' AND updated_at<?", (_queue_iso(_queue_now()), _queue_iso(_queue_now()-timedelta(minutes=5))))
+            now = _queue_now()
+            # Recover jobs left running by a crashed/restarted process.
+            c.execute(
+                "UPDATE manual_send_queue SET status='pending', next_run_at=?, updated_at=? "
+                "WHERE status='running' AND updated_at<?",
+                (_queue_iso(now), _queue_iso(now), _queue_iso(now - timedelta(minutes=5)))
+            )
             conn.commit()
-            last_heartbeat = time.time()
+
             rows = c.execute(
-                "SELECT id FROM manual_send_queue WHERE status='pending' ORDER BY next_run_at, id LIMIT 20"
+                "SELECT id, next_run_at FROM manual_send_queue "
+                "WHERE status='pending' ORDER BY next_run_at, id LIMIT 50"
             ).fetchall()
             if not rows:
-                await asyncio.sleep(2)
+                await asyncio.sleep(0.5)
                 continue
+
             due_ids = []
             nearest = None
-            now = _queue_now()
-            for (job_id,) in rows:
-                job = get_manual_queue_job(job_id)
-                if not job:
-                    continue
-                due = _queue_parse_time(job["next_run_at"])
+            for job_id, next_run_at in rows:
+                due = _queue_parse_time(next_run_at)
                 if due <= now:
                     due_ids.append(job_id)
                 elif nearest is None or due < nearest:
                     nearest = due
+
             if not due_ids:
-                wait_for = max(0.25, min(2.0, (nearest - now).total_seconds())) if nearest else 2.0
-                await asyncio.sleep(wait_for)
+                # Convert the Tehran wall-clock deadline to a monotonic sleep
+                # duration once, with a tiny guard against float rounding.
+                wait = max(0.01, (nearest - now).total_seconds()) if nearest else 0.5
+                await asyncio.sleep(wait)
                 continue
 
             for job_id in due_ids:
                 job = get_manual_queue_job(job_id)
-                if not job or job["status"] != "pending":
+                if not job or job.get("status") != "pending":
                     continue
-                # Claim the job briefly so two worker iterations cannot double-send it.
-                claimed = update_manual_queue_job(job_id, job["profile_id"], status="running")
+                claimed = update_manual_queue_job(job_id, int(job["profile_id"]), status="running")
                 if not claimed:
                     continue
                 try:
                     sent = await _send_manual_queue_batch(bot, job)
-                    log.info(f"[MANUAL_QUEUE] job={job_id} profile={job['profile_id']} kind={job['kind']} sent={sent}")
+                    log.info(
+                        f"[MANUAL_QUEUE] job={job_id} profile={job['profile_id']} "
+                        f"kind={job['kind']} sent={sent} at={get_tehran_time()}"
+                    )
                 except asyncio.CancelledError:
                     raise
-                except Exception as e:
+                except Exception as exc:
                     log.exception(f"[MANUAL_QUEUE] job={job_id} failed")
-                    update_manual_queue_job(job_id, job["profile_id"], status="pending", last_error=str(e)[:500])
-                    # Prevent a tight retry loop after an exception.
                     update_manual_queue_job(
-                        job_id, job["profile_id"],
+                        job_id, int(job["profile_id"]), status="pending",
+                        last_error=str(exc)[:500],
                         next_run_at=_queue_iso(_queue_now() + timedelta(seconds=10))
                     )
+
         except asyncio.CancelledError:
             log.info("🛑 Persistent manual-send scheduler cancelled")
-            break
+            return
         except Exception:
             log.exception("manual_queue_worker error")
-            await asyncio.sleep(2)
+            await asyncio.sleep(0.5)
 
 # Normalize missing Ping mode to the new default (Global) without overwriting explicit user choices.
 c.execute("UPDATE profiles SET ping_mode=? WHERE ping_mode IS NULL OR TRIM(ping_mode)=?", ("global", ""))
@@ -4316,8 +4331,12 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
 
     # Advance each stream independently. A failed Telegram send MUST NOT move
     # that stream's cursor, otherwise the failed content would be lost forever.
-    config_ok = (not working) or (total_configs > 0)
-    proxy_ok = (not proxy_with_ping) or (total_proxies > 0)
+    # A stream may advance only when there was nothing new to publish OR when
+    # every publishable candidate for that stream was actually delivered.
+    # IMPORTANT: an existing/new candidate that failed validation or Telegram
+    # delivery must remain behind the cursor so the next automatic cycle retries it.
+    config_ok = (not enable_configs) or (not new_configs) or (total_configs > 0)
+    proxy_ok = (not enable_proxies) or (not new_proxies) or (total_proxies > 0)
     for src, newest_id in source_newest_ids.items():
         if not newest_id:
             continue
@@ -4511,44 +4530,125 @@ async def _run_scheduled_profile_cycle(bot, profile_id, mode):
         return 0, "error"
 
 async def _profile_scheduler_v16(bot, profile_id, mode):
-    key=(profile_id, mode)
-    log.info(f"v0.1.16 scheduler started {key}")
+    """Stable interval scheduler.
+
+    - Uses Tehran time for all displayed/saved timestamps.
+    - Uses the event loop monotonic clock for sleeping, preventing wall-clock
+      jumps from making a job run early/late.
+    - Keeps a fixed schedule anchor, so a slow scrape/send cycle does not shift
+      every future run.
+    - Never silently converts an explicit interval=0 setting into 1 minute.
+    """
+    key = (int(profile_id), str(mode))
+    log.info(f"[SCHEDULER] started {key} | timezone=Asia/Tehran")
+    loop = asyncio.get_running_loop()
+    next_deadline = None
+    interval_seconds = None
+
     while True:
         try:
-            profile=get_profile(profile_id)
+            profile = get_profile(profile_id)
             if not profile:
+                log.warning(f"[SCHEDULER] profile {profile_id} disappeared; stopping {mode}")
                 return
+
             if not get_profile_enabled(profile_id):
-                await asyncio.sleep(30)
+                next_deadline = None
+                interval_seconds = None
+                await asyncio.sleep(1.0)
                 continue
 
-            enabled = get_profile_post_configs(profile_id) if mode=="config" else get_profile_post_proxies(profile_id)
-            if not enabled:
-                await asyncio.sleep(30)
+            posting_enabled = (get_profile_post_configs(profile_id) if mode == "config"
+                               else get_profile_post_proxies(profile_id))
+            if not posting_enabled:
+                next_deadline = None
+                interval_seconds = None
+                await asyncio.sleep(1.0)
                 continue
 
-            interval = get_profile_interval_config(profile_id) if mode=="config" else get_profile_interval_proxy(profile_id)
-            interval=max(1, int(interval or 1))
+            raw_interval = get_profile_interval_config(profile_id) if mode == "config" else get_profile_interval_proxy(profile_id)
+            try:
+                interval_minutes = int(raw_interval or 0)
+            except Exception:
+                interval_minutes = 0
+            interval_minutes = max(0, interval_minutes)
 
-            now=datetime.now(TEHRAN_TZ)
-            next_run=_auto_next_runs.get(key)
-            if not next_run:
-                next_run=now
+            # Profile timer is always interpreted in Tehran timezone.
+            timer_expiry = profile.get("timer_expiry")
+            if timer_expiry:
+                try:
+                    expiry = datetime.fromisoformat(timer_expiry)
+                    if expiry.tzinfo is None:
+                        expiry = TEHRAN_TZ.localize(expiry)
+                    expiry = expiry.astimezone(TEHRAN_TZ)
+                    now_tehran = datetime.now(TEHRAN_TZ)
+                    if expiry > now_tehran:
+                        next_deadline = None
+                        interval_seconds = None
+                        await asyncio.sleep(min(1.0, max(0.05, (expiry - now_tehran).total_seconds())))
+                        continue
+                    clear_profile_timer(profile_id)
+                    try:
+                        await bot.send_message(
+                            MAIN_ADMIN_ID,
+                            f"⏰ تایمر پروفایل {profile.get('dest_name','')} (ID: {profile_id}) به پایان رسید. ارسال خودکار از سر گرفته شد."
+                        )
+                    except Exception:
+                        pass
+                    next_deadline = None
+                    interval_seconds = None
+                except Exception:
+                    clear_profile_timer(profile_id)
+                    next_deadline = None
+                    interval_seconds = None
 
-            if now < next_run:
-                await asyncio.sleep(min((next_run-now).total_seconds(),30))
+            # interval=0 retains the legacy instant mode: run, then check again
+            # after a short pause. Positive intervals are scheduled precisely.
+            if interval_minutes == 0:
+                started = datetime.now(TEHRAN_TZ)
+                log.info(f"[SCHEDULER] AUTO TICK {key} at {started.isoformat()} (instant mode)")
+                await _run_scheduled_profile_cycle(bot, profile_id, mode)
+                await asyncio.sleep(0.5)
                 continue
 
-            _auto_next_runs[key]=next_run+timedelta(minutes=interval)
+            seconds = float(interval_minutes * 60)
+            if interval_seconds != seconds or next_deadline is None:
+                # Preserve the bot's established behavior: one immediate cycle
+                # when the worker starts (so enabling AUTO never waits a whole
+                # interval), then every configured interval from that fixed
+                # anchor. This also keeps the cadence independent of scrape time.
+                interval_seconds = seconds
+                next_deadline = loop.time()
 
-            # fire cycle without touching manual queue
+            wait = next_deadline - loop.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+                continue
+
+            scheduled_for = datetime.now(TEHRAN_TZ)
+            log.info(
+                f"[SCHEDULER] AUTO TICK {key} scheduled={scheduled_for.isoformat()} "
+                f"interval={interval_minutes}m"
+            )
+
+            # Advance the schedule BEFORE doing network work. If the cycle is
+            # slow, skip missed slots rather than firing a burst of late posts.
+            now_mono = loop.time()
+            missed = max(0, int((now_mono - next_deadline) // seconds))
+            next_deadline += (missed + 1) * seconds
+
             await _run_scheduled_profile_cycle(bot, profile_id, mode)
 
         except asyncio.CancelledError:
+            log.info(f"[SCHEDULER] cancelled {key}")
             return
         except Exception:
-            log.error(traceback.format_exc())
-            await asyncio.sleep(30)
+            log.exception(f"[SCHEDULER] error in {key}")
+            # Never sleep for 30/60 seconds after a transient error; that would
+            # destroy exact scheduling. Re-enter the deadline calculation quickly.
+            await asyncio.sleep(0.5)
+            if interval_seconds and next_deadline is None:
+                next_deadline = loop.time() + interval_seconds
 
 async def profile_loop_config(bot, profile_id):
     await _profile_scheduler_v16(bot, profile_id, "config")
@@ -5437,7 +5537,6 @@ def source_list_kb(profile_id, page=1):
             nav.append(InlineKeyboardButton("بعدی ▶️", callback_data=f"src_list_{profile_id}_{page+1}", style="primary"))
         btns.append(nav)
     btns.append([InlineKeyboardButton(msg("btn_add_source"), callback_data=f"sa_{profile_id}", style="success")])
-    btns.append([InlineKeyboardButton("📊 بررسی کامل همه منابع", callback_data=f"scan_sources_{profile_id}", style="primary")])
     btns.append([InlineKeyboardButton(msg("btn_back"), callback_data=f"prof_{profile_id}", style="primary")])
     return InlineKeyboardMarkup(btns)
 
@@ -6523,14 +6622,6 @@ async def _on_callback_impl(u, ctx):
                 await q.edit_message_text(txt,reply_markup=source_list_kb(profile_id,page))
             else:
                 await q.answer("❌ منبع پیدا نشد؛ لیست به‌روز شده است.",show_alert=True)
-            return
-
-        if d.startswith("scan_sources_"):
-            try: profile_id=int(d.split("_")[2])
-            except (ValueError,IndexError): await q.answer("⚠️ شناسه نامعتبر"); return
-            await q.edit_message_text("⏳ در حال بررسی کامل همه کانال‌های منبع...\nاین عملیات ممکن است برای منابع بزرگ زمان‌بر باشد.")
-            result=await run_cycle_for_profile(q.get_bot(),profile_id,enable_configs=True,enable_proxies=True,is_instant=False)
-            await q.edit_message_text(f"✅ بررسی کامل همه منابع انجام شد.\nنتیجه: {result[0]} | {result[1]}",reply_markup=source_list_kb(profile_id,1))
             return
 
         if d.startswith("sa_"):
