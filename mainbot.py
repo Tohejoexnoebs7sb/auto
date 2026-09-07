@@ -1,9 +1,9 @@
 # bot.py — 4.1.4
-APP_VERSION = "4.1.8"
+APP_VERSION = "4.1.9"
 APP_VERSION_MAJOR = 4
 APP_VERSION_MINOR = 1
-APP_VERSION_PATCH = 8
-APP_VERSION_LABEL = "4.1.8-stable"
+APP_VERSION_PATCH = 9
+APP_VERSION_LABEL = "4.1.9-stable"
 BOT_VERSION = APP_VERSION
 import os
 import re
@@ -1254,13 +1254,16 @@ def create_manual_queue_job(profile_id, kind, items, interval_minutes=0, batch_s
     return c.lastrowid
 
 def get_manual_queue(profile_id, include_done=False):
+    # The queue UI must retain cancelled jobs so an admin can resume them.
+    # By default we show pending + cancelled; done/failed remain hidden unless
+    # include_done=True. The worker itself still processes ONLY pending rows.
     if include_done:
         rows = c.execute(
             "SELECT * FROM manual_send_queue WHERE profile_id=? ORDER BY next_run_at, id", (profile_id,)
         ).fetchall()
     else:
         rows = c.execute(
-            "SELECT * FROM manual_send_queue WHERE profile_id=? AND status='pending' ORDER BY next_run_at, id",
+            "SELECT * FROM manual_send_queue WHERE profile_id=? AND status IN ('pending','cancelled') ORDER BY next_run_at, id",
             (profile_id,)
         ).fetchall()
     cols = [d[0] for d in c.description]
@@ -1309,7 +1312,19 @@ def update_manual_queue_job(job_id, profile_id, **changes):
     return c.rowcount > 0
 
 def cancel_manual_queue_job(job_id, profile_id):
-    return update_manual_queue_job(job_id, profile_id, status="cancelled")
+    job = get_manual_queue_job(job_id, profile_id)
+    if not job or job.get("status") not in ("pending", "running"):
+        return False
+    return update_manual_queue_job(job_id, profile_id, status="cancelled", last_error="")
+
+def resume_manual_queue_job(job_id, profile_id):
+    job = get_manual_queue_job(job_id, profile_id)
+    if not job or job.get("status") != "cancelled" or not (job.get("items") or []):
+        return False
+    return update_manual_queue_job(
+        job_id, profile_id, status="pending", next_run_at=_queue_iso(_queue_now()),
+        fail_count=0, last_error=""
+    )
 
 def delete_manual_queue_job(job_id, profile_id):
     c.execute("DELETE FROM manual_send_queue WHERE id=? AND profile_id=?", (job_id, profile_id))
@@ -1492,6 +1507,26 @@ def purge_duplicate_ledgers():
 def sqlite_maintenance_cycle():
     return cleanup_expired_runtime_data()
 
+async def _run_manual_queue_batch_isolated(bot, job):
+    """Send one queue batch without racing the profile's automatic cycle.
+
+    Manual queues are persistent and independent, but they must not publish
+    concurrently with the same profile's automatic cycle. Waiting on this
+    per-profile lock prevents duplicate posts and shared cursor corruption.
+    """
+    profile_id = int(job["profile_id"])
+    lock = _PROFILE_CYCLE_LOCKS.get(profile_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _PROFILE_CYCLE_LOCKS[profile_id] = lock
+    async with lock:
+        # Re-read after waiting: the admin may have cancelled/deleted the job
+        # while this task was waiting.
+        fresh = get_manual_queue_job(int(job["id"]), profile_id)
+        if not fresh or fresh.get("status") != "running":
+            return 0
+        return await _send_manual_queue_batch(bot, fresh)
+
 async def manual_queue_worker(bot):
     """Persistent manual scheduler with second-level deadline accuracy.
 
@@ -1503,6 +1538,7 @@ async def manual_queue_worker(bot):
     loop = asyncio.get_running_loop()
     while True:
         try:
+            _WORKER_HEARTBEATS["manual_queue"] = time.time()
             now = _queue_now()
             # Recover jobs left running by a crashed/restarted process.
             c.execute(
@@ -1544,7 +1580,8 @@ async def manual_queue_worker(bot):
                 if not claimed:
                     continue
                 try:
-                    sent = await _send_manual_queue_batch(bot, job)
+                    sent = await _run_manual_queue_batch_isolated(bot, job)
+                    _WORKER_HEARTBEATS["manual_queue"] = time.time()
                     log.info(
                         f"[MANUAL_QUEUE] job={job_id} profile={job['profile_id']} "
                         f"kind={job['kind']} sent={sent} at={get_tehran_time()}"
@@ -5135,15 +5172,17 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
 # lock, so two callers can never publish the same candidate concurrently.
 _PROFILE_CYCLE_LOCKS = {}
 
-async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_proxies=True, is_instant=False):
+async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_proxies=True, is_instant=False, wait_if_running=False):
     pid = int(profile_id)
     lock = _PROFILE_CYCLE_LOCKS.get(pid)
     if lock is None:
         lock = asyncio.Lock()
         _PROFILE_CYCLE_LOCKS[pid] = lock
-    if lock.locked():
+    if lock.locked() and not wait_if_running:
         log.warning("⏭️ [profile=%s] cycle already running; duplicate trigger skipped", pid)
         return 0, "cycle already running"
+    if lock.locked() and wait_if_running:
+        log.info("⏳ [profile=%s] manual run-now is queued behind the current cycle", pid)
     async with lock:
         return await _run_cycle_for_profile_unlocked(
             bot, pid, enable_configs=enable_configs, enable_proxies=enable_proxies, is_instant=is_instant
@@ -6458,7 +6497,9 @@ def manual_queue_list_kb(profile_id, page=1):
         count=len(job.get("items") or [])
         interval=int(job.get("interval_minutes") or 0)
         interval_text="فوری" if interval==0 else f"هر {interval}د"
-        btns.append([InlineKeyboardButton(f"{kind} #{job['id']} • {count} باقی • {interval_text}",callback_data=f"mq_detail_{profile_id}_{job['id']}",style="primary")])
+        status = str(job.get("status") or "pending")
+        status_icon = {"pending": "🟢", "cancelled": "⛔", "running": "🔵", "done": "✅", "failed": "⚠️"}.get(status, "❔")
+        btns.append([InlineKeyboardButton(f"{status_icon} {kind} #{job['id']} • {count} باقی • {interval_text}",callback_data=f"mq_detail_{profile_id}_{job['id']}",style="primary")])
     if not btns: btns.append([InlineKeyboardButton("صف خالی است",callback_data="dummy",style="primary")])
     if total_pages>1:
         nav=[]
@@ -6493,9 +6534,13 @@ def manual_queue_detail_kb(profile_id, job_id, items, item_page=1):
     btns.append([InlineKeyboardButton("✏️ تغییر فاصله زمانی", callback_data=f"mq_edit_interval_{profile_id}_{job_id}", style="primary"),
                  InlineKeyboardButton("📦 تغییر تعداد در هر پست", callback_data=f"mq_edit_batch_{profile_id}_{job_id}", style="primary")])
     btns.append([InlineKeyboardButton("➕ افزودن سرور به این صف", callback_data=f"mq_add_{profile_id}_{job_id}", style="success")])
-    btns.append([InlineKeyboardButton("⏩ ارسال همین پست الان", callback_data=f"mq_force_{profile_id}_{job_id}", style="success")])
-    btns.append([InlineKeyboardButton("⛔ لغو ارسال", callback_data=f"mq_cancel_{profile_id}_{job_id}", style="danger"),
-                 InlineKeyboardButton("🗑 حذف کامل", callback_data=f"mq_delete_{profile_id}_{job_id}", style="danger")])
+    status = str((get_manual_queue_job(job_id, profile_id) or {}).get("status") or "pending")
+    if status == "cancelled":
+        btns.append([InlineKeyboardButton("▶️ خارج کردن از لغو و ادامه ارسال", callback_data=f"mq_resume_{profile_id}_{job_id}", style="success")])
+    elif status == "pending":
+        btns.append([InlineKeyboardButton("⏩ ارسال همین پست الان", callback_data=f"mq_force_{profile_id}_{job_id}", style="success")])
+        btns.append([InlineKeyboardButton("⛔ لغو ارسال", callback_data=f"mq_cancel_{profile_id}_{job_id}", style="danger")])
+    btns.append([InlineKeyboardButton("🗑 حذف کامل صف", callback_data=f"mq_delete_{profile_id}_{job_id}", style="danger")])
     btns.append([InlineKeyboardButton("🔙 صف", callback_data=f"mq_list_{profile_id}", style="primary")])
     return InlineKeyboardMarkup(btns)
 
@@ -6505,6 +6550,8 @@ def manual_queue_text(job):
     interval = int(job.get("interval_minutes") or 0)
     batch = int(job.get("batch_size") or 1)
     status = job.get("status", "pending")
+    status_labels = {"pending": "🟢 در صف", "cancelled": "⛔ لغوشده", "running": "🔵 در حال ارسال", "done": "✅ تکمیل‌شده", "failed": "⚠️ ناموفق"}
+    status_label = status_labels.get(status, status)
     next_run = job.get("next_run_at", "")
     preview = "\n".join(f"{i+1}. {html.escape(str(x)[:100])}" for i, x in enumerate(items[:12]))
     if len(items) > 12:
@@ -6513,7 +6560,7 @@ def manual_queue_text(job):
             f"نوع: {kind}\nباقی‌مانده: <b>{len(items)}</b>\n"
             f"تعداد هر پست: <b>{batch}</b>\n"
             f"فاصله: <b>{'فوری' if interval == 0 else str(interval) + ' دقیقه'}</b>\n"
-            f"وضعیت: <b>{status}</b>\n"
+            f"وضعیت: <b>{status_label}</b>\n"
             f"اجرای بعدی: <code>{html.escape(next_run)}</code>\n\n{preview}")
 
 def timer_menu_kb(profile_id):
@@ -7853,13 +7900,16 @@ async def _on_callback_impl(u, ctx):
                 async def _run_manual_fast():
                     try:
                         _started_mono = asyncio.get_running_loop().time()
+                        _WORKER_HEARTBEATS[f"manual_runnow_{profile_id}"] = time.time()
                         n, m = await asyncio.wait_for(
                             run_cycle_for_profile(
-                                u.get_bot(), profile_id, enable_configs=True, enable_proxies=True, is_instant=True
+                                u.get_bot(), profile_id, enable_configs=True, enable_proxies=True, is_instant=True,
+                                wait_if_running=True
                             ),
-                            timeout=118.0
+                            timeout=300.0
                         )
                         _elapsed = asyncio.get_running_loop().time() - _started_mono
+                        _WORKER_HEARTBEATS.pop(f"manual_runnow_{profile_id}", None)
                         try:
                             await u.get_bot().send_message(
                                 MAIN_ADMIN_ID,
@@ -7868,21 +7918,23 @@ async def _on_callback_impl(u, ctx):
                         except Exception:
                             pass
                     except asyncio.TimeoutError:
+                        _WORKER_HEARTBEATS.pop(f"manual_runnow_{profile_id}", None)
                         log.error(f"❌ runnow timeout for profile {profile_id}")
                         try:
-                            await u.get_bot().send_message(MAIN_ADMIN_ID, "⚠️ اجرای دستی بیش از ۱۱۸ ثانیه طول کشید و برای جلوگیری از کرش متوقف شد.\nجزئیات در لاگ ثبت شده است.")
+                            await u.get_bot().send_message(MAIN_ADMIN_ID, "⚠️ اجرای دستی بیش از ۵ دقیقه طول کشید و متوقف شد.\nجزئیات در لاگ ثبت شده است.")
                         except Exception:
                             pass
                     except Exception as e:
+                        _WORKER_HEARTBEATS.pop(f"manual_runnow_{profile_id}", None)
                         log.exception(f"❌ runnow error for profile {profile_id}")
                         try:
                             await u.get_bot().send_message(MAIN_ADMIN_ID, f"❌ خطای اجرای دستی: {str(e)[:300]}")
                         except Exception:
                             pass
                 task_key = f"manual_runnow_{profile_id}"
-                existing = _WORKER_TASKS.get(task_key)
+                existing = _MANUAL_RUN_TASKS.get(task_key)
                 if existing is None or existing.done():
-                    _WORKER_TASKS[task_key] = asyncio.create_task(_run_manual_fast())
+                    _MANUAL_RUN_TASKS[task_key] = asyncio.create_task(_run_manual_fast())
                 else:
                     try:
                         await u.get_bot().send_message(MAIN_ADMIN_ID, f"⚠️ اجرای دستی پروفایل {profile_id} هنوز در حال انجام است؛ اجرای تکراری شروع نشد.")
@@ -8385,7 +8437,7 @@ async def _on_callback_impl(u, ctx):
             except (ValueError,IndexError):
                 await q.answer("⚠️ شناسه/صفحه نامعتبر",show_alert=True); return
             jobs=get_manual_queue(profile_id)
-            await q.edit_message_text(f"📋 <b>صف ارسال‌های دستی</b>\nتعداد صف فعال: <b>{len(jobs)}</b>\nصفحه: <b>{page}</b>",parse_mode="HTML",reply_markup=manual_queue_list_kb(profile_id,page))
+            await q.edit_message_text(f"📋 <b>صف ارسال‌های دستی</b>\nتعداد صف‌ها: <b>{len(jobs)}</b>\nصفحه: <b>{page}</b>",parse_mode="HTML",reply_markup=manual_queue_list_kb(profile_id,page))
             return
 
         if d.startswith("mq_detail_"):
@@ -8397,9 +8449,9 @@ async def _on_callback_impl(u, ctx):
             except (ValueError, IndexError):
                 await q.answer("⚠️ داده نامعتبر"); return
             job = get_manual_queue_job(job_id, profile_id)
-            if not job or job.get("status") != "pending":
-                await q.answer("این صف دیگر فعال نیست", show_alert=True)
-                await q.edit_message_text("📋 صف فعال", reply_markup=manual_queue_list_kb(profile_id)); return
+            if not job or job.get("status") not in ("pending", "cancelled", "running"):
+                await q.answer("این صف دیگر قابل مدیریت نیست", show_alert=True)
+                await q.edit_message_text("📋 صف ارسال‌های دستی", reply_markup=manual_queue_list_kb(profile_id)); return
             await q.edit_message_text(manual_queue_text(job), parse_mode="HTML", reply_markup=manual_queue_detail_kb(profile_id, job_id, job.get("items") or [], item_page))
             return
 
@@ -8422,17 +8474,50 @@ async def _on_callback_impl(u, ctx):
             parts=d.split("_")
             try: profile_id=int(parts[2]); job_id=int(parts[3])
             except (ValueError,IndexError): await q.answer("⚠️ داده نامعتبر"); return
-            cancel_manual_queue_job(job_id, profile_id)
-            await q.answer("⛔ ارسال لغو شد")
-            await q.edit_message_text("📋 صف فعال", reply_markup=manual_queue_list_kb(profile_id)); return
+            if cancel_manual_queue_job(job_id, profile_id):
+                await q.answer("⛔ ارسال لغو شد؛ صف حذف نشد")
+            else:
+                await q.answer("⚠️ این صف دیگر قابل لغو نیست", show_alert=True)
+            await q.edit_message_text("📋 صف ارسال‌های دستی", reply_markup=manual_queue_list_kb(profile_id)); return
 
-        if d.startswith("mq_delete_"):
+        if d.startswith("mq_resume_"):
             parts=d.split("_")
             try: profile_id=int(parts[2]); job_id=int(parts[3])
             except (ValueError,IndexError): await q.answer("⚠️ داده نامعتبر"); return
+            if resume_manual_queue_job(job_id, profile_id):
+                await q.answer("▶️ صف از حالت لغو خارج شد و آماده ارسال است")
+            else:
+                await q.answer("⚠️ صف قابل بازیابی نیست", show_alert=True)
+            job=get_manual_queue_job(job_id, profile_id)
+            if job:
+                await q.edit_message_text(manual_queue_text(job), parse_mode="HTML", reply_markup=manual_queue_detail_kb(profile_id, job_id, job.get("items") or []))
+            else:
+                await q.edit_message_text("📋 صف ارسال‌های دستی", reply_markup=manual_queue_list_kb(profile_id))
+            return
+
+        if d.startswith("mq_delete_") and not d.startswith("mq_delete_yes_"):
+            parts=d.split("_")
+            try: profile_id=int(parts[2]); job_id=int(parts[3])
+            except (ValueError,IndexError): await q.answer("⚠️ داده نامعتبر"); return
+            if not get_manual_queue_job(job_id, profile_id):
+                await q.answer("صف پیدا نشد", show_alert=True); return
+            await q.edit_message_text(
+                "⚠️ <b>حذف کامل صف</b>\n\nاین کار کل صف و موارد باقی‌مانده آن را برای همیشه حذف می‌کند.\nاگر فقط نمی‌خواهی ارسال شود، از «لغو ارسال» استفاده کن.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🗑 بله، حذف کامل", callback_data=f"mq_delete_yes_{profile_id}_{job_id}", style="danger"),
+                    InlineKeyboardButton("↩️ بازگشت", callback_data=f"mq_detail_{profile_id}_{job_id}", style="primary")
+                ]])
+            )
+            return
+
+        if d.startswith("mq_delete_yes_"):
+            parts=d.split("_")
+            try: profile_id=int(parts[3]); job_id=int(parts[4])
+            except (ValueError,IndexError): await q.answer("⚠️ داده نامعتبر"); return
             delete_manual_queue_job(job_id, profile_id)
-            await q.answer("🗑 صف حذف شد")
-            await q.edit_message_text("📋 صف فعال", reply_markup=manual_queue_list_kb(profile_id)); return
+            await q.answer("🗑 صف به‌طور کامل حذف شد")
+            await q.edit_message_text("📋 صف ارسال‌های دستی", reply_markup=manual_queue_list_kb(profile_id)); return
 
         if d.startswith("mq_add_"):
             parts = d.split("_")
