@@ -1,5 +1,5 @@
-# bot.py — Version: 0.1.24-STABLE
-APP_VERSION = "0.1.24-STABLE"
+# bot.py — Version: 0.1.25-CONFIG-MODES
+APP_VERSION = "0.1.25-CONFIG-MODES"
 BOT_VERSION = APP_VERSION
 import os
 import re
@@ -703,6 +703,12 @@ ensure_column("profiles", "country_display", "INTEGER DEFAULT 2", 2)
 ensure_column("profiles", "show_ping", "INTEGER DEFAULT 1", 1)
 ensure_column("profiles", "proxy_banner_template", "TEXT DEFAULT ''", "")
 ensure_column("profiles", "proxy_post_mode", "INTEGER DEFAULT 0", 0)
+ensure_column("profiles", "config_post_mode", "INTEGER DEFAULT 0", 0)
+try:
+    c.execute("UPDATE profiles SET config_post_mode=0 WHERE config_post_mode IS NULL")
+    conn.commit()
+except Exception:
+    pass
 ensure_column("profiles", "ping_testing", "INTEGER DEFAULT 1", 1)
 ensure_column("profiles", "config_header_enabled", "INTEGER DEFAULT 1", 1)
 ensure_column("profiles", "low_cost_mode", "INTEGER DEFAULT 1", 1)
@@ -3765,6 +3771,7 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
         sponsor_button = InlineKeyboardButton(sponsor["button_text"], url=sponsor["url"], style=btn_style)
 
     config_blocks = []
+    config_mode = get_profile_config_post_mode(profile_id)
     for i, (url, ping, node_count) in enumerate(items, 1):
         n = last_n + i
 
@@ -3857,10 +3864,18 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
             if custom_query and protocol not in ('https', 'tg'):
                 modified_url = add_custom_query_to_url(modified_url, custom_query, protocol)
 
-        block = f"<pre>{modified_url}</pre>"
-        config_blocks.append((header + "\n" if header else "") + block)
+        if config_mode == 1:
+            config_blocks.append(html.escape(modified_url, quote=False))
+        else:
+            block = f"<pre>{modified_url}</pre>"
+            config_blocks.append((header + "\n" if header else "") + block)
 
-    configs_text = "\n\n".join(config_blocks)
+    if config_mode == 1:
+        configs_text = "<blockquote expandable>\n" + "\n".join(
+            f"<code>{line}</code>" for line in config_blocks
+        ) + "\n</blockquote>"
+    else:
+        configs_text = "\n\n".join(config_blocks)
     try:
         full_text = banner_template.format(configs=configs_text)
     except KeyError:
@@ -3879,25 +3894,58 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
         buttons.append([sponsor_button])
     reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
 
-    ok = await send_with_retry(
-        bot, dest, full_text,
-        parse_mode="HTML",
-        reply_markup=reply_markup,
-        disable_web_page_preview=True,
-        max_retries=3
-    )
-    if not ok:
-        plain_text = re.sub(r'<[^>]+>', '', full_text)
-        ok2 = await send_with_retry(
-            bot, dest, plain_text,
-            parse_mode=None,
-            reply_markup=reply_markup,
+    html_messages = [full_text]
+    if config_mode == 1 and len(full_text) > 4096:
+        marker = "__CONFIGS__"
+        try:
+            probe = banner_template.format(configs=marker)
+        except KeyError:
+            probe = f"✦ V2Ray Config List\n\n{marker}\n\n◈ 📢 Channel\n↳ @Auto_Server\n◈ #کانفیگ #ویتوری"
+        before, sep, after = probe.partition(marker)
+        if not sep:
+            before, after = "", ""
+        html_messages = []
+        batch = []
+        for line in config_blocks:
+            candidate = batch + [line]
+            quote = "<blockquote expandable>\n" + "\n".join(f"<code>{x}</code>" for x in candidate) + "\n</blockquote>"
+            if batch and len(before + quote + after) > 4096:
+                quote = "<blockquote expandable>\n" + "\n".join(f"<code>{x}</code>" for x in batch) + "\n</blockquote>"
+                html_messages.append(before + quote + after)
+                batch = [line]
+            else:
+                batch = candidate
+        if batch:
+            quote = "<blockquote expandable>\n" + "\n".join(f"<code>{x}</code>" for x in batch) + "\n</blockquote>"
+            html_messages.append(before + quote + after)
+
+    ok = True
+    for idx, message_text in enumerate(html_messages):
+        sent = await send_with_retry(
+            bot, dest, message_text,
+            parse_mode="HTML",
+            reply_markup=reply_markup if idx == 0 else None,
             disable_web_page_preview=True,
-            max_retries=2
+            max_retries=3
         )
-        if not ok2:
-            log.error(f"❌ Failed to send configs after all retries")
-            return 0
+        if not sent:
+            plain_text = re.sub(r'<[^>]+>', '', message_text)
+            sent = await send_with_retry(
+                bot, dest, plain_text[:4096],
+                parse_mode=None,
+                reply_markup=reply_markup if idx == 0 else None,
+                disable_web_page_preview=True,
+                max_retries=2
+            )
+        if not sent:
+            ok = False
+            break
+        if idx < len(html_messages) - 1:
+            await asyncio.sleep(0.25)
+
+    if not ok:
+        log.error(f"❌ Failed to send configs after all retries")
+        return 0
 
     sent_count = len(items)
     for i, (url, ping, node_count) in enumerate(items, 1):
@@ -4187,25 +4235,10 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
                     if ping_testing:
                         ping, ok, cnt = await check_full_link_ping(u, config_ping_mode, perform_ping=True)
                     else:
-                        # Ping testing disabled: we still check host resolution and TCP? But we don't filter.
-                        # We'll just consider it reachable if we can resolve host.
-                        # However, we still want to avoid posting dead links.
-                        # We'll do a DNS check only.
-                        host, _ = extract_host(u)
-                        if host:
-                            ip = await host_to_ip(host)
-                            if ip:
-                                ping = 0
-                                ok = True
-                                cnt = 0
-                            else:
-                                ok = False
-                                ping = 0
-                                cnt = 0
-                        else:
-                            ok = False
-                            ping = 0
-                            cnt = 0
+                        # Ping testing OFF: never suppress a discovered config.
+                        ping = 0
+                        ok = True
+                        cnt = 0
                     if ok:
                         return u, True, ping, cnt, src
                     else:
@@ -5315,6 +5348,7 @@ def profile_admin_kb(profile_id):
         )],
         [InlineKeyboardButton(f"🌐 حالت انتشار پروکسی: {'شیشه‌ای' if get_profile_proxy_post_mode(profile_id) == 1 else 'عادی'}", callback_data=f"tgl_prx_mode_{profile_id}", style="primary"),
          InlineKeyboardButton(f"📡 تست Ping: {'✅' if ping_testing else '❌'}", callback_data=f"tgl_ping_test_{profile_id}", style="primary")],
+        [InlineKeyboardButton(f"🧩 حالت انتشار کانفیگ: {'Quote جمع‌شونده' if get_profile_config_post_mode(profile_id) == 1 else 'عادی'}", callback_data=f"tgl_cfg_post_mode_{profile_id}", style="primary")],
         [InlineKeyboardButton(f"👁 نمایش Ping: {'✅' if prof.get('show_ping', 1) else '❌'}", callback_data=f"tgl_show_ping_{profile_id}", style="primary"),
          InlineKeyboardButton("📍 تنظیم مناطق Ping", callback_data=f"ping_regions_{profile_id}", style="primary")],
         [InlineKeyboardButton(f"📍 Ping ویتوری: {'🇮🇷 ایران' if get_profile_config_ping_mode(profile_id) == 'iran' else '🌍 جهانی'}", callback_data=f"ping_region_config_{profile_id}", style="primary"),
@@ -7075,6 +7109,19 @@ async def _on_callback_impl(u, ctx):
                 await show_profile_admin(q.message, profile_id)
             else:
                 await q.answer("⚠️ خطا در داده")
+            return
+
+        if d.startswith("tgl_cfg_post_mode_"):
+            try:
+                profile_id = int(d.rsplit("_", 1)[1])
+            except Exception:
+                await q.answer("⚠️ شناسه نامعتبر")
+                return
+            current = get_profile_config_post_mode(profile_id)
+            new_mode = 0 if current == 1 else 1
+            set_profile_config_post_mode(profile_id, new_mode)
+            await q.answer("🧩 حالت Quote جمع‌شونده فعال شد." if new_mode else "🧩 حالت انتشار عادی فعال شد.")
+            await show_profile_admin(q.message, profile_id)
             return
 
         if d.startswith("tgl_prx_mode_"):
