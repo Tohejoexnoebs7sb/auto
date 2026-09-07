@@ -1,9 +1,9 @@
 # bot.py — 4.1.4
-APP_VERSION = "4.1.10"
+APP_VERSION = "4.1.11"
 APP_VERSION_MAJOR = 4
 APP_VERSION_MINOR = 1
-APP_VERSION_PATCH = 10
-APP_VERSION_LABEL = "4.1.10-stable"
+APP_VERSION_PATCH = 11
+APP_VERSION_LABEL = "4.1.11-stable"
 BOT_VERSION = APP_VERSION
 import os
 import re
@@ -69,11 +69,11 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        RotatingFileHandler(
+        # Logs are intentionally reset on every process/redeploy.
+        # The database is untouched; only bot.log is truncated.
+        logging.FileHandler(
             _LOG_FILE,
-            mode='a',
-            maxBytes=2 * 1024 * 1024,
-            backupCount=3,
+            mode='w',
             encoding='utf-8'
         )
     ]
@@ -1340,7 +1340,14 @@ def remove_manual_queue_item(job_id, profile_id, index):
         return False
     items.pop(index)
     if not items:
-        return delete_manual_queue_job(job_id, profile_id)
+        # Removing the final item must NOT destroy the queue. Only the explicit
+        # "delete completely" action is allowed to remove the queue row.
+        return update_manual_queue_job(
+            job_id, profile_id,
+            items_json="[]",
+            status="cancelled",
+            last_error="صف خالی شد؛ برای حذف کامل از گزینه حذف کامل استفاده کنید."
+        )
     return update_manual_queue_job(job_id, profile_id, items_json=json.dumps(items, ensure_ascii=False))
 
 
@@ -5232,25 +5239,57 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
 
 # One cycle at a time per profile. Automatic and manual triggers share this
 # lock, so two callers can never publish the same candidate concurrently.
+# Automatic locks are per profile + stream. Config and proxy of the same
+# profile must never block each other. Combined/manual lanes use their own key.
 _PROFILE_CYCLE_LOCKS = {}
-# Manual sending is deliberately isolated from automatic cycles.
-# It has its own per-profile lock and never acquires the automatic-cycle lock.
+# Manual queue is completely isolated from automatic cycles.
 _MANUAL_QUEUE_LOCKS = {}
+_MANUAL_RUN_LOCKS = {}
+# Callback handlers may be invoked before any worker has been created; keep the
+# registry defined at module load time so run-now can never raise NameError.
+_MANUAL_RUN_TASKS = {}
 
 async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_proxies=True, is_instant=False, wait_if_running=False):
     pid = int(profile_id)
-    lock = _PROFILE_CYCLE_LOCKS.get(pid)
+    if enable_configs and enable_proxies:
+        stream_key = "combined"
+    elif enable_configs:
+        stream_key = "config"
+    elif enable_proxies:
+        stream_key = "proxy"
+    else:
+        return 0, "nothing enabled"
+    lock_key = (pid, stream_key)
+    lock = _PROFILE_CYCLE_LOCKS.get(lock_key)
     if lock is None:
         lock = asyncio.Lock()
-        _PROFILE_CYCLE_LOCKS[pid] = lock
+        _PROFILE_CYCLE_LOCKS[lock_key] = lock
     if lock.locked() and not wait_if_running:
-        log.warning("⏭️ [profile=%s] cycle already running; duplicate trigger skipped", pid)
+        log.warning("⏭️ [profile=%s][stream=%s] cycle already running; duplicate trigger skipped", pid, stream_key)
         return 0, "cycle already running"
     if lock.locked() and wait_if_running:
-        log.info("⏳ [profile=%s] manual run-now is queued behind the current cycle", pid)
+        log.info("⏳ [profile=%s][stream=%s] waiting for current cycle", pid, stream_key)
     async with lock:
         return await _run_cycle_for_profile_unlocked(
             bot, pid, enable_configs=enable_configs, enable_proxies=enable_proxies, is_instant=is_instant
+        )
+
+async def _run_manual_runnow_isolated(bot, profile_id):
+    """Run Now lane independent from AUTO config/proxy locks.
+
+    It intentionally uses the same tested cycle implementation, but acquires a
+    dedicated manual lock instead of waiting behind an automatic stream.
+    Dedup still protects already-posted items, while the manual trigger cannot
+    deadlock on AUTO.
+    """
+    pid = int(profile_id)
+    lock = _MANUAL_RUN_LOCKS.get(pid)
+    if lock is None:
+        lock = asyncio.Lock()
+        _MANUAL_RUN_LOCKS[pid] = lock
+    async with lock:
+        return await _run_cycle_for_profile_unlocked(
+            bot, pid, enable_configs=True, enable_proxies=True, is_instant=True
         )
 
 # ======================================================================
@@ -7967,9 +8006,8 @@ async def _on_callback_impl(u, ctx):
                         _started_mono = asyncio.get_running_loop().time()
                         _WORKER_HEARTBEATS[f"manual_runnow_{profile_id}"] = time.time()
                         n, m = await asyncio.wait_for(
-                            run_cycle_for_profile(
-                                u.get_bot(), profile_id, enable_configs=True, enable_proxies=True, is_instant=True,
-                                wait_if_running=True
+                            _run_manual_runnow_isolated(
+                                u.get_bot(), profile_id
                             ),
                             timeout=300.0
                         )
@@ -9994,12 +10032,12 @@ async def process_manual_text(u, message, profile_id, is_document=False, ctx=Non
         for link in config_links:
             link = clean_config_url(link.strip())
             ok, _ = validate_config_link(link)
-            if ok and not is_already_posted(profile_id, link):
+            if ok:
                 valid_configs.append(link)
         valid_proxies = []
         for pl in proxy_links:
             norm = normalize_proxy_url(pl)
-            if norm and is_telegram_proxy_url(norm) and not is_proxy_posted(profile_id, norm):
+            if norm and is_telegram_proxy_url(norm):
                 valid_proxies.append(norm)
         valid_configs = list(dict.fromkeys(valid_configs))
         valid_proxies = list(dict.fromkeys(valid_proxies))
@@ -10268,8 +10306,14 @@ async def _profile_scheduler_supervisor(app):
             if ENABLE_AUTO:
                 for prof in get_profiles():
                     pid=int(prof["id"])
-                    start_worker(app, f"auto_config_{pid}", lambda pid=pid: _profile_scheduler_v16(app.bot, pid, "config"))
-                    start_worker(app, f"auto_proxy_{pid}", lambda pid=pid: _profile_scheduler_v16(app.bot, pid, "proxy"))
+                    if get_profile_post_configs(pid):
+                        start_worker(app, f"auto_config_{pid}", lambda pid=pid: _profile_scheduler_v16(app.bot, pid, "config"))
+                    else:
+                        log.info(f"[AUTO-SUPERVISOR] profile={pid} config disabled by profile setting")
+                    if get_profile_post_proxies(pid):
+                        start_worker(app, f"auto_proxy_{pid}", lambda pid=pid: _profile_scheduler_v16(app.bot, pid, "proxy"))
+                    else:
+                        log.info(f"[AUTO-SUPERVISOR] profile={pid} proxy disabled by profile setting")
             await asyncio.sleep(10)
         except asyncio.CancelledError:
             return
@@ -10321,6 +10365,14 @@ async def post_init(app):
         log.info(f"✅ Created default profile with id {new_id}.")
         profiles = get_profiles()
     log.info(f"✅ INIT done: {len(profiles)} profiles, AUTO={ENABLE_AUTO}")
+    for _prof in profiles:
+        log.info(
+            f"[PROFILE-BOOT] id={_prof['id']} dest={_prof.get('dest_name','')} "
+            f"enabled={int(_prof.get('profile_enabled', 1) or 0)} "
+            f"config={int(_prof.get('post_configs', 0) or 0)} "
+            f"proxy={int(_prof.get('post_proxies', 0) or 0)} "
+            f"intervals=({_prof.get('interval_config',0)},{_prof.get('interval_proxy',0)})"
+        )
     # Load permanent dedup identities once. Hot posting paths then avoid SQLite
     # lookups entirely; profiles/settings remain untouched.
     load_dedup_cache()
