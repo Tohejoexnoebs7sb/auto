@@ -1,4 +1,6 @@
-APP_VERSION = "0.1.22-FINAL"
+# bot.py — Version: 0.1.23-PRO
+APP_VERSION = "0.1.23-PRO"
+BOT_VERSION = APP_VERSION
 import os
 import re
 import asyncio
@@ -53,6 +55,9 @@ os.makedirs(BACKUP_DIR, exist_ok=True)
 # تنظیم لاگ
 # ======================================================================
 from logging.handlers import RotatingFileHandler
+
+# All bot-visible/logged timestamps use Tehran time.
+logging.Formatter.converter = lambda *args: datetime.now(pytz.timezone("Asia/Tehran")).timetuple()
 
 _LOG_FILE = os.path.join(DATA_DIR, "bot.log")
 logging.basicConfig(
@@ -937,7 +942,7 @@ def migrate_old_config():
             (dest, old_sources, old_banner_config, old_banner_proxy,
              old_interval, old_max_post, old_max_proxies,
              old_post_configs, old_post_proxies, old_ping_mode, old_last_num,
-             datetime.now().isoformat(), 1, "", 1, 1, "", 0, None, 0, 1000,
+             get_tehran_time(), 1, "", 1, 1, "", 0, None, 0, 1000,
              old_interval, old_interval, old_max_post, old_max_proxies,
              "{Flag} | ⚡️Telegram = {CHANNEL_ID}", "", 1, 1, 2, 1, "", 0, 1))
     conn.commit()
@@ -3431,19 +3436,20 @@ async def scrape_channel_paginated(profile_id, channel, max_pages=5, stream="com
     newest_seen_id = ""
     stopped = False
 
-    effective_max_pages = max_pages
+    # None/0 means exhaustive scan; never artificially stop at 2/3/5 pages.
+    effective_max_pages = None if max_pages in (None, 0) else int(max_pages)
     if stream == "proxy" and not last_msg_id:
         # Existing installations may have no proxy cursor. Scan a small recent
         # window so proxies on the newest few pages are not missed. Dedup/state
         # protection prevents reposting already published proxies.
-        effective_max_pages = min(max_pages, 3)
+        effective_max_pages = None if max_pages in (None, 0) else int(max_pages)
 
     log.info(
         f"🔍 [profile={profile_id}][stream={stream}] Starting scrape for "
         f"{clean_channel} (max {effective_max_pages} pages, last_msg_id={last_msg_id or 'NONE'})"
     )
 
-    while page_count < effective_max_pages and not stopped:
+    while (effective_max_pages is None or page_count < effective_max_pages) and not stopped:
         page_count += 1
         log.info(
             f"🔍 [profile={profile_id}][stream={stream}] Scraping page "
@@ -3515,7 +3521,7 @@ async def scrape_channel_paginated(profile_id, channel, max_pages=5, stream="com
 
 async def _scrape_single_page_with_messages(url, channel):
     headers = {
-        "User-Agent": _USER_AGENTS[hash(datetime.now().timestamp()) % len(_USER_AGENTS)],
+        "User-Agent": _USER_AGENTS[hash(datetime.now(TEHRAN_TZ).timestamp()) % len(_USER_AGENTS)],
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9,fa;q=0.8",
         "Accept-Encoding": "gzip, deflate, br",
@@ -4093,21 +4099,34 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
 
     # Low-cost mode reduces Railway network/CPU usage.
     low_cost_mode=get_profile_low_cost_mode(profile_id)
-    scrape_pages=2 if low_cost_mode else 5
-    config_test_limit=10 if low_cost_mode else 30
+    # Exhaustive source scan: keep paging until the stored cursor or channel history ends.
+    # Low-cost mode now controls ping/test intensity only; it must never hide source messages.
+    scrape_pages=None
+    config_test_limit = None  # exhaustive source processing; never hide configs behind a 10/30-item scan cap
     # Scrape all sources in parallel
     async def scrape_one(src):
-        config_links, proxy_links, newest_id = await scrape_channel_paginated(
-            profile_id, src, max_pages=scrape_pages, stream=stream
-        )
-        return src, config_links, proxy_links, newest_id
+        last_exc = None
+        for attempt in range(1, 4):
+            try:
+                config_links, proxy_links, newest_id = await scrape_channel_paginated(
+                    profile_id, src, max_pages=scrape_pages, stream=stream
+                )
+                return src, config_links, proxy_links, newest_id
+            except Exception as exc:
+                last_exc = exc
+                log.warning(f"⚠️ [profile={profile_id}] source={src} scrape attempt {attempt}/3 failed: {exc}")
+                if attempt < 3:
+                    await asyncio.sleep(min(10, attempt * 2))
+        raise RuntimeError(f"source {src} failed after 3 attempts: {last_exc}")
 
     scrape_tasks = [scrape_one(src) for src in sources]
     results = await asyncio.gather(*scrape_tasks, return_exceptions=True)
+    failed_sources = []
 
     for res in results:
         if isinstance(res, Exception):
             log.warning(f"Scrape error: {res}")
+            failed_sources.append(str(res))
             continue
         src, config_links, proxy_links, newest_id = res
         source_newest_ids[src] = newest_id
@@ -4141,7 +4160,7 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
     working = []
     if enable_configs and new_configs:
         # Test configs in batches
-        test_limit=min(len(new_configs),config_test_limit)
+        test_limit=len(new_configs) if config_test_limit is None else min(len(new_configs), config_test_limit)
         to_test=new_configs[:test_limit]
         log.info(f"📊 Testing {len(to_test)} configs... low_cost={low_cost_mode}")
         sem=asyncio.Semaphore(20 if low_cost_mode else 50)
@@ -4313,6 +4332,8 @@ async def run_cycle_for_profile(bot, profile_id, enable_configs=True, enable_pro
             set_stream_last_message_id(profile_id, src, "proxy", newest_id)
 
     result_msg = f"posted {total_configs} configs and {total_proxies} proxies"
+    if failed_sources:
+        result_msg += f" | failed sources: {len(failed_sources)} (cursor not advanced for failed sources)"
     if total_configs == 0 and total_proxies == 0:
         result_msg = "no new content to send"
 
@@ -4609,7 +4630,7 @@ async def delete_file_after_delay(filepath, delay_seconds):
     except Exception as e:
         log.error(f"Error deleting file {filepath}: {e}")
 
-BOT_START_TIME = datetime.now(timezone.utc)
+BOT_START_TIME = datetime.now(TEHRAN_TZ)
 
 async def get_logs(update, context, profile_id, log_type="full", time_range_minutes=30):
     """Export the actual rotating bot.log files; safe for callback buttons too."""
@@ -4699,8 +4720,8 @@ async def periodic_cleanup():
         try:
             log_file_path = os.path.join(DATA_DIR, "bot.log")
             if os.path.exists(log_file_path):
-                now_utc = datetime.now(timezone.utc)
-                cutoff_utc = now_utc - timedelta(minutes=30)
+                now_tehran = datetime.now(TEHRAN_TZ)
+                cutoff_tehran = now_tehran - timedelta(minutes=30)
                 lines_to_keep = []
                 with open(log_file_path, 'r', encoding='utf-8') as f:
                     for line in f:
@@ -4709,7 +4730,7 @@ async def periodic_cleanup():
                             ts_str = match.group(1)
                             try:
                                 ts = normalize_datetime_value(ts_str)
-                                if ts >= cutoff_utc:
+                                if ts >= cutoff_tehran:
                                     lines_to_keep.append(line)
                             except:
                                 lines_to_keep.append(line)
@@ -5087,13 +5108,27 @@ def main_menu_kb():
         [InlineKeyboardButton(msg("btn_balance"), callback_data="show_balance", style="primary")],
     ])
 
-def profiles_kb():
+PROFILE_PAGE_SIZE = 20
+
+def profiles_kb(page=1):
     profiles = get_profiles()
-    btns = []
-    for p in profiles:
+    try: page=max(1,int(page))
+    except (TypeError,ValueError): page=1
+    total_pages=max(1,(len(profiles)+PROFILE_PAGE_SIZE-1)//PROFILE_PAGE_SIZE)
+    page=min(page,total_pages)
+    btns=[]
+    start=(page-1)*PROFILE_PAGE_SIZE
+    for p in profiles[start:start+PROFILE_PAGE_SIZE]:
         status = "✅" if get_profile_enabled(p['id']) else "⛔"
         btns.append([InlineKeyboardButton(f"{status} {p['dest_name']} (ID:{p['id']})", callback_data=f"prof_{p['id']}", style="primary")])
+    if total_pages>1:
+        nav=[]
+        if page>1: nav.append(InlineKeyboardButton("◀️ قبلی", callback_data=f"profiles_page_{page-1}", style="primary"))
+        nav.append(InlineKeyboardButton(f"صفحه {page}/{total_pages}", callback_data="dummy", style="primary"))
+        if page<total_pages: nav.append(InlineKeyboardButton("بعدی ▶️", callback_data=f"profiles_page_{page+1}", style="primary"))
+        btns.append(nav)
     btns.append([InlineKeyboardButton("➕ Add Profile", callback_data="prof_add", style="success")])
+    btns.append([InlineKeyboardButton("📜 فعالیت ۵۰ عمل آخر", callback_data="activity_log", style="primary")])
     btns.append([InlineKeyboardButton(msg("btn_back"), callback_data="back_home", style="primary")])
     return InlineKeyboardMarkup(btns)
 
@@ -5245,15 +5280,23 @@ def destinations_kb(profile_id):
     btns.append([InlineKeyboardButton(msg("btn_back"), callback_data=f"prof_{profile_id}", style="primary")])
     return InlineKeyboardMarkup(btns)
 
-def sponsor_list_kb(profile_id):
-    sponsors = get_sponsors(profile_id, include_disabled=True)
-    btns = []
-    if sponsors:
-        for sp in sponsors:
-            status = "✅" if sp["enabled"] else "❌"
-            btns.append([InlineKeyboardButton(f"{status} {sp['name']} (اولویت:{sp['priority']})", callback_data=f"sp_detail_{sp['id']}", style="primary")])
-    btns.append([InlineKeyboardButton("➕ افزودن اسپانسر", callback_data=f"sp_add_step_{profile_id}_name", style="success")])
-    btns.append([InlineKeyboardButton(msg("btn_back"), callback_data=f"prof_{profile_id}", style="primary")])
+def sponsor_list_kb(profile_id, page=1):
+    sponsors=get_sponsors(profile_id,include_disabled=True); per_page=20
+    try: page=max(1,int(page))
+    except (TypeError,ValueError): page=1
+    total_pages=max(1,(len(sponsors)+per_page-1)//per_page); page=min(page,total_pages); start=(page-1)*per_page
+    btns=[]
+    for sp in sponsors[start:start+per_page]:
+        status="✅" if sp["enabled"] else "❌"
+        btns.append([InlineKeyboardButton(f"{status} {sp['name']} (اولویت:{sp['priority']})",callback_data=f"sp_detail_{sp['id']}",style="primary")])
+    if total_pages>1:
+        nav=[]
+        if page>1: nav.append(InlineKeyboardButton("◀️ قبلی",callback_data=f"sponsor_list_{profile_id}_{page-1}",style="primary"))
+        nav.append(InlineKeyboardButton(f"صفحه {page}/{total_pages}",callback_data="dummy",style="primary"))
+        if page<total_pages: nav.append(InlineKeyboardButton("بعدی ▶️",callback_data=f"sponsor_list_{profile_id}_{page+1}",style="primary"))
+        btns.append(nav)
+    btns.append([InlineKeyboardButton("➕ افزودن اسپانسر",callback_data=f"sp_add_step_{profile_id}_name",style="success")])
+    btns.append([InlineKeyboardButton(msg("btn_back"),callback_data=f"prof_{profile_id}",style="primary")])
     return InlineKeyboardMarkup(btns)
 
 def sponsor_detail_kb(sponsor_id, profile_id):
@@ -5281,13 +5324,120 @@ def sponsor_edit_kb(sponsor_id, profile_id):
         [InlineKeyboardButton("🔙 برگشت", callback_data=f"sp_detail_{sponsor_id}", style="primary")],
     ])
 
-def source_list_kb(profile_id):
+# ======================================================================
+# Admin audit log (last 50 actions, Tehran time)
+# ======================================================================
+
+c.execute("""CREATE TABLE IF NOT EXISTS admin_activity (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    admin_id INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    details TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)""")
+c.execute("CREATE INDEX IF NOT EXISTS idx_admin_activity_created ON admin_activity(id DESC)")
+conn.commit()
+
+_AUDIT_TABLES = ("profiles", "sponsors", "blacklist", "admins", "profile_protocol_settings", "manual_send_queue")
+
+def _audit_snapshot():
+    snap = {}
+    db = get_conn()
+    try:
+        for table in _AUDIT_TABLES:
+            try:
+                rows = db.execute(f"SELECT * FROM {table}").fetchall()
+                cols = [x[1] for x in db.execute(f"PRAGMA table_info({table})").fetchall()]
+                snap[table] = {str(row[0]): dict(zip(cols,row)) for row in rows}
+            except Exception:
+                snap[table] = {}
+    finally:
+        db.close()
+    return snap
+
+def _fmt_audit_value(v):
+    if v is None: return "NULL"
+    text = str(v)
+    return text if len(text) <= 1200 else text[:1200] + "…[truncated]"
+
+def _audit_diff(before, after):
+    out=[]
+    for table in _AUDIT_TABLES:
+        b=before.get(table,{}) ; a=after.get(table,{})
+        for key in sorted(set(b)-set(a)):
+            out.append(f"[حذف] جدول={table} شناسه={key} | داده={json.dumps(b[key],ensure_ascii=False,default=str)}")
+        for key in sorted(set(a)-set(b)):
+            out.append(f"[افزودن] جدول={table} شناسه={key} | داده={json.dumps(a[key],ensure_ascii=False,default=str)}")
+        for key in sorted(set(a)&set(b)):
+            changes=[]
+            for col in a[key]:
+                if a[key].get(col) != b[key].get(col):
+                    changes.append(f"{col}: {_fmt_audit_value(b[key].get(col))} -> {_fmt_audit_value(a[key].get(col))}")
+            if changes:
+                out.append(f"[تغییر] جدول={table} شناسه={key} | " + " | ".join(changes))
+    return out
+
+def _record_admin_activity(admin_id, action, before=None, after=None, extra=""):
+    try:
+        details = []
+        if before is not None and after is not None:
+            details.extend(_audit_diff(before, after))
+        if extra: details.append(str(extra))
+        if not details: details.append("بدون تغییر در دیتابیس؛ عمل مدیریتی/ناوبری ثبت شد.")
+        text = "\n".join(details)
+        db=get_conn()
+        db.execute("INSERT INTO admin_activity(admin_id,action,details,created_at) VALUES(?,?,?,?)", (int(admin_id), str(action)[:200], text, get_tehran_time()))
+        db.execute("DELETE FROM admin_activity WHERE id NOT IN (SELECT id FROM admin_activity ORDER BY id DESC LIMIT 500)")
+        db.commit(); db.close()
+    except Exception:
+        log.exception("admin audit write failed")
+
+def _activity_report(limit=50):
+    db=get_conn()
+    try:
+        rows=db.execute("SELECT id,admin_id,action,details,created_at FROM admin_activity ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
+    finally: db.close()
+    lines=[f"BOT ADMIN ACTIVITY | version={APP_VERSION}", f"Timezone: Asia/Tehran", f"Generated: {get_tehran_time()}", "="*90]
+    for i,(aid,admin_id,action,details,created_at) in enumerate(rows,1):
+        lines += [f"\n#{i} | Activity ID: {aid}", f"زمان تهران: {created_at}", f"ادمین: {admin_id}", f"عمل: {action}", "جزئیات:", details, "-"*90]
+    if not rows: lines.append("هیچ فعالیتی ثبت نشده است.")
+    return "\n".join(lines)
+
+async def _send_activity_file(message):
+    path=os.path.join(DATA_DIR, f"admin_activity_{datetime.now(TEHRAN_TZ).strftime('%Y%m%d_%H%M%S')}.txt")
+    try:
+        with open(path,"w",encoding="utf-8") as f: f.write(_activity_report(50))
+        with open(path,"rb") as f: await message.reply_document(document=f, filename="admin_activity_50.txt", caption=f"📜 ۵۰ فعالیت آخر ادمین — زمان تهران: {get_tehran_time()}")
+    finally:
+        try: os.remove(path)
+        except OSError: pass
+
+SOURCE_PAGE_SIZE = 20
+
+def source_list_kb(profile_id, page=1):
     sources = get_profile_sources(profile_id)
+    try:
+        page = max(1, int(page))
+    except (TypeError, ValueError):
+        page = 1
+    total_pages = max(1, (len(sources) + SOURCE_PAGE_SIZE - 1) // SOURCE_PAGE_SIZE)
+    page = min(page, total_pages)
     btns = []
-    if sources:
-        for i, src in enumerate(sources):
-            btns.append([InlineKeyboardButton(f"❌ {src}", callback_data=f"src_del_{profile_id}_{i}", style="danger")])
+    start = (page - 1) * SOURCE_PAGE_SIZE
+    for offset, src in enumerate(sources[start:start + SOURCE_PAGE_SIZE]):
+        idx = start + offset
+        label = src if len(src) <= 48 else src[:45] + "..."
+        btns.append([InlineKeyboardButton(f"❌ {idx + 1}. {label}", callback_data=f"src_del_{profile_id}_{idx}_{page}", style="danger")])
+    if total_pages > 1:
+        nav = []
+        if page > 1:
+            nav.append(InlineKeyboardButton("◀️ قبلی", callback_data=f"src_list_{profile_id}_{page-1}", style="primary"))
+        nav.append(InlineKeyboardButton(f"صفحه {page}/{total_pages}", callback_data="dummy", style="primary"))
+        if page < total_pages:
+            nav.append(InlineKeyboardButton("بعدی ▶️", callback_data=f"src_list_{profile_id}_{page+1}", style="primary"))
+        btns.append(nav)
     btns.append([InlineKeyboardButton(msg("btn_add_source"), callback_data=f"sa_{profile_id}", style="success")])
+    btns.append([InlineKeyboardButton("📊 بررسی کامل همه منابع", callback_data=f"scan_sources_{profile_id}", style="primary")])
     btns.append([InlineKeyboardButton(msg("btn_back"), callback_data=f"prof_{profile_id}", style="primary")])
     return InlineKeyboardMarkup(btns)
 
@@ -5297,16 +5447,25 @@ def empty_button_kb(profile_id, callback):
         [InlineKeyboardButton(msg("btn_back"), callback_data=f"prof_{profile_id}", style="primary")]
     ])
 
-def blacklist_kb(profile_id):
-    words = get_blacklist(profile_id)
-    btns = []
-    if words:
-        for w in words:
-            btns.append([InlineKeyboardButton(f"❌ {w}", callback_data=f"bl_del_{profile_id}_{w}", style="danger")])
-    btns.append([InlineKeyboardButton("➕ افزودن", callback_data=f"bl_add_{profile_id}", style="success")])
-    if words:
-        btns.append([InlineKeyboardButton("🗑 پاک کردن همه", callback_data=f"bl_clear_{profile_id}", style="danger")])
-    btns.append([InlineKeyboardButton(msg("btn_back"), callback_data=f"prof_{profile_id}", style="primary")])
+def blacklist_kb(profile_id,page=1):
+    words=get_blacklist(profile_id); per_page=20
+    try: page=max(1,int(page))
+    except (TypeError,ValueError): page=1
+    total_pages=max(1,(len(words)+per_page-1)//per_page); page=min(page,total_pages); start=(page-1)*per_page
+    btns=[]
+    for w in words[start:start+per_page]:
+        # Encode word safely in callback data; callback size is limited, so use row index.
+        idx=words.index(w,start) if False else start + words[start:start+per_page].index(w)
+        btns.append([InlineKeyboardButton(f"❌ {idx+1}. {w}",callback_data=f"bl_del_{profile_id}_{idx}_{page}",style="danger")])
+    if total_pages>1:
+        nav=[]
+        if page>1: nav.append(InlineKeyboardButton("◀️ قبلی",callback_data=f"bl_list_{profile_id}_{page-1}",style="primary"))
+        nav.append(InlineKeyboardButton(f"صفحه {page}/{total_pages}",callback_data="dummy",style="primary"))
+        if page<total_pages: nav.append(InlineKeyboardButton("بعدی ▶️",callback_data=f"bl_list_{profile_id}_{page+1}",style="primary"))
+        btns.append(nav)
+    btns.append([InlineKeyboardButton("➕ افزودن",callback_data=f"bl_add_{profile_id}",style="success")])
+    if words: btns.append([InlineKeyboardButton("🗑 پاک کردن همه",callback_data=f"bl_clear_{profile_id}",style="danger")])
+    btns.append([InlineKeyboardButton(msg("btn_back"),callback_data=f"prof_{profile_id}",style="primary")])
     return InlineKeyboardMarkup(btns)
 
 def backup_export_type_kb(profile_id):
@@ -5379,11 +5538,24 @@ def manual_queue_list_kb(profile_id, page=1):
 
 def manual_queue_detail_kb(profile_id, job_id, items, item_page=1):
     btns = []
-    for i, item in enumerate(paginate_items(items, item_page, 25)):
+    per_page = 25
+    try: item_page = max(1, int(item_page))
+    except (TypeError, ValueError): item_page = 1
+    total_pages = max(1, (len(items) + per_page - 1) // per_page)
+    item_page = min(item_page, total_pages)
+    start = (item_page - 1) * per_page
+    for offset, item in enumerate(items[start:start + per_page]):
+        idx = start + offset
         label = str(item)
         if len(label) > 42:
             label = label[:39] + "..."
-        btns.append([InlineKeyboardButton(f"🗑 حذف {i+1}: {label}", callback_data=f"mq_rm_{profile_id}_{job_id}_{i}", style="danger")])
+        btns.append([InlineKeyboardButton(f"🗑 حذف {idx+1}: {label}", callback_data=f"mq_rm_{profile_id}_{job_id}_{idx}_{item_page}", style="danger")])
+    if total_pages > 1:
+        nav = []
+        if item_page > 1: nav.append(InlineKeyboardButton("◀️ قبلی", callback_data=f"mq_detail_{profile_id}_{job_id}_{item_page-1}", style="primary"))
+        nav.append(InlineKeyboardButton(f"صفحه {item_page}/{total_pages}", callback_data="dummy", style="primary"))
+        if item_page < total_pages: nav.append(InlineKeyboardButton("بعدی ▶️", callback_data=f"mq_detail_{profile_id}_{job_id}_{item_page+1}", style="primary"))
+        btns.append(nav)
     btns.append([InlineKeyboardButton("✏️ تغییر فاصله زمانی", callback_data=f"mq_edit_interval_{profile_id}_{job_id}", style="primary"),
                  InlineKeyboardButton("📦 تغییر تعداد در هر پست", callback_data=f"mq_edit_batch_{profile_id}_{job_id}", style="primary")])
     btns.append([InlineKeyboardButton("➕ افزودن سرور به این صف", callback_data=f"mq_add_{profile_id}_{job_id}", style="success")])
@@ -5447,6 +5619,7 @@ def general_settings_kb():
         [InlineKeyboardButton(msg("btn_backup"), callback_data="backup_db", style="primary")],
         [InlineKeyboardButton(msg("btn_replace_database"), callback_data="replace_db", style="danger")],
         [InlineKeyboardButton("🧪 دیباگ عمیق با شماره لاین", callback_data="run_deep_debug", style="primary")],
+        [InlineKeyboardButton("📜 فعالیت ۵۰ عمل آخر ادمین", callback_data="activity_log", style="primary")],
         [InlineKeyboardButton(msg("btn_back"), callback_data="back_home", style="primary")],
     ])
 
@@ -5457,6 +5630,23 @@ def manage_admins_kb():
         [InlineKeyboardButton(msg("btn_list_admins"), callback_data="list_admins", style="primary")],
         [InlineKeyboardButton(msg("btn_back"), callback_data="general_settings", style="primary")],
     ])
+
+def admin_list_kb(page=1):
+    admins=list_admins(); per_page=20
+    try: page=max(1,int(page))
+    except (TypeError,ValueError): page=1
+    total_pages=max(1,(len(admins)+per_page-1)//per_page); page=min(page,total_pages)
+    btns=[]
+    if total_pages>1:
+        nav=[]
+        if page>1: nav.append(InlineKeyboardButton("◀️ قبلی",callback_data=f"list_admins_{page-1}",style="primary"))
+        nav.append(InlineKeyboardButton(f"صفحه {page}/{total_pages}",callback_data="dummy",style="primary"))
+        if page<total_pages: nav.append(InlineKeyboardButton("بعدی ▶️",callback_data=f"list_admins_{page+1}",style="primary"))
+        btns.append(nav)
+    btns.append([InlineKeyboardButton("➕ افزودن ادمین",callback_data="add_admin",style="success")])
+    btns.append([InlineKeyboardButton("🗑 حذف ادمین",callback_data="remove_admin",style="danger")])
+    btns.append([InlineKeyboardButton(msg("btn_back"),callback_data="manage_admins",style="primary")])
+    return InlineKeyboardMarkup(btns)
 
 # ======================================================================
 # دستورات (بدون تغییر)
@@ -5490,7 +5680,7 @@ async def cmd_balance(u, ctx):
         txt = "💰 اعتبار سرویس در دسترس نیست."
     await u.message.reply_text(txt, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(msg("btn_back"), callback_data="back_home", style="primary")]]))
 
-async def show_profiles_list(msg_or_q):
+async def show_profiles_list(msg_or_q, page=1):
     profiles = get_profiles()
     if not profiles:
         txt = "❌ هیچ پروفایلی وجود ندارد.\nبرای ساخت، دکمه Add را بزنید."
@@ -5500,7 +5690,7 @@ async def show_profiles_list(msg_or_q):
             status = "✅" if get_profile_enabled(p['id']) else "⛔"
             lines.append(f"• {status} `{p['dest_name']}` (ID: {p['id']}) – {len(get_profile_sources(p['id']))} منبع, بازه کانفیگ:{p.get('interval_config',5)}m, بازه پروکسی:{p.get('interval_proxy',5)}m")
         txt = msg("profile_list", list="\n".join(lines))
-    kb = profiles_kb()
+    kb = profiles_kb(page)
     try:
         if hasattr(msg_or_q, "edit_text"):
             await msg_or_q.edit_text(txt, parse_mode="HTML", reply_markup=kb)
@@ -5678,7 +5868,7 @@ def clear_pending_input_state(ctx):
         ctx.user_data.pop(key, None)
 
 
-async def on_callback(u, ctx):
+async def _on_callback_impl(u, ctx):
     q = u.callback_query
     try:
         if not is_admin(q.from_user.id):
@@ -5726,7 +5916,18 @@ async def on_callback(u, ctx):
             return
 
         if d == "profiles_list":
-            await show_profiles_list(q.message)
+            await show_profiles_list(q.message, 1)
+            return
+
+        if d.startswith("profiles_page_"):
+            try: page=int(d.split("_")[-1])
+            except ValueError: page=1
+            await show_profiles_list(q.message, page)
+            return
+
+        if d == "activity_log":
+            await _send_activity_file(q.message)
+            await q.answer("📜 فایل فعالیت ارسال شد.")
             return
 
         if d == "general_settings":
@@ -5767,13 +5968,19 @@ async def on_callback(u, ctx):
             return
 
         if d == "manage_admins":
-            admins = list_admins()
-            main = MAIN_ADMIN_ID
-            admin_lines = [f"• {a['user_id']} (added by {a['added_by']})" for a in admins]
-            admin_list = "\n".join(admin_lines) if admin_lines else "هیچ"
-            txt = msg("admin_list", main=main, admins=admin_list)
-            await q.edit_message_text(txt, parse_mode="HTML", reply_markup=manage_admins_kb())
-            return
+            admins=list_admins(); main=MAIN_ADMIN_ID
+            admin_list="\n".join([f"• {a['user_id']} (added by {a['added_by']})" for a in admins]) if admins else "هیچ"
+            txt=msg("admin_list",main=main,admins=admin_list)
+            await q.edit_message_text(txt,parse_mode="HTML",reply_markup=admin_list_kb(1)); return
+
+        if d.startswith("list_admins_"):
+            try: page=int(d.split("_")[-1])
+            except ValueError: page=1
+            admins=list_admins(); main=MAIN_ADMIN_ID; per_page=20; total_pages=max(1,(len(admins)+per_page-1)//per_page); page=min(max(1,page),total_pages); start=(page-1)*per_page
+            shown=admins[start:start+per_page]
+            admin_list="\n".join([f"• {a['user_id']} (added by {a['added_by']})" for a in shown]) if shown else "هیچ"
+            txt=msg("admin_list",main=main,admins=admin_list)+f"\n\n📄 صفحه {page}/{total_pages} | کل ادمین‌های فرعی: {len(admins)}"
+            await q.edit_message_text(txt,parse_mode="HTML",reply_markup=admin_list_kb(page)); return
 
         if d == "add_admin":
             ctx.user_data["action"] = "add_admin"
@@ -5781,13 +5988,11 @@ async def on_callback(u, ctx):
             return
 
         if d == "list_admins":
-            admins = list_admins()
-            main = MAIN_ADMIN_ID
-            admin_lines = [f"• {a['user_id']} (added by {a['added_by']})" for a in admins]
-            admin_list = "\n".join(admin_lines) if admin_lines else "هیچ"
-            txt = msg("admin_list", main=main, admins=admin_list)
-            await q.edit_message_text(txt, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(msg("btn_back"), callback_data="manage_admins", style="primary")]]))
-            return
+            admins=list_admins(); main=MAIN_ADMIN_ID; per_page=20; shown=admins[:per_page]
+            admin_list="\n".join([f"• {a['user_id']} (added by {a['added_by']})" for a in shown]) if shown else "هیچ"
+            total_pages=max(1,(len(admins)+per_page-1)//per_page)
+            txt=msg("admin_list",main=main,admins=admin_list)+f"\n\n📄 صفحه 1/{total_pages} | کل ادمین‌های فرعی: {len(admins)}"
+            await q.edit_message_text(txt,parse_mode="HTML",reply_markup=admin_list_kb(1)); return
 
         if d == "remove_admin":
             ctx.user_data["action"] = "remove_admin"
@@ -5911,27 +6116,20 @@ async def on_callback(u, ctx):
 
         # ===================== SPONSOR NEW =====================
         if d.startswith("sponsor_list_"):
-            parts = d.split("_")
-            if len(parts) >= 3:
-                try:
-                    profile_id = int(parts[2])
-                except ValueError:
-                    await q.answer("⚠️ شناسه نامعتبر")
-                    return
-                prof = get_profile(profile_id)
-                name = prof["dest_name"] if prof else ""
-                sponsors = get_sponsors(profile_id, include_disabled=True)
-                if not sponsors:
-                    txt = msg("sponsor_list_title", name=name, sponsors=msg("sponsor_list_empty"))
-                else:
-                    lines = []
-                    for sp in sponsors:
-                        duration_str = "نامحدود" if sp["unlimited"] else f"{sp['duration_hours']} ساعت"
-                        lines.append(msg("sponsor_item", name=sp["name"], priority=sp["priority"], enabled=sp["enabled"], url=sp["url"], text=sp["button_text"], duration=duration_str))
-                    txt = msg("sponsor_list_title", name=name, sponsors="\n".join(lines))
-                await q.edit_message_text(txt, parse_mode="HTML", reply_markup=sponsor_list_kb(profile_id))
+            parts=d.split("_")
+            try: profile_id=int(parts[2]); page=int(parts[3]) if len(parts)>=4 else 1
+            except (ValueError,IndexError): await q.answer("⚠️ شناسه نامعتبر"); return
+            prof=get_profile(profile_id); name=prof["dest_name"] if prof else ""; sponsors=get_sponsors(profile_id,include_disabled=True); per_page=20
+            total_pages=max(1,(len(sponsors)+per_page-1)//per_page); page=min(max(1,page),total_pages); start=(page-1)*per_page
+            shown=sponsors[start:start+per_page]
+            if not shown: txt=msg("sponsor_list_title",name=name,sponsors=msg("sponsor_list_empty"))
             else:
-                await q.answer("⚠️ خطا در داده")
+                lines=[]
+                for sp in shown:
+                    duration_str="نامحدود" if sp["unlimited"] else f"{sp['duration_hours']} ساعت"
+                    lines.append(msg("sponsor_item",name=sp["name"],priority=sp["priority"],enabled=sp["enabled"],url=sp["url"],text=sp["button_text"],duration=duration_str))
+                txt=msg("sponsor_list_title",name=name,sponsors="\n".join(lines))+f"\n\n📄 صفحه {page}/{total_pages} | کل: {len(sponsors)}"
+            await q.edit_message_text(txt,parse_mode="HTML",reply_markup=sponsor_list_kb(profile_id,page))
             return
 
         if d.startswith("sp_detail_"):
@@ -6294,45 +6492,45 @@ async def on_callback(u, ctx):
         # Sources
         if d.startswith("src_list_"):
             parts = d.split("_")
-            if len(parts) >= 3:
-                try:
-                    profile_id = int(parts[2])
-                except ValueError:
-                    await q.answer("⚠️ شناسه نامعتبر")
-                    return
-                prof = get_profile(profile_id)
-                name = prof["dest_name"] if prof else ""
-                sources = get_profile_sources(profile_id)
-                src_text = "\n".join([f"• {s}" for s in sources]) if sources else "هیچ منبعی"
-                txt = msg("source_list", name=name, sources=src_text)
-                await q.edit_message_text(txt, reply_markup=source_list_kb(profile_id))
-            else:
-                await q.answer("⚠️ خطا در داده")
+            try:
+                profile_id = int(parts[2]); page = int(parts[3]) if len(parts) >= 4 else 1
+            except (ValueError, IndexError):
+                await q.answer("⚠️ شناسه نامعتبر"); return
+            prof = get_profile(profile_id); name = prof["dest_name"] if prof else ""
+            sources = get_profile_sources(profile_id)
+            start=(max(1,page)-1)*SOURCE_PAGE_SIZE
+            shown=sources[start:start+SOURCE_PAGE_SIZE]
+            src_text = "\n".join([f"• {start+i+1}. {s}" for i,s in enumerate(shown)]) if shown else "هیچ منبعی"
+            txt = msg("source_list", name=name, sources=src_text) + f"\n\n📄 صفحه {min(max(1,page),max(1,(len(sources)+SOURCE_PAGE_SIZE-1)//SOURCE_PAGE_SIZE))}/{max(1,(len(sources)+SOURCE_PAGE_SIZE-1)//SOURCE_PAGE_SIZE)} | کل منابع: {len(sources)}"
+            await q.edit_message_text(txt, reply_markup=source_list_kb(profile_id,page))
             return
 
         if d.startswith("src_del_"):
-            parts = d.split("_")
-            if len(parts) >= 4:
-                try:
-                    profile_id = int(parts[2])
-                    idx = int(parts[3])
-                except ValueError:
-                    await q.answer("⚠️ شناسه نامعتبر")
-                    return
-                sources = get_profile_sources(profile_id)
-                if 0 <= idx < len(sources):
-                    removed = sources.pop(idx)
-                    set_profile_sources(profile_id, sources)
-                    await q.answer(msg("source_deleted"))
-                    prof = get_profile(profile_id)
-                    name = prof["dest_name"] if prof else ""
-                    src_text = "\n".join([f"• {s}" for s in sources]) if sources else "هیچ منبعی"
-                    txt = msg("source_list", name=name, sources=src_text)
-                    await q.edit_message_text(txt, reply_markup=source_list_kb(profile_id))
-                else:
-                    await q.answer("❌ خطا در ایندکس")
+            parts=d.split("_")
+            try:
+                profile_id=int(parts[2]); idx=int(parts[3]); page=int(parts[4]) if len(parts)>=5 else 1
+            except (ValueError,IndexError):
+                await q.answer("⚠️ شناسه نامعتبر"); return
+            sources=get_profile_sources(profile_id)
+            if 0 <= idx < len(sources):
+                removed=sources.pop(idx); set_profile_sources(profile_id,sources)
+                await q.answer(msg("source_deleted"))
+                prof=get_profile(profile_id); name=prof["dest_name"] if prof else ""
+                total_pages=max(1,(len(sources)+SOURCE_PAGE_SIZE-1)//SOURCE_PAGE_SIZE); page=min(max(1,page),total_pages)
+                start=(page-1)*SOURCE_PAGE_SIZE; shown=sources[start:start+SOURCE_PAGE_SIZE]
+                src_text="\n".join([f"• {start+i+1}. {s}" for i,s in enumerate(shown)]) if shown else "هیچ منبعی"
+                txt=msg("source_list",name=name,sources=src_text)+f"\n\n📄 صفحه {page}/{total_pages} | کل منابع: {len(sources)}"
+                await q.edit_message_text(txt,reply_markup=source_list_kb(profile_id,page))
             else:
-                await q.answer("⚠️ خطا در داده")
+                await q.answer("❌ منبع پیدا نشد؛ لیست به‌روز شده است.",show_alert=True)
+            return
+
+        if d.startswith("scan_sources_"):
+            try: profile_id=int(d.split("_")[2])
+            except (ValueError,IndexError): await q.answer("⚠️ شناسه نامعتبر"); return
+            await q.edit_message_text("⏳ در حال بررسی کامل همه کانال‌های منبع...\nاین عملیات ممکن است برای منابع بزرگ زمان‌بر باشد.")
+            result=await run_cycle_for_profile(q.get_bot(),profile_id,enable_configs=True,enable_proxies=True,is_instant=False)
+            await q.edit_message_text(f"✅ بررسی کامل همه منابع انجام شد.\nنتیجه: {result[0]} | {result[1]}",reply_markup=source_list_kb(profile_id,1))
             return
 
         if d.startswith("sa_"):
@@ -7103,20 +7301,20 @@ async def on_callback(u, ctx):
             ctx.user_data.pop("manual_schedule_custom", None)
             parts = d.split("_")
             try:
-                profile_id = int(parts[2]); job_id = int(parts[3])
+                profile_id = int(parts[2]); job_id = int(parts[3]); item_page = int(parts[4]) if len(parts) >= 5 else 1
             except (ValueError, IndexError):
                 await q.answer("⚠️ داده نامعتبر"); return
             job = get_manual_queue_job(job_id, profile_id)
             if not job or job.get("status") != "pending":
                 await q.answer("این صف دیگر فعال نیست", show_alert=True)
                 await q.edit_message_text("📋 صف فعال", reply_markup=manual_queue_list_kb(profile_id)); return
-            await q.edit_message_text(manual_queue_text(job), parse_mode="HTML", reply_markup=manual_queue_detail_kb(profile_id, job_id, job.get("items") or []))
+            await q.edit_message_text(manual_queue_text(job), parse_mode="HTML", reply_markup=manual_queue_detail_kb(profile_id, job_id, job.get("items") or [], item_page))
             return
 
         if d.startswith("mq_rm_"):
             parts = d.split("_")
             try:
-                profile_id = int(parts[2]); job_id = int(parts[3]); item_index = int(parts[4])
+                profile_id = int(parts[2]); job_id = int(parts[3]); item_index = int(parts[4]); item_page = int(parts[5]) if len(parts) >= 6 else 1
             except (ValueError, IndexError):
                 await q.answer("⚠️ داده نامعتبر"); return
             remove_manual_queue_item(job_id, profile_id, item_index)
@@ -7125,7 +7323,7 @@ async def on_callback(u, ctx):
                 await q.answer("✅ مورد حذف شد و صف خالی شد")
                 await q.edit_message_text("📋 صف فعال", reply_markup=manual_queue_list_kb(profile_id)); return
             await q.answer("✅ مورد حذف شد")
-            await q.edit_message_text(manual_queue_text(job), parse_mode="HTML", reply_markup=manual_queue_detail_kb(profile_id, job_id, job.get("items") or []))
+            await q.edit_message_text(manual_queue_text(job), parse_mode="HTML", reply_markup=manual_queue_detail_kb(profile_id, job_id, job.get("items") or [], item_page))
             return
 
         if d.startswith("mq_cancel_"):
@@ -7446,22 +7644,14 @@ async def on_callback(u, ctx):
             return
 
         if d.startswith("bl_list_"):
-            parts = d.split("_")
-            if len(parts) >= 3:
-                try:
-                    profile_id = int(parts[2])
-                except ValueError:
-                    await q.answer("⚠️ شناسه نامعتبر")
-                    return
-                prof = get_profile(profile_id)
-                name = prof["dest_name"] if prof else ""
-                words = get_blacklist(profile_id)
-                words_text = "\n".join([f"• `{w}`" for w in words]) if words else msg("blacklist_empty")
-                txt = msg("blacklist_title", name=name, words=words_text)
-                await q.edit_message_text(txt, parse_mode="HTML", reply_markup=blacklist_kb(profile_id))
-            else:
-                await q.answer("⚠️ خطا در داده")
-            return
+            parts=d.split("_")
+            try: profile_id=int(parts[2]); page=int(parts[3]) if len(parts)>=4 else 1
+            except (ValueError,IndexError): await q.answer("⚠️ شناسه نامعتبر"); return
+            prof=get_profile(profile_id); name=prof["dest_name"] if prof else ""; words=get_blacklist(profile_id); per_page=20
+            total_pages=max(1,(len(words)+per_page-1)//per_page); page=min(max(1,page),total_pages); start=(page-1)*per_page; shown=words[start:start+per_page]
+            words_text="\n".join([f"• {start+i+1}. `{w}`" for i,w in enumerate(shown)]) if shown else msg("blacklist_empty")
+            txt=msg("blacklist_title",name=name,words=words_text)+f"\n\n📄 صفحه {page}/{total_pages} | کل: {len(words)}"
+            await q.edit_message_text(txt,parse_mode="HTML",reply_markup=blacklist_kb(profile_id,page)); return
 
         if d.startswith("bl_add_"):
             parts = d.split("_")
@@ -7478,24 +7668,17 @@ async def on_callback(u, ctx):
             return
 
         if d.startswith("bl_del_"):
-            parts = d.split("_")
-            if len(parts) >= 4:
-                try:
-                    profile_id = int(parts[2])
-                    word = "_".join(parts[3:])
-                except ValueError:
-                    await q.answer("⚠️ شناسه نامعتبر")
-                    return
-                remove_blacklist_word(profile_id, word)
-                await q.answer(msg("blacklist_removed"))
-                prof = get_profile(profile_id)
-                name = prof["dest_name"] if prof else ""
-                words = get_blacklist(profile_id)
-                words_text = "\n".join([f"• `{w}`" for w in words]) if words else msg("blacklist_empty")
-                txt = msg("blacklist_title", name=name, words=words_text)
-                await q.edit_message_text(txt, parse_mode="HTML", reply_markup=blacklist_kb(profile_id))
-            else:
-                await q.answer("⚠️ خطا در داده")
+            parts=d.split("_")
+            try: profile_id=int(parts[2]); idx=int(parts[3]); page=int(parts[4]) if len(parts)>=5 else 1
+            except (ValueError,IndexError): await q.answer("⚠️ شناسه نامعتبر"); return
+            words=get_blacklist(profile_id)
+            if 0<=idx<len(words):
+                removed=words[idx]; remove_blacklist_word(profile_id,removed); await q.answer(msg("blacklist_removed"))
+                prof=get_profile(profile_id); name=prof["dest_name"] if prof else ""; words=get_blacklist(profile_id); per_page=20; total_pages=max(1,(len(words)+per_page-1)//per_page); page=min(max(1,page),total_pages); start=(page-1)*per_page; shown=words[start:start+per_page]
+                words_text="\n".join([f"• {start+i+1}. `{w}`" for i,w in enumerate(shown)]) if shown else msg("blacklist_empty")
+                txt=msg("blacklist_title",name=name,words=words_text)+f"\n\n📄 صفحه {page}/{total_pages} | کل: {len(words)}"
+                await q.edit_message_text(txt,parse_mode="HTML",reply_markup=blacklist_kb(profile_id,page))
+            else: await q.answer("❌ مورد پیدا نشد؛ لیست به‌روز شده است.",show_alert=True)
             return
 
         if d.startswith("bl_clear_"):
@@ -7837,7 +8020,7 @@ async def show_profile_admin(msg_or_q, profile_id):
 # ======================================================================
 # هندلرهای متنی و سند (بدون تغییر، حذف بخش فایل)
 # ======================================================================
-async def on_text(u, ctx):
+async def _on_text_impl(u, ctx):
     if not is_admin(u.effective_user.id):
         return
 
@@ -8445,7 +8628,7 @@ async def on_text(u, ctx):
         await show_profile_admin(u.message, profile_id)
         return
 
-async def on_document(u, ctx):
+async def _on_document_impl(u, ctx):
     if not is_admin(u.effective_user.id):
         return
     a = ctx.user_data.get("action")
@@ -8776,7 +8959,7 @@ ENABLE_AUTO = True
 async def post_init(app):
     global BOT_REF, BOT_START_TIME
     BOT_REF = app.bot
-    BOT_START_TIME = datetime.now(timezone.utc)
+    BOT_START_TIME = datetime.now(TEHRAN_TZ)
     # پاکسازی تایمرهای منقضی‌شده در ابتدا
     for prof in get_profiles():
         expiry_str = prof.get("timer_expiry")
@@ -8845,7 +9028,7 @@ def optimize_database():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_processed_message ON processed_messages(source,message_id,profile_id)")
 
-        cutoff = (datetime.now() - timedelta(hours=48)).isoformat()
+        cutoff = (datetime.now(TEHRAN_TZ) - timedelta(hours=48)).isoformat()
         # delete old duplicate trackers, not actual configs
         cur.execute("DELETE FROM posts WHERE created_at < ?", (cutoff,))
         cur.execute("DELETE FROM seen WHERE last_posted IS NOT NULL AND last_posted < ? AND first_seen IS NOT NULL", (cutoff,))
@@ -8872,6 +9055,41 @@ def optimize_database():
     finally:
         if db:
             db.close()
+
+async def on_callback(u, ctx):
+    before=_audit_snapshot()
+    try:
+        await _on_callback_impl(u, ctx)
+    finally:
+        try:
+            admin=getattr(getattr(u,"effective_user",None),"id",0)
+            action=f"Callback: {getattr(getattr(u,'callback_query',None),'data','')}"
+            after=_audit_snapshot(); _record_admin_activity(admin,action,before,after)
+        except Exception: log.exception("callback audit wrapper failed")
+
+async def on_text(u, ctx):
+    before=_audit_snapshot()
+    action_before = (ctx.user_data.get("action", "unknown") if getattr(ctx, "user_data", None) else "unknown")
+    try:
+        await _on_text_impl(u, ctx)
+    finally:
+        try:
+            admin=getattr(getattr(u,"effective_user",None),"id",0)
+            action=f"Text action: {action_before}"
+            after=_audit_snapshot(); _record_admin_activity(admin,action,before,after)
+        except Exception: log.exception("text audit wrapper failed")
+
+async def on_document(u, ctx):
+    before=_audit_snapshot()
+    action_before = (ctx.user_data.get("action", "unknown") if getattr(ctx, "user_data", None) else "unknown")
+    try:
+        await _on_document_impl(u, ctx)
+    finally:
+        try:
+            admin=getattr(getattr(u,"effective_user",None),"id",0)
+            action=f"Document action: {action_before}"
+            after=_audit_snapshot(); _record_admin_activity(admin,action,before,after)
+        except Exception: log.exception("document audit wrapper failed")
 
 def main():
     try:
@@ -8924,7 +9142,7 @@ def save_unique_post(text, count=0):
     fp = post_fingerprint(text)
     db = get_conn()
     try:
-        db.execute("INSERT OR IGNORE INTO posts(content,count,created_at) VALUES(?,?,?)", (fp,count,datetime.now().isoformat()))
+        db.execute("INSERT OR IGNORE INTO posts(content,count,created_at) VALUES(?,?,?)", (fp,count,get_tehran_time()))
         db.commit()
     finally:
         db.close()
