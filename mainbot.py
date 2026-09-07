@@ -1,9 +1,9 @@
-# bot.py — 4.1.6
-APP_VERSION = "4.1.6"
+# bot.py — 4.1.4
+APP_VERSION = "4.1.7"
 APP_VERSION_MAJOR = 4
 APP_VERSION_MINOR = 1
-APP_VERSION_PATCH = 5
-APP_VERSION_LABEL = "4.1.6-stable"
+APP_VERSION_PATCH = 7
+APP_VERSION_LABEL = "4.1.7-stable"
 BOT_VERSION = APP_VERSION
 import os
 import re
@@ -685,8 +685,53 @@ c.execute("""CREATE TABLE IF NOT EXISTS profiles (
     show_ping INTEGER DEFAULT 1,
     proxy_banner_template TEXT DEFAULT '',
     config_post_mode INTEGER DEFAULT 0,
-    ping_testing INTEGER DEFAULT 1
+    ping_testing INTEGER DEFAULT 1,
+    batch_posting INTEGER DEFAULT 0
 )""")
+conn.commit()
+
+# Robust schema self-healing: old Railway SQLite files may predate batch_posting.
+# The migration is intentionally executed AFTER the profiles table exists and is
+# also verified below, so callbacks can never hit "no such column".
+try:
+    ensure_column("profiles", "batch_posting", "INTEGER DEFAULT 0", 0)
+    c.execute("PRAGMA table_info(profiles)")
+    _profile_columns = {row[1] for row in c.fetchall()}
+    if "batch_posting" not in _profile_columns:
+        raise RuntimeError("profiles.batch_posting migration failed")
+    c.execute("UPDATE profiles SET batch_posting=0 WHERE batch_posting IS NULL")
+    conn.commit()
+except Exception:
+    log.exception("[DB SCHEMA] batch_posting migration failed")
+    raise
+
+# Persistent strict-batch queue. This is NOT a posted ledger: rows here are
+# only healthy candidates waiting for a full batch. They are removed only after
+# Telegram posting succeeds (or when their permanent posted hash is detected).
+c.execute("""CREATE TABLE IF NOT EXISTS pending_batch_items (
+    profile_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    identity_hash TEXT NOT NULL,
+    url TEXT NOT NULL,
+    source TEXT DEFAULT '',
+    ping REAL DEFAULT 0,
+    ping_count INTEGER DEFAULT 0,
+    flag TEXT DEFAULT '🌐',
+    country_code TEXT DEFAULT '',
+    added_at TEXT NOT NULL,
+    PRIMARY KEY(profile_id, kind, identity_hash))""")
+c.execute("CREATE INDEX IF NOT EXISTS idx_pending_batch_profile_kind ON pending_batch_items(profile_id, kind, added_at)")
+
+# Short-lived negative test cache prevents the strict-batch scanner from
+# re-testing the same dead candidates forever and allows it to move through a
+# large source backlog across cycles. It contains no profile settings.
+c.execute("""CREATE TABLE IF NOT EXISTS batch_test_cache (
+    profile_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    identity_hash TEXT NOT NULL,
+    tested_at TEXT NOT NULL,
+    PRIMARY KEY(profile_id, kind, identity_hash))""")
+c.execute("CREATE INDEX IF NOT EXISTS idx_batch_test_cache_time ON batch_test_cache(profile_id, kind, tested_at)")
 conn.commit()
 
 # Permanent, compact once-only ledgers. The large URL history tables are only
@@ -1631,6 +1676,8 @@ def delete_profile(profile_id):
     c.execute("DELETE FROM source_stream_state WHERE profile_id=?", (profile_id,))
     c.execute("DELETE FROM processed_messages WHERE profile_id=?", (profile_id,))
     c.execute("DELETE FROM manual_send_queue WHERE profile_id=?", (profile_id,))
+    c.execute("DELETE FROM pending_batch_items WHERE profile_id=?", (profile_id,))
+    c.execute("DELETE FROM batch_test_cache WHERE profile_id=?", (profile_id,))
     c.execute("DELETE FROM blacklist WHERE profile_id=?", (profile_id,))
     conn.commit()
 
@@ -1914,12 +1961,114 @@ def set_profile_low_cost_mode(profile_id, enabled):
 
 # Smart batch mode: independently stored per profile and OFF by default.
 def get_profile_batch_posting(profile_id):
-    prof = get_profile(profile_id)
-    return bool(prof.get("batch_posting", 0)) if prof else False
+    try:
+        prof = get_profile(profile_id)
+        return bool(prof.get("batch_posting", 0)) if prof else False
+    except sqlite3.OperationalError as exc:
+        if "batch_posting" in str(exc).lower():
+            ensure_column("profiles", "batch_posting", "INTEGER DEFAULT 0", 0)
+            prof = get_profile(profile_id)
+            return bool(prof.get("batch_posting", 0)) if prof else False
+        raise
 
 def set_profile_batch_posting(profile_id, enabled):
+    # Self-heal old databases even if a callback reaches this function after a
+    # hot reload or an imported legacy DB.
+    try:
+        ensure_column("profiles", "batch_posting", "INTEGER DEFAULT 0", 0)
+    except Exception:
+        pass
     update_profile(profile_id, batch_posting=int(bool(enabled)))
     return bool(enabled)
+
+def _pending_batch_rows(profile_id, kind):
+    try:
+        rows = c.execute(
+            "SELECT identity_hash,url,source,ping,ping_count,flag,country_code FROM pending_batch_items "
+            "WHERE profile_id=? AND kind=? ORDER BY added_at ASC",
+            (int(profile_id), kind)
+        ).fetchall()
+        return rows
+    except sqlite3.Error:
+        log.exception("pending batch read failed for profile %s/%s", profile_id, kind)
+        return []
+
+def _pending_batch_upsert(profile_id, kind, identity_hash, url, source="", ping=0, ping_count=0, flag="🌐", country_code=""):
+    try:
+        c.execute(
+            "INSERT OR IGNORE INTO pending_batch_items "
+            "(profile_id,kind,identity_hash,url,source,ping,ping_count,flag,country_code,added_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (int(profile_id), kind, identity_hash, url, source or "", float(ping or 0), int(ping_count or 0), flag or "🌐", country_code or "", get_tehran_time())
+        )
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        log.exception("pending batch write failed for profile %s/%s", profile_id, kind)
+
+def _pending_batch_remove_posted(profile_id, kind):
+    try:
+        rows = c.execute(
+            "SELECT identity_hash,url FROM pending_batch_items WHERE profile_id=? AND kind=?",
+            (int(profile_id), kind)
+        ).fetchall()
+        removed = 0
+        for identity_hash, url in rows:
+            posted = is_already_posted(profile_id, url) if kind == "config" else is_proxy_posted(profile_id, url)
+            if posted:
+                c.execute(
+                    "DELETE FROM pending_batch_items WHERE profile_id=? AND kind=? AND identity_hash=?",
+                    (int(profile_id), kind, identity_hash)
+                )
+                removed += c.rowcount
+        if removed:
+            conn.commit()
+        return removed
+    except sqlite3.Error:
+        conn.rollback()
+        log.exception("pending batch cleanup failed for profile %s/%s", profile_id, kind)
+        return 0
+
+def _batch_tested_recently(profile_id, kind, identity_hash, hours=2):
+    try:
+        cutoff = (datetime.now(TEHRAN_TZ) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+        row = c.execute(
+            "SELECT 1 FROM batch_test_cache WHERE profile_id=? AND kind=? AND identity_hash=? AND tested_at>=? LIMIT 1",
+            (int(profile_id), kind, identity_hash, cutoff)
+        ).fetchone()
+        return bool(row)
+    except sqlite3.Error:
+        return False
+
+def _batch_mark_tested(profile_id, kind, identity_hash):
+    try:
+        c.execute(
+            "INSERT OR REPLACE INTO batch_test_cache(profile_id,kind,identity_hash,tested_at) VALUES (?,?,?,?)",
+            (int(profile_id), kind, identity_hash, get_tehran_time())
+        )
+    except sqlite3.Error:
+        conn.rollback()
+
+def _batch_prune_test_cache(profile_id=None):
+    try:
+        cutoff = (datetime.now(TEHRAN_TZ) - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
+        if profile_id is None:
+            c.execute("DELETE FROM batch_test_cache WHERE tested_at < ?", (cutoff,))
+        else:
+            c.execute("DELETE FROM batch_test_cache WHERE profile_id=? AND tested_at < ?", (int(profile_id), cutoff))
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+
+def _pending_batch_clear(profile_id, kind=None):
+    try:
+        if kind:
+            c.execute("DELETE FROM pending_batch_items WHERE profile_id=? AND kind=?", (int(profile_id), kind))
+        else:
+            c.execute("DELETE FROM pending_batch_items WHERE profile_id=?", (int(profile_id),))
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
 
 def render_naming_template(template, *, protocol, flag, country_code, channel_link, count):
     """Render {TOKEN} and [TOKEN] placeholders."""
@@ -4457,8 +4606,8 @@ async def post_proxies(bot, profile_id, proxies_with_ping, is_instant=False, max
         max_proxies = max(1, int(max_proxies))
     except Exception:
         max_proxies = 10
-    if is_instant:
-        max_proxies = min(max_proxies, 3)
+    # Instant mode changes scheduling responsiveness only; it must never
+    # silently reduce the profile's configured posting limit.
     mode = get_profile_proxy_post_mode(profile_id)
     show_date = get_profile_show_date_proxy(profile_id)
     country_display = get_profile_country_display(profile_id)
@@ -4728,22 +4877,34 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
                     return u, False, 0, 0, src
 
         if batch_posting:
-            # Smart batch: keep testing until the configured maximum is filled,
-            # or until the current new set is exhausted. If only 3 usable servers
-            # exist while max=5, publish those 3; never invent/wait forever.
-            test_cap = min(len(new_configs), max(24, min(120, desired * 12)))
-            batch_size = min(12, test_cap)
-            tested = 0
-            while tested < test_cap and len(working) < desired:
-                chunk = new_configs[tested:min(tested + batch_size, test_cap)]
+            # Strict persistent batch: existing healthy candidates are loaded first.
+            # New candidates are tested in a bounded slice and successful ones are
+            # persisted. Nothing is posted until the persisted healthy queue reaches
+            # the configured batch size. This survives redeploys and page turnover.
+            _pending_batch_remove_posted(profile_id, "config")
+            pending_rows = _pending_batch_rows(profile_id, "config")
+            pending_hashes = {r[0] for r in pending_rows}
+            for identity_hash, url, src, ping, ping_count, _flag, _cc in pending_rows:
+                working.append((url, ping, ping_count))
+
+            if len(working) < desired:
+                fresh = []
+                _batch_prune_test_cache(profile_id)
+                for item in new_configs:
+                    identity_hash = _config_identity_hash(item[0])
+                    if identity_hash not in pending_hashes and not _batch_tested_recently(profile_id, "config", identity_hash):
+                        fresh.append(item)
+                test_cap = min(len(fresh), max(24, min(120, desired * 12)))
+                chunk = fresh[:test_cap]
                 rs = await asyncio.gather(*[_check(item) for item in chunk], return_exceptions=True)
-                for r in rs:
+                for item, r in zip(chunk, rs):
+                    identity_hash = _config_identity_hash(item[0])
+                    _batch_mark_tested(profile_id, "config", identity_hash)
                     if not isinstance(r, Exception) and r[1]:
+                        _pending_batch_upsert(profile_id, "config", identity_hash, r[0], r[4], r[2], r[3])
                         working.append((r[0], r[2], r[3]))
-                        if len(working) >= desired:
-                            break
-                tested += len(chunk)
-            log.info(f"📦 [AUTO-CONFIG] smart batch tested={tested}/{len(new_configs)} working={len(working)} target={desired}")
+                conn.commit()
+                log.info(f"📦 [AUTO-CONFIG] strict queue tested={len(chunk)}/{len(fresh)} pending={len(working)} target={desired}")
         else:
             adaptive_limit = max(desired * 2, desired + 8)
             test_limit = min(len(new_configs), adaptive_limit)
@@ -4792,21 +4953,29 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
                     return proxy_url, 0, flag, country_code
 
             if batch_posting:
-                # Same smart-batch rule as configs: stop as soon as max is filled;
-                # if fewer working proxies exist, send the smaller available set.
-                test_cap = min(len(valid_proxies), max(24, min(120, desired_proxy * 12)))
-                batch_size = min(12, test_cap)
-                tested = 0
-                while tested < test_cap and len(proxy_with_ping) < desired_proxy:
-                    chunk = valid_proxies[tested:min(tested + batch_size, test_cap)]
+                _pending_batch_remove_posted(profile_id, "proxy")
+                pending_rows = _pending_batch_rows(profile_id, "proxy")
+                pending_hashes = {r[0] for r in pending_rows}
+                for identity_hash, url, _src, ping, ping_count, flag, cc in pending_rows:
+                    proxy_with_ping.append((url, ping, flag, cc))
+                if len(proxy_with_ping) < desired_proxy:
+                    fresh = []
+                    _batch_prune_test_cache(profile_id)
+                    for p in valid_proxies:
+                        identity_hash = _proxy_identity_hash(p)
+                        if identity_hash not in pending_hashes and not _batch_tested_recently(profile_id, "proxy", identity_hash):
+                            fresh.append(p)
+                    test_cap = min(len(fresh), max(24, min(120, desired_proxy * 12)))
+                    chunk = fresh[:test_cap]
                     results = await asyncio.gather(*[check_proxy(p) for p in chunk], return_exceptions=True)
-                    for r in results:
-                        if not isinstance(r, Exception):
+                    for p, r in zip(chunk, results):
+                        identity_hash = _proxy_identity_hash(p)
+                        _batch_mark_tested(profile_id, "proxy", identity_hash)
+                        if not isinstance(r, Exception) and (not ping_testing or r[1] > 0):
+                            _pending_batch_upsert(profile_id, "proxy", identity_hash, r[0], "", r[1], 0, r[2], r[3])
                             proxy_with_ping.append(r)
-                            if len(proxy_with_ping) >= desired_proxy:
-                                break
-                    tested += len(chunk)
-                log.info(f"📦 [AUTO-PROXY] smart batch tested={tested}/{len(valid_proxies)} working={len(proxy_with_ping)} target={desired_proxy}")
+                    conn.commit()
+                    log.info(f"📦 [AUTO-PROXY] strict queue tested={len(chunk)}/{len(fresh)} pending={len(proxy_with_ping)} target={desired_proxy}")
             else:
                 results = await asyncio.gather(*[check_proxy(p) for p in valid_proxies], return_exceptions=True)
                 for r in results:
@@ -4860,11 +5029,15 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
         )
         # If the config message containing the glass proxy buttons was delivered,
         # those proxies were actually published. Mark them only after success.
+        if batch_posting and total_configs > 0:
+            _pending_batch_remove_posted(profile_id, "config")
         if combined_glass and glass_proxy_rows and total_configs > 0:
             total_proxies = len(selected_proxy_urls)
             for proxy_url in selected_proxy_urls:
                 if not is_proxy_posted(profile_id, proxy_url):
                     mark_proxy_posted(profile_id, proxy_url)
+            if batch_posting:
+                _pending_batch_remove_posted(profile_id, "proxy")
         elif combined_glass:
             # Config message failed/no configs: do not lose proxy candidates.
             selected_proxy_urls = []
@@ -4891,6 +5064,8 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
                 total_proxies = cnt
                 log.info(f"[PROXY][profile={profile_id}] Telegram send succeeded for {cnt} proxies")
                 mark_proxies_posted_batch(profile_id, selected_proxy_urls)
+                if batch_posting:
+                    _pending_batch_remove_posted(profile_id, "proxy")
 
     # Advance each stream independently. A failed Telegram send MUST NOT move
     # that stream's cursor, otherwise the failed content would be lost forever.
@@ -4951,6 +5126,8 @@ async def profile_loop_config(bot, profile_id):
     log.info(f"🔄 Starting config loop for profile {profile_id}")
     while True:
         try:
+            _WORKER_HEARTBEATS.get(f"auto_{mode}_{profile_id}")
+            _WORKER_HEARTBEATS[f"auto_{mode}_{profile_id}"] = time.time()
             profile = get_profile(profile_id)
             if not profile:
                 log.error(f"❌ Profile {profile_id} not found, stopping config loop.")
@@ -5023,6 +5200,8 @@ async def profile_loop_proxy(bot, profile_id):
     log.info(f"🔄 Starting proxy loop for profile {profile_id}")
     while True:
         try:
+            _WORKER_HEARTBEATS.get(f"auto_{mode}_{profile_id}")
+            _WORKER_HEARTBEATS[f"auto_{mode}_{profile_id}"] = time.time()
             profile = get_profile(profile_id)
             if not profile:
                 log.error(f"❌ Profile {profile_id} not found, stopping proxy loop.")
@@ -5111,12 +5290,12 @@ async def _run_scheduled_profile_cycle(bot, profile_id, mode):
     try:
         if mode == "config":
             result = await run_cycle_for_profile(
-                bot, profile_id, enable_configs=True, enable_proxies=False, is_instant=False
+                bot, profile_id, enable_configs=True, enable_proxies=False, is_instant=(get_profile_interval_config(profile_id) == 0)
             )
             log.info(f"[AUTO-CONFIG] profile={profile_id} result={result}")
             return result
         result = await run_cycle_for_profile(
-            bot, profile_id, enable_configs=False, enable_proxies=True, is_instant=False
+            bot, profile_id, enable_configs=False, enable_proxies=True, is_instant=(get_profile_interval_proxy(profile_id) == 0)
         )
         log.info(f"[AUTO-PROXY] profile={profile_id} result={result}")
         return result
@@ -5144,6 +5323,8 @@ async def _profile_scheduler_v16(bot, profile_id, mode):
 
     while True:
         try:
+            _WORKER_HEARTBEATS.get(f"auto_{mode}_{profile_id}")
+            _WORKER_HEARTBEATS[f"auto_{mode}_{profile_id}"] = time.time()
             profile = get_profile(profile_id)
             if not profile:
                 log.warning(f"[SCHEDULER] profile {profile_id} disappeared; stopping {mode}")
@@ -5207,7 +5388,9 @@ async def _profile_scheduler_v16(bot, profile_id, mode):
                 started = datetime.now(TEHRAN_TZ)
                 log.info(f"[SCHEDULER] AUTO TICK {key} at {started.isoformat()} (instant mode)")
                 await _run_scheduled_profile_cycle(bot, profile_id, mode)
-                await asyncio.sleep(30.0)
+                # Public Telegram channel scraping is polling-based. A short
+                # bounded sleep gives near-immediate updates without a busy loop.
+                await asyncio.sleep(15.0)
                 continue
 
             seconds = float(interval_minutes * 60)
@@ -9765,6 +9948,18 @@ def automatic_database_cleanup():
                 deleted[table] = max(0, cur.rowcount)
             except sqlite3.Error:
                 deleted[table] = 0
+        try:
+            pending_cutoff = (datetime.now(TEHRAN_TZ) - timedelta(hours=48)).strftime("%Y-%m-%d %H:%M:%S")
+            cur.execute("DELETE FROM pending_batch_items WHERE added_at < ?", (pending_cutoff,))
+            deleted["pending_batch_items"] = max(0, cur.rowcount)
+        except sqlite3.Error:
+            deleted["pending_batch_items"] = 0
+        try:
+            cache_cutoff = (datetime.now(TEHRAN_TZ) - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
+            cur.execute("DELETE FROM batch_test_cache WHERE tested_at < ?", (cache_cutoff,))
+            deleted["batch_test_cache"] = max(0, cur.rowcount)
+        except sqlite3.Error:
+            deleted["batch_test_cache"] = 0
         # Admin activity is useful, but only recent 7-day activity is needed.
         try:
             cur.execute("DELETE FROM admin_activity WHERE created_at < ?", (cutoff,))
