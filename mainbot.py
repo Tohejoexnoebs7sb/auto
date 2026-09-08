@@ -1,11 +1,12 @@
 # bot.py — 4.1.4
-APP_VERSION = "4.1.11"
+APP_VERSION = "4.1.12"
 APP_VERSION_MAJOR = 4
 APP_VERSION_MINOR = 1
-APP_VERSION_PATCH = 11
-APP_VERSION_LABEL = "4.1.11-stable"
+APP_VERSION_PATCH = 12
+APP_VERSION_LABEL = "4.1.12-stable"
 BOT_VERSION = APP_VERSION
 import os
+import glob
 import re
 import asyncio
 import sqlite3
@@ -64,6 +65,20 @@ from logging.handlers import RotatingFileHandler
 logging.Formatter.converter = lambda *args: datetime.now(pytz.timezone("Asia/Tehran")).timetuple()
 
 _LOG_FILE = os.path.join(DATA_DIR, "bot.log")
+# Hard reset logging on every process start: remove the previous active log
+# and any legacy rotated copies. DB/backups are intentionally untouched.
+try:
+    for _old_log in glob.glob(_LOG_FILE + ".*"):
+        try:
+            os.remove(_old_log)
+        except OSError:
+            pass
+    try:
+        os.remove(_LOG_FILE)
+    except FileNotFoundError:
+        pass
+except Exception:
+    pass
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -198,6 +213,16 @@ def detect_config_protocol(config_url):
         return "TROJAN"
     if u.startswith(("ss://", "ssr://")):
         return "SHADOWSOCKS"
+    if u.startswith(("hysteria2://", "hy2://")):
+        return "HYSTERIA2"
+    if u.startswith("hysteria://"):
+        return "HYSTERIA"
+    if u.startswith("tuic://"):
+        return "TUIC"
+    if u.startswith(("juicity://", "juic://")):
+        return "JUICITY"
+    if u.startswith(("wireguard://", "wg://")):
+        return "WIREGUARD"
     return ""
 
 
@@ -4902,8 +4927,18 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
 
     # Low-cost mode reduces Railway network/CPU usage.
     low_cost_mode=get_profile_low_cost_mode(profile_id)
-    batch_posting = get_profile_batch_posting(profile_id)
-    log.info(f"📦 [profile={profile_id}] smart_batch={batch_posting} (default OFF)")
+    batch_posting = bool(get_profile_batch_posting(profile_id))
+    if not batch_posting:
+        # OFF means OFF: no persistent batch queue is allowed to participate in
+        # automatic posting. Clear only transient batch state; profiles/settings
+        # and permanent dedup ledgers are never touched.
+        try:
+            _pending_batch_clear(profile_id, "config")
+            _pending_batch_clear(profile_id, "proxy")
+            conn.commit()
+        except Exception:
+            log.exception(f"[BATCH][profile={profile_id}] failed clearing disabled batch state")
+    log.info(f"📦 [profile={profile_id}] smart_batch={int(batch_posting)} (default OFF)")
     # Responsive incremental scan. A cycle must never walk hundreds of historical
     # Telegram pages. Four pages per source are enough for normal interval runs;
     # an unfinished backlog remains behind the stream cursor and is picked up by
@@ -4919,8 +4954,11 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
             last_exc = None
             for attempt in range(1, 3):
                 try:
-                    config_links, proxy_links, newest_id = await scrape_channel_paginated(
-                        profile_id, src, max_pages=scrape_pages, stream=stream
+                    config_links, proxy_links, newest_id = await asyncio.wait_for(
+                        scrape_channel_paginated(
+                            profile_id, src, max_pages=scrape_pages, stream=stream
+                        ),
+                        timeout=15.0,
                     )
                     return src, config_links, proxy_links, newest_id
                 except Exception as exc:
@@ -4963,6 +5001,9 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
         # Otherwise a small max_post/test window can be filled entirely by
         # blacklisted URLs and newer valid configs never get a chance to publish.
         if blacklist_words and any(str(word).lower() in str(u).lower() for word in blacklist_words if word):
+            continue
+        if not detect_config_protocol(u):
+            log.warning(f"[CONFIG][profile={profile_id}] unsupported config scheme skipped before test: {str(u)[:90]}")
             continue
         if not is_already_posted(profile_id, u):
             new_configs.append((u, s))
@@ -8177,7 +8218,18 @@ async def _on_callback_impl(u, ctx):
             current = get_profile_batch_posting(profile_id)
             new_val = not current
             set_profile_batch_posting(profile_id, new_val)
-            await q.answer("📦 ارسال تجمیعی فعال شد." if new_val else "📦 ارسال تجمیعی خاموش شد.")
+            # Read back from SQLite: the UI must reflect the persisted value,
+            # never an optimistic/in-memory value.
+            persisted = bool(get_profile_batch_posting(profile_id))
+            if not persisted:
+                try:
+                    _pending_batch_clear(profile_id, "config")
+                    _pending_batch_clear(profile_id, "proxy")
+                    conn.commit()
+                except Exception:
+                    log.exception(f"[BATCH][profile={profile_id}] cleanup after OFF failed")
+            log.info(f"[BATCH][profile={profile_id}] toggle requested={int(new_val)} persisted={int(persisted)}")
+            await q.answer("📦 ارسال تجمیعی فعال شد." if persisted else "📦 ارسال تجمیعی خاموش شد.")
             await show_profile_admin(q.message, profile_id)
             return
 
@@ -10407,11 +10459,17 @@ async def post_init(app):
         # profile can race on cursors and make config posting appear broken.
         for prof in profiles:
             pid = int(prof["id"])
-            log.info(f"⏰ Creating precise config scheduler for profile {pid} ({prof['dest_name']})")
-            start_worker(app, f"auto_config_{pid}", lambda pid=pid: _profile_scheduler_v16(app.bot, pid, "config"))
-            log.info(f"⏰ Creating precise proxy scheduler for profile {pid} ({prof['dest_name']})")
-            start_worker(app, f"auto_proxy_{pid}", lambda pid=pid: _profile_scheduler_v16(app.bot, pid, "proxy"))
-        log.info("⏰ Precise automatic scheduler started: config/proxy are fully independent")
+            if get_profile_post_configs(pid):
+                log.info(f"⏰ Creating precise config scheduler for profile {pid} ({prof['dest_name']})")
+                start_worker(app, f"auto_config_{pid}", lambda pid=pid: _profile_scheduler_v16(app.bot, pid, "config"))
+            else:
+                log.info(f"⏸️ AUTO config scheduler not started for profile {pid}: posting disabled")
+            if get_profile_post_proxies(pid):
+                log.info(f"⏰ Creating precise proxy scheduler for profile {pid} ({prof['dest_name']})")
+                start_worker(app, f"auto_proxy_{pid}", lambda pid=pid: _profile_scheduler_v16(app.bot, pid, "proxy"))
+            else:
+                log.info(f"⏸️ AUTO proxy scheduler not started for profile {pid}: posting disabled")
+        log.info("⏰ Precise automatic scheduler started: only enabled streams are running")
         start_worker(app, "profile_scheduler_supervisor", lambda: _profile_scheduler_supervisor(app))
         log.info("🛡️ AUTO scheduler supervisor enabled (10s reconciliation)")
 
