@@ -1,9 +1,9 @@
 # bot.py — 4.1.4
-APP_VERSION = "4.1.12"
+APP_VERSION = "4.1.13"
 APP_VERSION_MAJOR = 4
 APP_VERSION_MINOR = 1
-APP_VERSION_PATCH = 12
-APP_VERSION_LABEL = "4.1.12-stable"
+APP_VERSION_PATCH = 13
+APP_VERSION_LABEL = "4.1.13-stable"
 BOT_VERSION = APP_VERSION
 import os
 import glob
@@ -1116,6 +1116,9 @@ c.execute("""CREATE TABLE IF NOT EXISTS manual_send_queue (
 )""")
 ensure_column("manual_send_queue", "last_error", "TEXT DEFAULT ''", "")
 ensure_column("manual_send_queue", "sent_count", "INTEGER DEFAULT 0", 0)
+ensure_column("manual_send_queue", "queue_name", "TEXT DEFAULT ''", "")
+c.execute("UPDATE manual_send_queue SET queue_name = 'صف #' || id WHERE queue_name IS NULL OR TRIM(queue_name) = ''")
+conn.commit()
 ensure_column("manual_send_queue", "fail_count", "INTEGER DEFAULT 0", 0)
 c.execute("CREATE INDEX IF NOT EXISTS idx_manual_queue_due ON manual_send_queue(status, next_run_at)")
 c.execute("CREATE INDEX IF NOT EXISTS idx_manual_queue_profile ON manual_send_queue(profile_id, status)")
@@ -1263,6 +1266,26 @@ def create_manual_queue_job(profile_id, kind, items, interval_minutes=0, batch_s
         raise ValueError("mixed proxy/config input is not allowed")
     if kind not in ("config", "proxy"):
         raise ValueError("invalid queue kind")
+    # Never store duplicate/already-posted configs in a queue. Permanent posted
+    # hashes are kept separately, so this does not delete any history.
+    if kind == "config":
+        filtered=[]; local=set()
+        for item in items:
+            key=_config_identity_hash(item)
+            if key in local or is_already_posted(profile_id, item):
+                continue
+            local.add(key); filtered.append(item)
+        items=filtered
+    else:
+        filtered=[]; local=set()
+        for item in items:
+            norm=normalize_proxy_url(item); key=_proxy_identity_hash(norm)
+            if key in local or is_proxy_posted(profile_id, norm):
+                continue
+            local.add(key); filtered.append(norm)
+        items=filtered
+    if not items:
+        return None
     interval_minutes = max(0, int(interval_minutes or 0))
     batch_size = max(1, int(batch_size or 1))
     # Telegram text has a practical ceiling; keep one queue batch bounded.
@@ -1271,12 +1294,15 @@ def create_manual_queue_job(profile_id, kind, items, interval_minutes=0, batch_s
     first_run = now + timedelta(minutes=max(0, int(first_delay_minutes or 0)))
     stamp = _queue_iso(now)
     c.execute("""INSERT INTO manual_send_queue
-        (profile_id, kind, items_json, interval_minutes, batch_size, next_run_at, status, created_at, updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?)""",
+        (profile_id, kind, items_json, interval_minutes, batch_size, next_run_at, status, created_at, updated_at, queue_name)
+        VALUES (?,?,?,?,?,?,?,?,?,?)""",
         (profile_id, kind, json.dumps(items, ensure_ascii=False), interval_minutes,
-         batch_size, _queue_iso(first_run), "pending", stamp, stamp))
+         batch_size, _queue_iso(first_run), "pending", stamp, stamp, ""))
+    job_id = c.lastrowid
+    c.execute("UPDATE manual_send_queue SET queue_name=? WHERE id=? AND profile_id=?",
+              (f"صف #{job_id}", job_id, profile_id))
     conn.commit()
-    return c.lastrowid
+    return job_id
 
 def get_manual_queue(profile_id, include_done=False):
     # The queue UI must retain cancelled jobs so an admin can resume them.
@@ -1321,7 +1347,7 @@ def update_manual_queue_job(job_id, profile_id, **changes):
     job = get_manual_queue_job(job_id, profile_id)
     if not job:
         return False
-    allowed = {"interval_minutes", "batch_size", "next_run_at", "status", "last_error", "items_json", "sent_count", "fail_count"}
+    allowed = {"interval_minutes", "batch_size", "next_run_at", "status", "last_error", "items_json", "sent_count", "fail_count", "queue_name"}
     clauses, params = [], []
     for k, v in changes.items():
         if k in allowed:
@@ -1376,6 +1402,32 @@ def remove_manual_queue_item(job_id, profile_id, index):
     return update_manual_queue_job(job_id, profile_id, items_json=json.dumps(items, ensure_ascii=False))
 
 
+def _manual_queue_identity(item, kind):
+    try:
+        return _config_identity_hash(clean_config_url(item)) if kind == "config" else _proxy_identity_hash(normalize_proxy_url(item))
+    except Exception:
+        return hashlib.sha256(str(item).strip().encode("utf-8", errors="ignore")).hexdigest()
+
+def _manual_queue_unposted_items(profile_id, kind, items):
+    """Return unique queue items that have not already been permanently posted."""
+    out=[]; seen_local=set()
+    for raw in items or []:
+        item=str(raw).strip()
+        if not item:
+            continue
+        key=_manual_queue_identity(item, kind)
+        if key in seen_local:
+            continue
+        seen_local.add(key)
+        if kind == "config":
+            if is_already_posted(profile_id, item):
+                continue
+        else:
+            if is_proxy_posted(profile_id, item):
+                continue
+        out.append(item)
+    return out
+
 def add_manual_queue_items(job_id, profile_id, items):
     """Append configs/proxies to an existing profile-owned queue job."""
     job = get_manual_queue_job(job_id, profile_id)
@@ -1390,11 +1442,12 @@ def add_manual_queue_items(job_id, profile_id, items):
         detected = "proxy" if detect_proxy_protocol(item) else "config" if detect_config_protocol(item) else ""
         if detected and kind and detected != kind:
             return False
-    current.extend(new_items)
+    merged = _manual_queue_unposted_items(profile_id, kind, current + new_items)
     return update_manual_queue_job(
         job_id, profile_id,
-        items_json=json.dumps(current, ensure_ascii=False),
-        status="pending"
+        items_json=json.dumps(merged, ensure_ascii=False),
+        status="pending",
+        last_error=""
     )
 
 def _manual_queue_take_batch(job):
@@ -1403,7 +1456,7 @@ def _manual_queue_take_batch(job):
         return []
     return items[:max(1, min(50, int(job.get("batch_size") or 1)))]
 
-def _manual_queue_commit_batch(job_id, profile_id, sent_items, error=""):
+def _manual_queue_commit_batch(job_id, profile_id, sent_items, error="", consumed_items=None):
     job = get_manual_queue_job(job_id, profile_id)
     if not job:
         return
@@ -1413,9 +1466,10 @@ def _manual_queue_commit_batch(job_id, profile_id, sent_items, error=""):
         log.info(f"[MANUAL_QUEUE] job={job_id} remains cancelled; preserving queue after send attempt")
         return
     remaining = list(job.get("items") or [])
-    sent_set = set(sent_items or [])
-    # Preserve order while removing exactly the items that were successfully published.
-    remaining = [x for x in remaining if x not in sent_set]
+    consumed_set = set(consumed_items if consumed_items is not None else (sent_items or []))
+    # Preserve order while removing only items that were successfully published or
+    # were proven duplicate at send time. Duplicates are consumed but never sent.
+    remaining = [x for x in remaining if x not in consumed_set]
     sent_count = int(job.get("sent_count") or 0) + len(sent_items or [])
     if error and not sent_items:
         # Permanent failures must never create an infinite hot loop.
@@ -1458,8 +1512,8 @@ async def _send_manual_config_items(bot, profile_id, items):
     items = [str(x).strip() for x in (items or []) if str(x).strip()]
     if not items:
         return 0
-    # De-duplicate only within this manual batch. Explicit manual sending is
-    # intentionally allowed even if AUTO has posted the same config before.
+    # Legacy compatibility helper: permanent once-only dedup is still enforced
+    # by post_configs; automatic cursor state remains untouched.
     unique = []
     keys = set()
     for url in items:
@@ -1502,7 +1556,7 @@ async def _send_manual_proxy_items(bot, profile_id, items):
         flag_rows.append((norm,0,flag,country_code))
     cnt,payload,selected = await post_proxies(
         bot, profile_id, flag_rows, is_instant=True,
-        max_proxies_override=len(flag_rows), dedup=False
+        max_proxies_override=len(flag_rows), dedup=True
     )
     if cnt <= 0 or not payload:
         return 0
@@ -1525,20 +1579,29 @@ async def _send_manual_queue_batch(bot, job):
         return 0
 
     if kind == "config":
-        # Do not run the generic health filter here. Manual scheduling is an explicit
-        # admin action; structural validation was already performed at intake.
-        working = [(url, 0, 0) for url in batch]
+        # Manual queues also obey the permanent once-only dedup ledger. This does NOT
+        # advance automatic cursors/state; it only prevents a duplicate from ever being sent.
+        sendable=[]; duplicate_items=[]; local=set()
+        for url in batch:
+            key=_manual_queue_identity(url, "config")
+            if key in local or is_already_posted(profile_id, url):
+                duplicate_items.append(url)
+                continue
+            local.add(key); sendable.append(url)
+        if not sendable:
+            _manual_queue_commit_batch(job["id"], profile_id, [], "", consumed_items=duplicate_items)
+            return 0
+        working = [(url, 0, 0) for url in sendable]
         sent = await post_configs(
             bot, profile_id, working, source_for_seen="manual",
-            is_instant=True, max_post_override=len(batch),
-            dedup=False, update_auto_state=False
+            is_instant=True, max_post_override=len(sendable),
+            dedup=True, update_auto_state=False
         )
         if sent <= 0:
-            _manual_queue_commit_batch(job["id"], profile_id, [], "Telegram config send failed")
+            _manual_queue_commit_batch(job["id"], profile_id, [], "Telegram config send failed", consumed_items=duplicate_items)
             return 0
-        # post_configs marks exactly the successfully delivered configs. Remove the
-        # corresponding leading items; if a duplicate was already posted, it is also safe.
-        _manual_queue_commit_batch(job["id"], profile_id, batch[:sent], "")
+        successful = sendable[:sent]
+        _manual_queue_commit_batch(job["id"], profile_id, successful, "", consumed_items=duplicate_items + successful)
         return sent
 
     sent = await _send_manual_proxy_items(bot, profile_id, batch)
@@ -1549,21 +1612,23 @@ async def _send_manual_queue_batch(bot, job):
     return sent
 
 
-DB_RETENTION_HOURS = 24 * 7
+CONFIG_RETENTION_HOURS = 24 * 7
+RUNTIME_RETENTION_HOURS = 24
 
 def cleanup_expired_runtime_data():
     """Remove disposable runtime history after 7 days; profiles/settings and permanent dedup ledgers stay forever."""
-    cutoff = (datetime.now(TEHRAN_TZ) - timedelta(hours=DB_RETENTION_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+    config_cutoff = (datetime.now(TEHRAN_TZ) - timedelta(hours=CONFIG_RETENTION_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+    runtime_cutoff = (datetime.now(TEHRAN_TZ) - timedelta(hours=RUNTIME_RETENTION_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
     deleted = {}
     for table, where in (("posts", "created_at < ?"), ("processed_messages", "updated_at < ?"), ("manual_send_queue", "status IN (\'done\',\'cancelled\',\'failed\') AND updated_at < ?")):
         try:
-            cur = c.execute(f"DELETE FROM {table} WHERE {where}", (cutoff,))
+            cur = c.execute(f"DELETE FROM {table} WHERE {where}", (runtime_cutoff,))
             deleted[table] = cur.rowcount
         except sqlite3.OperationalError:
             deleted[table] = 0
     try:
-        cur = c.execute("DELETE FROM country_cache")
-        deleted["country_cache"] = cur.rowcount
+        # country_cache contains country/flag metadata and is intentionally permanent.
+        deleted["country_cache"] = 0
     except sqlite3.OperationalError:
         deleted["country_cache"] = 0
     conn.commit()
@@ -3608,6 +3673,7 @@ def canonical_config_identity(url):
 _SEEN_CONFIG_KEYS = set()
 _SEEN_PROXY_KEYS = set()
 _DEDUP_CACHE_READY = False
+_INFLIGHT_CONFIG_KEYS = set()
 
 def _config_identity_hash(url):
     return hashlib.sha256(canonical_config_identity(url).encode("utf-8", errors="ignore")).hexdigest()
@@ -4455,21 +4521,37 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
     blacklist_words = get_blacklist(profile_id)
     filtered_working = []
     local_seen = set()
+    reserved_keys = []
     for url, ping, cnt in working:
         identity_hash = _config_identity_hash(url)
+        inflight_key=(int(profile_id), identity_hash)
         if identity_hash in local_seen:
             log.info(f"⏭️ Duplicate config skipped inside current send: {str(url)[:70]}...")
             continue
         if dedup and is_already_posted(profile_id, url):
             log.info(f"⏭️ Duplicate config skipped before send: {str(url)[:70]}...")
             continue
+        # Process-wide in-flight reservation closes the race between manual and
+        # automatic senders in the same process. Reservation is released on exit
+        # if Telegram delivery fails, while successful delivery is persisted below.
+        if dedup and inflight_key in _INFLIGHT_CONFIG_KEYS:
+            log.info(f"⏭️ Duplicate config skipped: already being sent {str(url)[:70]}...")
+            continue
         local_seen.add(identity_hash)
         if blacklist_words and is_word_blacklisted(profile_id, url):
             log.info(f"⛔ Blacklisted config skipped: {url[:50]}...")
             continue
+        if dedup:
+            _INFLIGHT_CONFIG_KEYS.add(inflight_key)
+            reserved_keys.append(inflight_key)
         filtered_working.append((url, ping, cnt))
 
     items = sorted(filtered_working, key=lambda x: x[1])[:max_post]
+    # Release reservations for candidates trimmed by max_post.
+    selected_keys={(int(profile_id), _config_identity_hash(url)) for url,_,_ in items}
+    for _key in reserved_keys:
+        if _key not in selected_keys:
+            _INFLIGHT_CONFIG_KEYS.discard(_key)
     if not items:
         return 0
 
@@ -4628,6 +4710,8 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
             f"⛔ [CONFIG][profile={profile_id}] refusing empty banner send: "
             f"items={len(items)} blocks={len(config_blocks)} entries={len(posted_entries)}"
         )
+        for _key in reserved_keys:
+            _INFLIGHT_CONFIG_KEYS.discard(_key)
         return 0
 
     if config_mode == 1:
@@ -4729,12 +4813,16 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
         log.error(f"❌ Config send stopped after partial success: sent={sent_count}")
         if update_auto_state and sent_count > 0:
             set_profile_last_num(profile_id, last_n + sent_count)
+        for _key in reserved_keys:
+            _INFLIGHT_CONFIG_KEYS.discard(_key)
         return sent_count
 
     if update_auto_state and sent_count > 0:
         set_profile_last_num(profile_id, last_n + sent_count)
 
     log.info(f"✅ Sent {sent_count} configs in one message to {dest}")
+    for _key in reserved_keys:
+        _INFLIGHT_CONFIG_KEYS.discard(_key)
     return sent_count
 
 async def post_proxies(bot, profile_id, proxies_with_ping, is_instant=False, max_proxies_override=None, dedup=True):
@@ -5812,33 +5900,44 @@ async def send_daily_report(app):
     except Exception as e:
         log.error(f"❌ Failed to send daily report: {e}")
 
+_LOG_PRUNE_LOCK = threading.Lock()
+
+def _prune_log_to_30_minutes():
+    """Keep only timestamped bot.log records from the last 30 minutes."""
+    path=os.path.join(DATA_DIR, "bot.log")
+    if not os.path.exists(path):
+        return 0
+    cutoff=datetime.now(TEHRAN_TZ)-timedelta(minutes=30)
+    try:
+        with _LOG_PRUNE_LOCK:
+            with open(path,"r",encoding="utf-8",errors="ignore") as f:
+                lines=f.readlines()
+            kept=[]
+            for line in lines:
+                m=re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})",line)
+                if not m:
+                    # Preserve continuation/traceback lines only if the file still has
+                    # a recent timestamped record; they are tiny and avoid broken tracebacks.
+                    if kept: kept.append(line)
+                    continue
+                try:
+                    ts=normalize_datetime_value(m.group(1))
+                    if ts>=cutoff: kept.append(line)
+                except Exception:
+                    kept.append(line)
+            # Truncate/rewrite the same inode because logging.FileHandler keeps
+            # its file descriptor open for the lifetime of the bot. Replacing the
+            # path would make future log lines continue in an unlinked old inode.
+            with open(path,"w",encoding="utf-8") as f: f.writelines(kept)
+            return len(kept)
+    except Exception as exc:
+        log.warning("[LOG PRUNE] skipped: %s",exc)
+        return 0
+
 async def periodic_cleanup():
     while True:
         try:
-            log_file_path = os.path.join(DATA_DIR, "bot.log")
-            if os.path.exists(log_file_path):
-                now_tehran = datetime.now(TEHRAN_TZ)
-                cutoff_tehran = now_tehran - timedelta(minutes=30)
-                lines_to_keep = []
-                with open(log_file_path, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        match = re.match(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', line)
-                        if match:
-                            ts_str = match.group(1)
-                            try:
-                                ts = normalize_datetime_value(ts_str)
-                                if ts >= cutoff_tehran:
-                                    lines_to_keep.append(line)
-                            except:
-                                lines_to_keep.append(line)
-                        else:
-                            lines_to_keep.append(line)
-                if len(lines_to_keep) > 0:
-                    with open(log_file_path, 'w', encoding='utf-8') as f:
-                        f.writelines(lines_to_keep)
-                else:
-                    with open(log_file_path, 'w', encoding='utf-8') as f:
-                        pass
+            await asyncio.to_thread(_prune_log_to_30_minutes)
 
             now_ts = time.time()
             for fname in os.listdir(DATA_DIR):
@@ -6644,7 +6743,8 @@ def manual_queue_list_kb(profile_id, page=1):
         interval_text="فوری" if interval==0 else f"هر {interval}د"
         status = str(job.get("status") or "pending")
         status_icon = {"pending": "🟢", "cancelled": "⛔", "running": "🔵", "done": "✅", "failed": "⚠️"}.get(status, "❔")
-        btns.append([InlineKeyboardButton(f"{status_icon} {kind} #{job['id']} • {count} باقی • {interval_text}",callback_data=f"mq_detail_{profile_id}_{job['id']}",style="primary")])
+        qname=html.escape(str(job.get("queue_name") or f"صف #{job['id']}"))
+        btns.append([InlineKeyboardButton(f"{status_icon} {qname} • {kind} • {count} باقی • {interval_text}",callback_data=f"mq_detail_{profile_id}_{job['id']}",style="primary")])
     if not btns: btns.append([InlineKeyboardButton("صف خالی است",callback_data="dummy",style="primary")])
     if total_pages>1:
         nav=[]
@@ -6678,6 +6778,9 @@ def manual_queue_detail_kb(profile_id, job_id, items, item_page=1):
         btns.append(nav)
     btns.append([InlineKeyboardButton("✏️ تغییر فاصله زمانی", callback_data=f"mq_edit_interval_{profile_id}_{job_id}", style="primary"),
                  InlineKeyboardButton("📦 تغییر تعداد در هر پست", callback_data=f"mq_edit_batch_{profile_id}_{job_id}", style="primary")])
+    btns.append([InlineKeyboardButton("✏️ نام‌گذاری صف", callback_data=f"mq_rename_{profile_id}_{job_id}", style="primary")])
+    if str((get_manual_queue_job(job_id, profile_id) or {}).get("kind") or "") == "config":
+        btns.append([InlineKeyboardButton("📄 دریافت کانفیگ‌های فعالِ پست‌نشده TXT", callback_data=f"mq_export_{profile_id}_{job_id}", style="success")])
     btns.append([InlineKeyboardButton("➕ افزودن سرور به این صف", callback_data=f"mq_add_{profile_id}_{job_id}", style="success")])
     status = str((get_manual_queue_job(job_id, profile_id) or {}).get("status") or "pending")
     if status == "cancelled":
@@ -6701,7 +6804,8 @@ def manual_queue_text(job):
     preview = "\n".join(f"{i+1}. {html.escape(str(x)[:100])}" for i, x in enumerate(items[:12]))
     if len(items) > 12:
         preview += f"\n... و {len(items)-12} مورد دیگر"
-    return (f"📋 <b>صف #{job['id']}</b>\n"
+    queue_name=html.escape(str(job.get("queue_name") or f"صف #{job['id']}"))
+    return (f"📋 <b>{queue_name}</b> • #{job['id']}\n"
             f"نوع: {kind}\nباقی‌مانده: <b>{len(items)}</b>\n"
             f"تعداد هر پست: <b>{batch}</b>\n"
             f"فاصله: <b>{'فوری' if interval == 0 else str(interval) + ' دقیقه'}</b>\n"
@@ -8674,6 +8778,40 @@ async def _on_callback_impl(u, ctx):
             await q.answer("🗑 صف به‌طور کامل حذف شد")
             await q.edit_message_text("📋 صف ارسال‌های دستی", reply_markup=manual_queue_list_kb(profile_id)); return
 
+        if d.startswith("mq_rename_"):
+            parts=d.split("_")
+            try: profile_id=int(parts[2]); job_id=int(parts[3])
+            except (ValueError,IndexError): await q.answer("⚠️ داده نامعتبر", show_alert=True); return
+            if not get_manual_queue_job(job_id, profile_id):
+                await q.answer("صف پیدا نشد", show_alert=True); return
+            ctx.user_data["manual_queue_rename"]={"profile_id":profile_id,"job_id":job_id}
+            await q.answer("نام جدید را ارسال کن")
+            await q.edit_message_text("✏️ نام جدید صف را ارسال کن (حداکثر 60 کاراکتر).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data=f"mq_detail_{profile_id}_{job_id}", style="primary")]]))
+            return
+
+        if d.startswith("mq_export_"):
+            parts=d.split("_")
+            try: profile_id=int(parts[2]); job_id=int(parts[3])
+            except (ValueError,IndexError): await q.answer("⚠️ داده نامعتبر", show_alert=True); return
+            job=get_manual_queue_job(job_id, profile_id)
+            if not job or job.get("kind") != "config":
+                await q.answer("صف کانفیگ پیدا نشد", show_alert=True); return
+            items=_manual_queue_unposted_items(profile_id, "config", job.get("items") or [])
+            if not items:
+                await q.answer("کانفیگ فعال و پست‌نشده‌ای در این صف نیست", show_alert=True); return
+            safe_name=re.sub(r"[^A-Za-z0-9_-]+", "_", str(job.get("queue_name") or f"queue_{job_id}"))[:40].strip("_") or f"queue_{job_id}"
+            path=os.path.join(DATA_DIR, f"{safe_name}_unposted_{get_tehran_date()}.txt")
+            try:
+                with open(path,"w",encoding="utf-8") as f:
+                    f.write("\n".join(items)+"\n")
+                with open(path,"rb") as f:
+                    await q.message.reply_document(document=f, filename=os.path.basename(path), caption=f"📄 {len(items)} کانفیگ فعال و پست‌نشده از {job.get('queue_name') or ('صف #'+str(job_id))}")
+                await q.answer("✅ فایل آماده شد")
+            finally:
+                try: os.remove(path)
+                except OSError: pass
+            return
+
         if d.startswith("mq_add_"):
             parts = d.split("_")
             try:
@@ -9409,28 +9547,45 @@ async def _on_text_impl(u, ctx):
         )
         return
 
+    rename_state=ctx.user_data.get("manual_queue_rename")
+    if rename_state and u.message.text:
+        name=" ".join((u.message.text or "").split()).strip()[:60]
+        if not name:
+            await u.message.reply_text("❌ نام صف نمی‌تواند خالی باشد.")
+            return
+        if update_manual_queue_job(int(rename_state["job_id"]), int(rename_state["profile_id"]), queue_name=name):
+            ctx.user_data.pop("manual_queue_rename",None)
+            job=get_manual_queue_job(int(rename_state["job_id"]), int(rename_state["profile_id"]))
+            await u.message.reply_text("✅ نام صف ذخیره شد.", reply_markup=manual_queue_detail_kb(int(rename_state["profile_id"]), int(rename_state["job_id"]), job.get("items") or []))
+        else:
+            await u.message.reply_text("❌ ذخیره نام صف ناموفق بود.")
+        return
+
     add_state = ctx.user_data.get("manual_queue_add")
-    if add_state and (u.message.text or u.message.document):
-        items = []
+    if add_state and u.message.text:
+        items=[]
+        text=u.message.text or ""
+        for url in extract_links_from_text(text):
+            if detect_config_protocol(url): items.append(clean_config_url(url))
+        for url in extract_proxy_links_from_text(text):
+            norm=normalize_proxy_url(url)
+            if norm: items.append(norm)
+        for line in text.splitlines():
+            line=line.strip()
+            if detect_config_protocol(line): items.append(clean_config_url(line))
+            elif detect_proxy_protocol(line): items.append(normalize_proxy_url(line))
+        items=list(dict.fromkeys(x for x in items if x))
         try:
-            if u.message.document:
-                f = await u.message.document.get_file()
-                data = await f.download_as_bytearray()
-                text = data.decode("utf-8", errors="ignore")
+            job=get_manual_queue_job(add_state["job_id"], add_state["profile_id"])
+            if not job:
+                await u.message.reply_text("❌ صف پیدا نشد.")
             else:
-                text = u.message.text or ""
-            for line in text.splitlines():
-                line=line.strip()
-                if detect_config_protocol(line) or detect_proxy_protocol(line):
-                    items.append(line)
-            # support forwarded posts with hidden telegram links/entities
-            if not items:
-                items.extend(extract_supported_links_from_message(u.message))
-            if items:
-                add_manual_queue_items(add_state["job_id"], add_state["profile_id"], items)
-                await u.message.reply_text(f"✅ {len(items)} سرور به صف اضافه شد")
-            else:
-                await u.message.reply_text("❌ کانفیگ یا پروکسی پیدا نشد")
+                kind=str(job.get("kind") or "")
+                items=_manual_queue_unposted_items(add_state["profile_id"], kind, items)
+                if items and add_manual_queue_items(add_state["job_id"], add_state["profile_id"], items):
+                    await u.message.reply_text(f"✅ {len(items)} مورد جدید به صف اضافه شد")
+                else:
+                    await u.message.reply_text("⚠️ مورد جدید و تکرارنشده‌ای برای این صف پیدا نشد.")
         finally:
             ctx.user_data.pop("manual_queue_add", None)
         return
@@ -9990,8 +10145,65 @@ async def _on_text_impl(u, ctx):
         await show_profile_admin(u.message, profile_id)
         return
 
+async def _process_manual_queue_add_document(u, ctx, state):
+    """Accept TXT/encoded TXT directly when adding servers to an existing queue."""
+    profile_id=int(state["profile_id"]); job_id=int(state["job_id"])
+    doc=u.message.document
+    if not doc:
+        return False
+    if doc.file_size and doc.file_size > 5 * 1024 * 1024:
+        await u.message.reply_text("❌ فایل بزرگ است؛ حداکثر 5MB")
+        return True
+    try:
+        f=await doc.get_file()
+        data=await f.download_as_bytearray()
+        text=data.decode("utf-8", errors="ignore")
+        if re.fullmatch(r"[A-Za-z0-9+/=\s]+", text.strip() or ""):
+            try:
+                decoded=base64.b64decode(text.strip(), validate=True).decode("utf-8", errors="ignore")
+                if decoded.strip(): text=decoded
+            except Exception:
+                pass
+        configs=[]; proxies=[]
+        for url in extract_links_from_text(text):
+            if detect_config_protocol(url): configs.append(clean_config_url(url))
+        for url in extract_proxy_links_from_text(text):
+            norm=normalize_proxy_url(url)
+            if norm and is_telegram_proxy_url(norm): proxies.append(norm)
+        # Also accept one raw URI per line, including formats the generic extractor misses.
+        for raw in text.splitlines():
+            line=raw.strip()
+            if not line: continue
+            if detect_config_protocol(line): configs.append(clean_config_url(line))
+            elif detect_proxy_protocol(line): proxies.append(normalize_proxy_url(line))
+        configs=list(dict.fromkeys(x for x in configs if x))
+        proxies=list(dict.fromkeys(x for x in proxies if x))
+        job=get_manual_queue_job(job_id, profile_id)
+        if not job:
+            await u.message.reply_text("❌ صف پیدا نشد.")
+            return True
+        kind=str(job.get("kind") or "")
+        incoming=configs if kind=="config" else proxies
+        if kind=="config": incoming=_manual_queue_unposted_items(profile_id, "config", incoming)
+        else: incoming=_manual_queue_unposted_items(profile_id, "proxy", incoming)
+        if not incoming:
+            await u.message.reply_text("⚠️ هیچ مورد جدید و تکرارنشده‌ای برای این صف پیدا نشد.")
+            return True
+        ok=add_manual_queue_items(job_id, profile_id, incoming)
+        await u.message.reply_text(f"✅ {len(incoming)} مورد جدید به صف #{job_id} اضافه شد." if ok else "❌ نوع سرورها با این صف سازگار نیست.")
+        return True
+    except Exception as exc:
+        log.exception("manual queue TXT import failed")
+        await u.message.reply_text(f"❌ خطا در خواندن TXT: {str(exc)[:200]}")
+        return True
+
 async def _on_document_impl(u, ctx):
     if not is_admin(u.effective_user.id):
+        return
+    queue_add_state = ctx.user_data.get("manual_queue_add")
+    if queue_add_state and u.message.document:
+        await _process_manual_queue_add_document(u, ctx, queue_add_state)
+        ctx.user_data.pop("manual_queue_add", None)
         return
     a = ctx.user_data.get("action")
     if not a:
@@ -10203,56 +10415,58 @@ def automatic_database_cleanup():
     try:
         db = get_conn()
         cur = db.cursor()
-        cutoff = (datetime.now(TEHRAN_TZ) - timedelta(hours=DB_RETENTION_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+        config_cutoff = (datetime.now(TEHRAN_TZ) - timedelta(hours=CONFIG_RETENTION_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+        runtime_cutoff = (datetime.now(TEHRAN_TZ) - timedelta(hours=RUNTIME_RETENTION_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
         deleted = {}
         try:
-            cur.execute("DELETE FROM manual_send_queue WHERE status IN ('done','cancelled','failed') AND updated_at < ?", (cutoff,))
+            cur.execute("DELETE FROM manual_send_queue WHERE status IN ('done','cancelled','failed') AND updated_at < ?", (runtime_cutoff,))
             deleted["manual_send_queue"] = max(0, cur.rowcount)
         except sqlite3.Error:
             deleted["manual_send_queue"] = 0
-        # URL history is disposable after 7 days. Permanent once-only hashes remain.
+        # Full config/proxy URL history stays 7 days. Permanent compact dedup hashes remain forever.
         for table, col in (("seen", "last_posted"), ("proxies_seen", "last_posted")):
             try:
-                cur.execute(f"DELETE FROM {table} WHERE {col} IS NOT NULL AND {col} < ?", (cutoff,))
+                cur.execute(f"DELETE FROM {table} WHERE {col} IS NOT NULL AND {col} < ?", (config_cutoff,))
                 deleted[table] = max(0, cur.rowcount)
             except sqlite3.Error:
                 deleted[table] = 0
 
-        try:
-            cur.execute("DELETE FROM country_cache")
-            deleted["country_cache"] = max(0, cur.rowcount)
-        except sqlite3.Error:
-            deleted["country_cache"] = 0
-        # These legacy tables are no longer part of the posting decision path.
-        # Keep the table definitions for compatibility, but remove their rows.
-        for table in ("processed_messages", "last_scrape", "posts"):
+        # NEVER delete country/flag cache; flags must remain available.
+        deleted["country_cache"] = 0
+        # Short-lived runtime history: one day. Scrape cursors are NOT disposable.
+        for table, col in (("processed_messages", "rowid"), ("posts", "created_at")):
             try:
-                cur.execute(f"DELETE FROM {table}")
+                if table == "processed_messages":
+                    # processed_messages has no timestamp column; it is safe to remove
+                    # the old rows because source_stream_state is the real cursor.
+                    cur.execute("DELETE FROM processed_messages")
+                else:
+                    cur.execute("DELETE FROM posts WHERE created_at < ?", (runtime_cutoff,))
                 deleted[table] = max(0, cur.rowcount)
             except sqlite3.Error:
                 deleted[table] = 0
         try:
-            pending_cutoff = (datetime.now(TEHRAN_TZ) - timedelta(hours=48)).strftime("%Y-%m-%d %H:%M:%S")
+            pending_cutoff = runtime_cutoff
             cur.execute("DELETE FROM pending_batch_items WHERE added_at < ?", (pending_cutoff,))
             deleted["pending_batch_items"] = max(0, cur.rowcount)
         except sqlite3.Error:
             deleted["pending_batch_items"] = 0
         try:
-            cache_cutoff = (datetime.now(TEHRAN_TZ) - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
+            cache_cutoff = runtime_cutoff
             cur.execute("DELETE FROM batch_test_cache WHERE tested_at < ?", (cache_cutoff,))
             deleted["batch_test_cache"] = max(0, cur.rowcount)
         except sqlite3.Error:
             deleted["batch_test_cache"] = 0
         # Admin activity is useful, but only recent 7-day activity is needed.
         try:
-            cur.execute("DELETE FROM admin_activity WHERE created_at < ?", (cutoff,))
+            cur.execute("DELETE FROM admin_activity WHERE created_at < ?", (runtime_cutoff,))
             deleted["admin_activity"] = max(0, cur.rowcount)
         except sqlite3.Error:
             deleted["admin_activity"] = 0
         # channel_posts is the authoritative 7-day record of messages actually
         # sent by each profile, including messages that were later deleted.
         try:
-            cur.execute("DELETE FROM channel_posts WHERE sent_at < ?", (cutoff,))
+            cur.execute("DELETE FROM channel_posts WHERE sent_at < ?", (config_cutoff,))
             deleted["channel_posts"] = max(0, cur.rowcount)
         except sqlite3.Error:
             deleted["channel_posts"] = 0
@@ -10308,7 +10522,7 @@ async def database_compact_worker():
         log.exception("[DB COMPACT] worker failed")
 
 async def database_cleanup_worker():
-    log.info('[DB CLEANER] worker started | retention=7d | compact-after-cleanup')
+    log.info('[DB CLEANER] worker started | config-retention=7d | runtime-retention=1d | flags=permanent | compact-after-cleanup')
     # Never compete with startup/callback initialization.
     await asyncio.sleep(10)
     while True:
