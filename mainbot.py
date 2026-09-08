@@ -1410,7 +1410,7 @@ def _manual_queue_identity(item, kind):
         return hashlib.sha256(str(item).strip().encode("utf-8", errors="ignore")).hexdigest()
 
 def _manual_queue_unposted_items(profile_id, kind, items):
-    """Return unique queue items that have not already been permanently posted."""
+    """Return the exact unique queue items that are still unposted."""
     out=[]; seen_local=set()
     for raw in items or []:
         item=str(raw).strip()
@@ -1428,6 +1428,12 @@ def _manual_queue_unposted_items(profile_id, kind, items):
                 continue
         out.append(item)
     return out
+
+def _manual_queue_active_count(profile_id, job):
+    """Count exactly what the TXT export will contain."""
+    if not job:
+        return 0
+    return len(_manual_queue_unposted_items(profile_id, str(job.get("kind") or ""), job.get("items") or []))
 
 def add_manual_queue_items(job_id, profile_id, items):
     """Append configs/proxies to an existing profile-owned queue job."""
@@ -6739,7 +6745,7 @@ def manual_queue_list_kb(profile_id, page=1):
     btns=[]
     for job in paginate_items(jobs,page,per_page):
         kind="📡" if job["kind"]=="config" else "🌐"
-        count=len(job.get("items") or [])
+        count=_manual_queue_active_count(profile_id, job)
         interval=int(job.get("interval_minutes") or 0)
         interval_text="فوری" if interval==0 else f"هر {interval}د"
         status = str(job.get("status") or "pending")
@@ -6793,9 +6799,9 @@ def manual_queue_detail_kb(profile_id, job_id, items, item_page=1):
     btns.append([InlineKeyboardButton("🔙 صف", callback_data=f"mq_list_{profile_id}", style="primary")])
     return InlineKeyboardMarkup(btns)
 
-def manual_queue_text(job):
+def manual_queue_text(job, profile_id):
     kind = "کانفیگ" if job["kind"] == "config" else "پروکسی"
-    items = job.get("items") or []
+    items = _manual_queue_unposted_items(profile_id, str(job.get("kind") or ""), job.get("items") or [])
     interval = int(job.get("interval_minutes") or 0)
     batch = int(job.get("batch_size") or 1)
     status = job.get("status", "pending")
@@ -8712,7 +8718,7 @@ async def _on_callback_impl(u, ctx):
             if not job or job.get("status") not in ("pending", "cancelled", "running"):
                 await q.answer("این صف دیگر قابل مدیریت نیست", show_alert=True)
                 await q.edit_message_text("📋 صف ارسال‌های دستی", reply_markup=manual_queue_list_kb(profile_id)); return
-            await q.edit_message_text(manual_queue_text(job), parse_mode="HTML", reply_markup=manual_queue_detail_kb(profile_id, job_id, job.get("items") or [], item_page))
+            await q.edit_message_text(manual_queue_text(job, profile_id), parse_mode="HTML", reply_markup=manual_queue_detail_kb(profile_id, job_id, job.get("items") or [], item_page))
             return
 
         if d.startswith("mq_rm_"):
@@ -8727,7 +8733,7 @@ async def _on_callback_impl(u, ctx):
                 await q.answer("✅ مورد حذف شد و صف خالی شد")
                 await q.edit_message_text("📋 صف فعال", reply_markup=manual_queue_list_kb(profile_id)); return
             await q.answer("✅ مورد حذف شد")
-            await q.edit_message_text(manual_queue_text(job), parse_mode="HTML", reply_markup=manual_queue_detail_kb(profile_id, job_id, job.get("items") or [], item_page))
+            await q.edit_message_text(manual_queue_text(job, profile_id), parse_mode="HTML", reply_markup=manual_queue_detail_kb(profile_id, job_id, job.get("items") or [], item_page))
             return
 
         if d.startswith("mq_cancel_"):
@@ -8750,7 +8756,7 @@ async def _on_callback_impl(u, ctx):
                 await q.answer("⚠️ صف قابل بازیابی نیست", show_alert=True)
             job=get_manual_queue_job(job_id, profile_id)
             if job:
-                await q.edit_message_text(manual_queue_text(job), parse_mode="HTML", reply_markup=manual_queue_detail_kb(profile_id, job_id, job.get("items") or []))
+                await q.edit_message_text(manual_queue_text(job, profile_id), parse_mode="HTML", reply_markup=manual_queue_detail_kb(profile_id, job_id, job.get("items") or []))
             else:
                 await q.edit_message_text("📋 صف ارسال‌های دستی", reply_markup=manual_queue_list_kb(profile_id))
             return
@@ -8852,7 +8858,7 @@ async def _on_callback_impl(u, ctx):
                 await q.edit_message_text("📋 صف فعال", reply_markup=manual_queue_list_kb(profile_id))
                 return
             await q.edit_message_text(
-                manual_queue_text(job), parse_mode="HTML",
+                manual_queue_text(job, profile_id), parse_mode="HTML",
                 reply_markup=manual_queue_detail_kb(profile_id, job_id, job.get("items") or [])
             )
             return
