@@ -1,9 +1,9 @@
-# bot.py — 4.1.4
-APP_VERSION = "4.1.13"
+# bot.py — 4.1.14
+APP_VERSION = "4.1.14"
 APP_VERSION_MAJOR = 4
 APP_VERSION_MINOR = 1
-APP_VERSION_PATCH = 13
-APP_VERSION_LABEL = "4.1.13-stable"
+APP_VERSION_PATCH = 14
+APP_VERSION_LABEL = "4.1.14-stable"
 BOT_VERSION = APP_VERSION
 import os
 import glob
@@ -3898,47 +3898,98 @@ def strip_url_fragment(url):
     return url
 
 def extract_host(url):
+    """
+    Extract ONLY the actual target host used by Check-Host.
+    VMess is special: its payload is Base64(JSON), so it must be decoded first
+    and the JSON `add` field is used as the host. Other supported URI schemes
+    use their URI hostname (or the Telegram proxy `server` parameter).
+    """
     try:
-        parsed = urlparse(url)
-        host = parsed.hostname
-        port = parsed.port
+        raw_url = html.unescape(str(url or "")).strip()
+        if not raw_url:
+            return None, None
 
-        if host and host.lower() == 't.me' and parsed.path.startswith('/proxy'):
+        # VMess: decode the payload first; never try to parse the Base64 text as
+        # a URI hostname.
+        if raw_url.lower().startswith("vmess://"):
+            payload = raw_url.split("://", 1)[1].split("#", 1)[0].strip()
+            try:
+                decoded = _decode_b64(payload).decode("utf-8", errors="strict")
+                obj = json.loads(decoded)
+                host = str(obj.get("add") or obj.get("address") or "").strip()
+                port_raw = obj.get("port")
+                try:
+                    port = int(port_raw) if port_raw not in (None, "") else None
+                except (TypeError, ValueError):
+                    port = None
+                if host:
+                    return host, port
+            except Exception as e:
+                log.debug("VMESS host extraction failed: %s", e)
+                return None, None
+
+        parsed = urlparse(raw_url)
+        host = parsed.hostname
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+
+        # Telegram MTProto/SOCKS proxy links keep the actual server in
+        # ?server=... rather than in the URI hostname.
+        if parsed.scheme.lower() in ("https", "http", "tg") and (
+            parsed.path.lower().startswith("/proxy") or parsed.netloc.lower() == "proxy"
+        ):
             query = parse_qs(parsed.query)
-            server = query.get('server', [None])[0]
+            server = (query.get("server") or [None])[0]
             if server:
-                if ':' in server:
-                    host, port_str = server.rsplit(':', 1)
-                    port = int(port_str)
+                server = str(server).strip()
+                if server.startswith("[") and "]" in server:
+                    close = server.find("]")
+                    host = server[1:close]
+                    remainder = server[close + 1:]
+                    if remainder.startswith(":") and remainder[1:].isdigit():
+                        port = int(remainder[1:])
+                elif server.count(":") == 1:
+                    maybe_host, maybe_port = server.rsplit(":", 1)
+                    if maybe_port.isdigit():
+                        host, port = maybe_host, int(maybe_port)
+                    else:
+                        host = server
                 else:
                     host = server
-                    port_str = query.get('port', [None])[0]
-                    if port_str:
-                        port = int(port_str)
+                if port is None:
+                    port_raw = (query.get("port") or [None])[0]
+                    if str(port_raw or "").isdigit():
+                        port = int(port_raw)
                 return host, port
             return host, port
 
         if host:
-            if parsed.port:
-                return host, parsed.port
-            else:
-                if ':' in parsed.netloc:
-                    host_part, port_part = parsed.netloc.rsplit(':', 1)
-                    if port_part.isdigit():
-                        return host_part, int(port_part)
-                return host, None
-        if "://" in url:
-            url = url.split("://", 1)[1]
-        for c in '?#':
-            if c in url:
-                url = url.split(c)[0]
-        if "@" in url:
-            url = url.split("@")[-1]
-        if ":" in url:
-            host, port = url.rsplit(":", 1)
-            return host.strip(), int(port)
-        else:
-            return url.strip(), None
+            return host, port
+
+        # Conservative fallback for legacy/non-standard forms.
+        candidate = raw_url
+        if "://" in candidate:
+            candidate = candidate.split("://", 1)[1]
+        candidate = candidate.split("?", 1)[0].split("#", 1)[0]
+        if "@" in candidate:
+            candidate = candidate.rsplit("@", 1)[-1]
+        candidate = candidate.strip()
+
+        if candidate.startswith("[") and "]" in candidate:
+            close = candidate.find("]")
+            host = candidate[1:close]
+            rest = candidate[close + 1:]
+            port = int(rest[1:]) if rest.startswith(":") and rest[1:].isdigit() else None
+            return host, port
+
+        if ":" in candidate:
+            maybe_host, maybe_port = candidate.rsplit(":", 1)
+            if maybe_port.isdigit():
+                return maybe_host.strip(), int(maybe_port)
+
+        return candidate or None, None
     except Exception as e:
         log.warning(f"extract_host error for {url}: {e}")
         return None, None
@@ -4026,89 +4077,206 @@ async def test_tcp_ping(host, port):
     except Exception:
         return False, 0
 
-async def ping_from_iran_only(host, port=None, allow_tcp_fallback=True):
-    ip = await host_to_ip(host)
-    if not ip:
-        ip = host
-    target = ip
+_CHECKHOST_IRAN_NODES = None
+_CHECKHOST_IRAN_NODES_AT = 0.0
+_CHECKHOST_IRAN_NODES_TTL = 900
+_CHECKHOST_NODE_LOCK = asyncio.Lock()
+
+async def _get_checkhost_iran_nodes():
+    """
+    Return four Iranian Check-Host nodes. The list is cached briefly because
+    the node list is metadata, not a per-config test.
+    """
+    global _CHECKHOST_IRAN_NODES, _CHECKHOST_IRAN_NODES_AT
+    now = time.monotonic()
+    if _CHECKHOST_IRAN_NODES and now - _CHECKHOST_IRAN_NODES_AT < _CHECKHOST_IRAN_NODES_TTL:
+        return list(_CHECKHOST_IRAN_NODES)
+
+    async with _CHECKHOST_NODE_LOCK:
+        now = time.monotonic()
+        if _CHECKHOST_IRAN_NODES and now - _CHECKHOST_IRAN_NODES_AT < _CHECKHOST_IRAN_NODES_TTL:
+            return list(_CHECKHOST_IRAN_NODES)
+
+        try:
+            cl = await _get_ping_client()
+            r = await cl.get(
+                "https://check-host.net/nodes/hosts",
+                headers={"Accept": "application/json"},
+            )
+            if r.status_code != 200:
+                log.warning("check-host.net nodes status: %s", r.status_code)
+                return []
+
+            data = r.json()
+            nodes = data.get("nodes", {}) if isinstance(data, dict) else {}
+            iran = []
+            for node_name, info in nodes.items():
+                if not isinstance(info, dict):
+                    continue
+                location = info.get("location") or []
+                country_code = str(location[0]).strip().lower() if location else ""
+                if country_code == "ir":
+                    iran.append(str(node_name))
+
+            # Stable ordering avoids changing the four nodes every cycle.
+            iran = sorted(set(iran))[:4]
+            if len(iran) < 4:
+                log.warning("⚠️ Check-Host has fewer than 4 Iranian ping nodes: %s", len(iran))
+                _CHECKHOST_IRAN_NODES = []
+                _CHECKHOST_IRAN_NODES_AT = now
+                return []
+
+            _CHECKHOST_IRAN_NODES = iran
+            _CHECKHOST_IRAN_NODES_AT = now
+            log.info("🇮🇷 Check-Host Iran ping nodes: %s", ", ".join(iran))
+            return list(iran)
+        except Exception as e:
+            log.warning("check-host.net Iran node discovery failed: %s", e)
+            return []
+
+async def ping_from_iran_only(host, port=None, allow_tcp_fallback=False):
+    """
+    ONLY run Check-Host Ping against the extracted host.
+    No DNS-to-IP substitution, no TCP fallback, no HTTP/TCP/DNS tests.
+
+    Acceptance rule:
+      - exactly four Iranian Check-Host nodes are selected;
+      - all four node results must arrive (no stuck/missing result);
+      - a node counts as reachable when at least one of its four ICMP
+        packets is OK;
+      - 1/4, 2/4, 3/4 or 4/4 reachable Iranian nodes => PASS;
+      - 0/4, missing/incomplete results, timeout/error of the whole check,
+        or a stuck request => FAIL.
+    """
+    target = str(host or "").strip()
+    if not target:
+        return 0, False, 0
+
+    nodes = await _get_checkhost_iran_nodes()
+    if len(nodes) != 4:
+        return 0, False, 0
 
     try:
         cl = await _get_ping_client()
+
+        # The user-requested endpoint is used directly; only the target host
+        # and four Check-Host ping nodes are supplied. No other check type is used.
+        params = [("host", target)]
+        for node in nodes:
+            params.append(("node", node))
+
         r = await cl.get(
-            f"https://check-host.net/check-ping?host={target}&json=1"
+            "https://check-host.net/check-ping",
+            params=params,
+            headers={"Accept": "application/json"},
         )
-        if r.status_code == 200:
+        if r.status_code != 200:
+            log.warning("check-host.net ping submit status: %s", r.status_code)
+            return 0, False, 0
+
+        try:
+            created = r.json()
+        except json.JSONDecodeError:
+            log.warning("⚠️ check-host.net ping submit returned invalid JSON for %s", target)
+            return 0, False, 0
+
+        if not isinstance(created, dict) or not created.get("ok") or not created.get("request_id"):
+            log.warning("⚠️ check-host.net ping submit failed for %s: %s", target, created)
+            return 0, False, 0
+
+        request_id = str(created["request_id"])
+        result_url = f"https://check-host.net/check-result/{quote(request_id, safe='')}"
+
+        # Check-Host runs ping asynchronously. Poll briefly until all four
+        # requested Iranian nodes have a concrete result.
+        deadline = time.monotonic() + 7.0
+        final = None
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.65)
+            rr = await cl.get(result_url, headers={"Accept": "application/json"})
+            if rr.status_code != 200:
+                continue
             try:
-                data = r.json()
+                result = rr.json()
             except json.JSONDecodeError:
-                log.warning(f"⚠️ check-host.net returned invalid JSON for {target}")
-                data = None
-            if data:
-                nodes = data.get("nodes", {})
-                iran_pings = []
-                iran_keywords = [
-                    "ir1", "ir2", "ir3", "ir4", "ir5", "ir6", "ir7", "ir8", "ir9",
-                    "iran", "tehran", "ir-", "-ir", "ir_", "_ir",
-                    "mci", "hamrahe", "rightel", "shatel", "iranel",
-                    "teh", "shiraz", "isfahan", "mashhad", "tabriz", "ahvaz"
-                ]
-                for node_name, results in nodes.items():
-                    if not isinstance(results, list):
-                        continue
-                    node_lower = node_name.lower()
-                    for v in results:
-                        if isinstance(v, (int, float)) and v > 0:
-                            if any(kw in node_lower for kw in iran_keywords):
-                                iran_pings.append(int(v))
-                            break
-                if iran_pings:
-                    avg_ping = int(sum(iran_pings) / len(iran_pings))
-                    log.info(f"✅ Iran ping OK: {target} -> {len(iran_pings)} nodes, avg {avg_ping}ms")
-                    return avg_ping, True, len(iran_pings)
-                else:
-                    log.info(f"⚠️ No Iran nodes responded for {target}")
-        else:
-            log.warning(f"check-host.net status: {r.status_code}")
+                continue
+            if not isinstance(result, dict):
+                continue
+
+            # Never accept a partially returned/stuck report.
+            if all(node in result and result.get(node) is not None for node in nodes):
+                final = result
+                break
+
+        if final is None:
+            log.warning("⏳ Check-Host ping stuck/incomplete for %s", target)
+            return 0, False, 0
+
+        reachable_nodes = 0
+        measured = []
+
+        for node in nodes:
+            node_result = final.get(node)
+            # Official Check-Host ping response is:
+            # node -> [ [ ["OK", seconds, ip], ["TIMEOUT", ...], ... ] ]
+            packets = None
+            if isinstance(node_result, list) and node_result:
+                first = node_result[0]
+                if isinstance(first, list):
+                    packets = first
+
+            if not isinstance(packets, list) or not packets:
+                log.warning("⚠️ Missing ping packet data for Iran node %s (%s)", node, target)
+                return 0, False, 0
+
+            ok_times = []
+            for packet in packets:
+                if not isinstance(packet, list) or not packet:
+                    continue
+                status = str(packet[0] or "").upper()
+                if status == "OK":
+                    try:
+                        ok_times.append(float(packet[1]))
+                    except (IndexError, TypeError, ValueError):
+                        pass
+
+            # A node is healthy if at least one of its four ICMP attempts got
+            # an actual OK response. We do not require 4/4 at each node.
+            if ok_times:
+                reachable_nodes += 1
+                measured.extend(ok_times)
+
+        if reachable_nodes <= 0:
+            log.info("❌ Iran ping 0/4 for %s", target)
+            return 0, False, 0
+
+        avg_ms = int(round(sum(measured) / len(measured) * 1000)) if measured else 0
+        log.info(
+            "✅ Iran ping %d/4 for %s -> avg %sms",
+            reachable_nodes, target, avg_ms
+        )
+        return avg_ms, True, reachable_nodes
+
     except Exception as e:
-        log.warning(f"check-host.net request failed: {e}")
-
-    if not allow_tcp_fallback:
-        log.info(f"❌ Iran ping failed and TCP fallback disabled for {target}")
+        log.warning("check-host.net ping request failed for %s: %s", target, e)
         return 0, False, 0
-
-    if port is not None:
-        log.info(f"🔄 TCP fallback with config port: {host}:{port}")
-        ok, ping = await test_tcp_ping(host, port)
-        if ok:
-            log.info(f"✅ TCP fallback OK: {host}:{port} -> {ping}ms")
-            return ping, True, 0
-        else:
-            log.info(f"❌ TCP fallback FAILED: {host}:{port}")
-    else:
-        log.info(f"🔄 No port in config, trying common ports...")
-        ports_to_try = [443, 80, 8443]
-        for test_port in ports_to_try:
-            ok, ping = await test_tcp_ping(host, test_port)
-            if ok:
-                log.info(f"✅ TCP fallback OK: {host}:{test_port} -> {ping}ms")
-                return ping, True, 0
-
-    log.info(f"❌ All ping attempts failed for {target}")
-    return 0, False, 0
 
 async def check_full_link_ping(url, ping_mode="global", perform_ping=True):
-    """Perform ping test if perform_ping is True, else return a dummy."""
+    """Check only the extracted host with Check-Host Ping when ping testing is enabled."""
     if not perform_ping:
-        return 0, True, 0  # treat as reachable if ping testing disabled? Actually we should not claim it's working.
-        # Instead, we need to return a neutral status. We'll handle this in the caller.
-    host, port = extract_host(url)
+        return 0, True, 0
+
+    host, _port = extract_host(url)
     if not host:
         return 0, False, 0
-    allow_tcp = (ping_mode != "iran")
-    ping, ok, cnt = await asyncio.wait_for(
-        ping_from_iran_only(host, port, allow_tcp_fallback=allow_tcp), timeout=3.5
+
+    # ping_mode is retained for backwards compatibility with the existing
+    # profile settings, but the actual test is intentionally always the
+    # Check-Host Ping test requested by the user.
+    return await asyncio.wait_for(
+        ping_from_iran_only(host, allow_tcp_fallback=False),
+        timeout=10.0,
     )
-    return ping, ok, cnt
 
 # ======================================================================
 # اسکرپ (بهینه‌شده: استفاده از last_message_id برای توقف)
@@ -5208,7 +5376,7 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
                                 flag, country_code = await get_flag_for_ip(ip)
                         except Exception as e:
                             log.debug(f"[PROXY] GeoIP lookup failed for {host}: {e}")
-                    if not host or not port or not (1 <= int(port) <= 65535):
+                    if not host:
                         return proxy_url, 0, flag, country_code
                     if ping_testing:
                         try:
