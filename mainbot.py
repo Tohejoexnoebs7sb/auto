@@ -1,9 +1,9 @@
-# bot.py — 4.1.16
-APP_VERSION = "4.1.16"
+# bot.py — 4.1.14
+APP_VERSION = "4.1.14"
 APP_VERSION_MAJOR = 4
 APP_VERSION_MINOR = 1
-APP_VERSION_PATCH = 16
-APP_VERSION_LABEL = "4.1.16-stable"
+APP_VERSION_PATCH = 14
+APP_VERSION_LABEL = "4.1.14-stable"
 BOT_VERSION = APP_VERSION
 import os
 import glob
@@ -3898,98 +3898,47 @@ def strip_url_fragment(url):
     return url
 
 def extract_host(url):
-    """
-    Extract ONLY the actual target host used by Check-Host.
-    VMess is special: its payload is Base64(JSON), so it must be decoded first
-    and the JSON `add` field is used as the host. Other supported URI schemes
-    use their URI hostname (or the Telegram proxy `server` parameter).
-    """
     try:
-        raw_url = html.unescape(str(url or "")).strip()
-        if not raw_url:
-            return None, None
-
-        # VMess: decode the payload first; never try to parse the Base64 text as
-        # a URI hostname.
-        if raw_url.lower().startswith("vmess://"):
-            payload = raw_url.split("://", 1)[1].split("#", 1)[0].strip()
-            try:
-                decoded = _decode_b64(payload).decode("utf-8", errors="strict")
-                obj = json.loads(decoded)
-                host = str(obj.get("add") or obj.get("address") or "").strip()
-                port_raw = obj.get("port")
-                try:
-                    port = int(port_raw) if port_raw not in (None, "") else None
-                except (TypeError, ValueError):
-                    port = None
-                if host:
-                    return host, port
-            except Exception as e:
-                log.debug("VMESS host extraction failed: %s", e)
-                return None, None
-
-        parsed = urlparse(raw_url)
+        parsed = urlparse(url)
         host = parsed.hostname
-        try:
-            port = parsed.port
-        except ValueError:
-            port = None
+        port = parsed.port
 
-        # Telegram MTProto/SOCKS proxy links keep the actual server in
-        # ?server=... rather than in the URI hostname.
-        if parsed.scheme.lower() in ("https", "http", "tg") and (
-            parsed.path.lower().startswith("/proxy") or parsed.netloc.lower() == "proxy"
-        ):
+        if host and host.lower() == 't.me' and parsed.path.startswith('/proxy'):
             query = parse_qs(parsed.query)
-            server = (query.get("server") or [None])[0]
+            server = query.get('server', [None])[0]
             if server:
-                server = str(server).strip()
-                if server.startswith("[") and "]" in server:
-                    close = server.find("]")
-                    host = server[1:close]
-                    remainder = server[close + 1:]
-                    if remainder.startswith(":") and remainder[1:].isdigit():
-                        port = int(remainder[1:])
-                elif server.count(":") == 1:
-                    maybe_host, maybe_port = server.rsplit(":", 1)
-                    if maybe_port.isdigit():
-                        host, port = maybe_host, int(maybe_port)
-                    else:
-                        host = server
+                if ':' in server:
+                    host, port_str = server.rsplit(':', 1)
+                    port = int(port_str)
                 else:
                     host = server
-                if port is None:
-                    port_raw = (query.get("port") or [None])[0]
-                    if str(port_raw or "").isdigit():
-                        port = int(port_raw)
+                    port_str = query.get('port', [None])[0]
+                    if port_str:
+                        port = int(port_str)
                 return host, port
             return host, port
 
         if host:
-            return host, port
-
-        # Conservative fallback for legacy/non-standard forms.
-        candidate = raw_url
-        if "://" in candidate:
-            candidate = candidate.split("://", 1)[1]
-        candidate = candidate.split("?", 1)[0].split("#", 1)[0]
-        if "@" in candidate:
-            candidate = candidate.rsplit("@", 1)[-1]
-        candidate = candidate.strip()
-
-        if candidate.startswith("[") and "]" in candidate:
-            close = candidate.find("]")
-            host = candidate[1:close]
-            rest = candidate[close + 1:]
-            port = int(rest[1:]) if rest.startswith(":") and rest[1:].isdigit() else None
-            return host, port
-
-        if ":" in candidate:
-            maybe_host, maybe_port = candidate.rsplit(":", 1)
-            if maybe_port.isdigit():
-                return maybe_host.strip(), int(maybe_port)
-
-        return candidate or None, None
+            if parsed.port:
+                return host, parsed.port
+            else:
+                if ':' in parsed.netloc:
+                    host_part, port_part = parsed.netloc.rsplit(':', 1)
+                    if port_part.isdigit():
+                        return host_part, int(port_part)
+                return host, None
+        if "://" in url:
+            url = url.split("://", 1)[1]
+        for c in '?#':
+            if c in url:
+                url = url.split(c)[0]
+        if "@" in url:
+            url = url.split("@")[-1]
+        if ":" in url:
+            host, port = url.rsplit(":", 1)
+            return host.strip(), int(port)
+        else:
+            return url.strip(), None
     except Exception as e:
         log.warning(f"extract_host error for {url}: {e}")
         return None, None
@@ -4019,12 +3968,18 @@ def add_custom_query_to_url(url, custom_query, protocol):
     return new_base
 
 # ======================================================================
-# پینگ (بهینه‌شده) - با لایه‌های تست
+# پینگ — فقط Check-Host و فقط معیار واقعی 3/4 یا 4/4 در ایران
 # ======================================================================
 _DNS_CACHE = {}
 _DNS_CACHE_TTL = 300
 _PING_CLIENT = None
 _PING_CLIENT_LOCK = asyncio.Lock()
+_PING_SUBMIT_LOCK = asyncio.Lock()
+_PING_ACTIVE_CHECKS = asyncio.Semaphore(4)
+_PING_LAST_SUBMIT = 0.0
+_PING_MIN_SUBMIT_INTERVAL = 1.0
+_PING_TARGET_IP_CACHE = {}
+_PING_TARGET_IP_CACHE_TTL = 900
 
 async def _get_ping_client():
     global _PING_CLIENT
@@ -4032,10 +3987,10 @@ async def _get_ping_client():
         async with _PING_CLIENT_LOCK:
             if _PING_CLIENT is None or _PING_CLIENT.is_closed:
                 _PING_CLIENT = httpx.AsyncClient(
-                    timeout=httpx.Timeout(2.5, connect=1.5),
-                    limits=httpx.Limits(max_connections=24, max_keepalive_connections=12),
+                    timeout=httpx.Timeout(4.0, connect=2.0),
+                    limits=httpx.Limits(max_connections=16, max_keepalive_connections=8),
                     follow_redirects=True,
-                    headers={"User-Agent": "Mozilla/5.0"},
+                    headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
                 )
     return _PING_CLIENT
 
@@ -4062,252 +4017,185 @@ async def host_to_ip(host):
         log.debug(f"DNS resolution failed for {host}: {e}")
         return None
 
-_PING_TARGET_IP_CACHE = {}
-_PING_TARGET_IP_CACHE_TTL = 900
+async def _checkhost_submit(target):
+    """Submit one Check-Host ping, with a global throttle and 429 backoff."""
+    global _PING_LAST_SUBMIT
+    cl = await _get_ping_client()
 
-# Check-Host is rate-limited. Keep submissions serialized and spaced so a
-# large scrape does not turn into dozens/hundreds of HTTP 429 responses.
-_CHECK_HOST_SUBMIT_LOCK = asyncio.Lock()
-_CHECK_HOST_LAST_SUBMIT = 0.0
-_CHECK_HOST_MIN_SUBMIT_INTERVAL = 0.80
-_CHECK_HOST_MAX_429_RETRIES = 2
-
-async def _check_host_submit(client, target):
-    """Submit one normal Check-Host Ping request with global rate limiting."""
-    global _CHECK_HOST_LAST_SUBMIT
-    last_status = None
-    for attempt in range(_CHECK_HOST_MAX_429_RETRIES + 1):
-        async with _CHECK_HOST_SUBMIT_LOCK:
+    for attempt in range(3):
+        async with _PING_SUBMIT_LOCK:
             now = time.monotonic()
-            wait_for = _CHECK_HOST_MIN_SUBMIT_INTERVAL - (now - _CHECK_HOST_LAST_SUBMIT)
+            wait_for = _PING_MIN_SUBMIT_INTERVAL - (now - _PING_LAST_SUBMIT)
             if wait_for > 0:
                 await asyncio.sleep(wait_for)
+            _PING_LAST_SUBMIT = time.monotonic()
+
             try:
-                response = await client.get(
+                r = await cl.get(
                     "https://check-host.net/check-ping",
                     params={"host": target},
                     headers={"Accept": "application/json"},
                 )
-            finally:
-                _CHECK_HOST_LAST_SUBMIT = time.monotonic()
+            except Exception:
+                raise
 
-        last_status = response.status_code
-        if response.status_code != 429:
-            return response
+        if r.status_code != 429:
+            return r
 
-        retry_after = response.headers.get("Retry-After", "")
+        retry_after = r.headers.get("Retry-After", "")
         try:
-            delay = max(2.0, min(float(retry_after), 15.0))
+            delay = max(1.5, min(float(retry_after), 15.0))
         except (TypeError, ValueError):
             delay = 3.0 * (attempt + 1)
-        log.warning(
-            "⏳ Check-Host rate limited (429) for %s; retry %d/%d in %.1fs",
-            target, attempt + 1, _CHECK_HOST_MAX_429_RETRIES, delay
-        )
+        log.warning("⚠️ Check-Host rate limited (429) for %s; retrying in %.1fs", target, delay)
         await asyncio.sleep(delay)
 
-    log.warning("❌ Check-Host submit failed after 429 retries for %s (status=%s)", target, last_status)
-    return None
-
-
-def _parse_check_host_packets(node_result):
-    """Return (ok_count, avg_ms, resolved_ip) for a Check-Host ping row."""
-    packets = None
-    if isinstance(node_result, list) and node_result:
-        first = node_result[0]
-        if isinstance(first, list):
-            packets = first
-    if not isinstance(packets, list) or not packets:
-        return 0, 0, None
-
-    ok_times = []
-    resolved_ip = None
-    for packet in packets[:4]:
-        if not isinstance(packet, list) or not packet:
-            continue
-        status = str(packet[0] or "").upper()
-        if status != "OK":
-            continue
-        try:
-            seconds = float(packet[1])
-            ok_times.append(seconds)
-        except (IndexError, TypeError, ValueError):
-            pass
-        if len(packet) >= 3 and packet[2]:
-            resolved_ip = str(packet[2]).strip()
-
-    ok_count = len(ok_times)
-    avg_ms = int(round(sum(ok_times) / ok_count * 1000)) if ok_times else 0
-    return ok_count, avg_ms, resolved_ip
-
+    return r
 
 async def ping_from_iran_only(host, port=None, allow_tcp_fallback=False):
-    """Strict Iran Ping mode.
+    """
+    Only Check-Host Ping is used.
 
-    Uses only the normal Check-Host Ping request. Iran is identified from the
-    API's node metadata (country code == ``ir``), never by node-name keywords.
-    PASS requires at least one Iranian row with 3/4 or 4/4 OK packets.
-    Other countries are ignored completely. No TCP/HTTP/DNS fallback is used.
+    Acceptance rule:
+      * inspect only rows whose node metadata country code is exactly ``ir``;
+      * one Iranian row with >=3 successful packets out of 4 => PASS;
+      * 0/4, 1/4, 2/4, null, missing, stuck, or no qualifying Iran row => FAIL;
+      * rows from every other country are ignored.
+
+    The target is the real extracted hostname/IP from the config. We do not
+    resolve it locally first because that can change what Check-Host tests.
     """
     target = str(host or "").strip()
     if not target:
         return 0, False, 0
 
-    try:
-        cl = await _get_ping_client()
-        r = await _check_host_submit(cl, target)
-        if r is None:
-            return 0, False, 0
-        if r.status_code != 200:
-            log.warning("check-host.net ping submit status: %s", r.status_code)
-            return 0, False, 0
-
+    async with _PING_ACTIVE_CHECKS:
         try:
-            created = r.json()
-        except json.JSONDecodeError:
-            log.warning("⚠️ Check-Host returned invalid JSON for %s", target)
+            cl = await _get_ping_client()
+            r = await _checkhost_submit(target)
+            if r.status_code != 200:
+                log.warning("❌ Check-Host submit failed for %s: HTTP %s", target, r.status_code)
+                return 0, False, 0
+
+            try:
+                created = r.json()
+            except json.JSONDecodeError:
+                log.warning("❌ Check-Host submit returned invalid JSON for %s", target)
+                return 0, False, 0
+
+            if not isinstance(created, dict) or not created.get("ok") or not created.get("request_id"):
+                log.warning("❌ Check-Host submit rejected %s: %s", target, created)
+                return 0, False, 0
+
+            # This is the authoritative country information for the check.
+            # Do NOT guess Iran from node names such as 'tehran', 'ir1', etc.
+            node_meta = created.get("nodes") or {}
+            iran_nodes = []
+            for node_name, info in node_meta.items():
+                if isinstance(info, list) and info and str(info[0] or "").strip().lower() == "ir":
+                    iran_nodes.append(str(node_name))
+
+            if not iran_nodes:
+                log.warning("❌ Check-Host returned no Iranian nodes for %s", target)
+                return 0, False, 0
+
+            request_id = str(created["request_id"])
+            result_url = f"https://check-host.net/check-result/{quote(request_id, safe='')}"
+            deadline = time.monotonic() + 12.0
+            seen_complete = set()
+
+            while time.monotonic() < deadline:
+                rr = await cl.get(result_url, headers={"Accept": "application/json"})
+                if rr.status_code == 200:
+                    try:
+                        result = rr.json()
+                    except json.JSONDecodeError:
+                        result = None
+
+                    if isinstance(result, dict):
+                        all_iran_done = True
+                        any_iran_data = False
+
+                        for node_name in iran_nodes:
+                            node_result = result.get(node_name)
+                            if node_result is None:
+                                all_iran_done = False
+                                continue
+
+                            any_iran_data = True
+                            packets = None
+                            if isinstance(node_result, list) and node_result:
+                                first = node_result[0]
+                                if isinstance(first, list):
+                                    packets = first
+
+                            # [null] means the node could not produce a result.
+                            if not isinstance(packets, list) or not packets:
+                                continue
+
+                            # Check-Host Ping is four packet slots. Count ONLY
+                            # packets explicitly marked OK; timing numbers alone
+                            # are never treated as success.
+                            ok_times = []
+                            observed_ip = None
+                            for packet in packets[:4]:
+                                if not isinstance(packet, list) or not packet:
+                                    continue
+                                status = str(packet[0] or "").strip().upper()
+                                if status != "OK":
+                                    continue
+                                try:
+                                    seconds = float(packet[1])
+                                    ok_times.append(seconds)
+                                except (IndexError, TypeError, ValueError):
+                                    pass
+                                if len(packet) >= 3 and packet[2]:
+                                    observed_ip = str(packet[2]).strip()
+
+                            ok_count = len(ok_times)
+                            if len(packets) >= 4:
+                                seen_complete.add(node_name)
+
+                            if ok_count >= 3:
+                                if observed_ip:
+                                    _PING_TARGET_IP_CACHE[target.lower()] = (
+                                        time.monotonic(), observed_ip
+                                    )
+                                avg_ms = int(round(sum(ok_times) / len(ok_times) * 1000)) if ok_times else 0
+                                log.info(
+                                    "✅ Iran Check-Host PASS %d/4 for %s (%s) -> avg %sms",
+                                    min(ok_count, 4), target, node_name, avg_ms
+                                )
+                                return avg_ms, True, min(ok_count, 4)
+
+                        # If every Iran row has completed, no 3/4+ exists.
+                        # Do not wait on other countries and do not reinterpret
+                        # incomplete/null Iran rows as success.
+                        if any_iran_data and all_iran_done and len(seen_complete) >= len(iran_nodes):
+                            log.info("❌ Iran Check-Host FAIL for %s: no Iran row reached 3/4", target)
+                            return 0, False, 0
+
+                await asyncio.sleep(0.75)
+
+            log.warning("⏳ Check-Host ping stuck/incomplete for %s", target)
             return 0, False, 0
 
-        if not isinstance(created, dict) or not created.get("ok") or not created.get("request_id"):
-            log.warning("⚠️ Check-Host ping submit failed for %s: %s", target, created)
+        except Exception as e:
+            log.warning("❌ Check-Host ping request failed for %s: %s", target, e)
             return 0, False, 0
-
-        node_meta = created.get("nodes") or {}
-        iran_nodes = []
-        for node_name, info in node_meta.items():
-            if isinstance(info, list) and info and str(info[0] or "").strip().lower() == "ir":
-                iran_nodes.append(str(node_name))
-
-        if not iran_nodes:
-            log.warning("⚠️ Check-Host returned no Iranian rows for %s", target)
-            return 0, False, 0
-
-        request_id = str(created["request_id"])
-        result_url = f"https://check-host.net/check-result/{quote(request_id, safe='')}"
-        deadline = time.monotonic() + 10.5
-
-        while time.monotonic() < deadline:
-            rr = await cl.get(result_url, headers={"Accept": "application/json"})
-            if rr.status_code == 200:
-                try:
-                    result = rr.json()
-                except json.JSONDecodeError:
-                    result = None
-
-                if isinstance(result, dict):
-                    any_concrete = False
-                    all_concrete = True
-                    for node_name in iran_nodes:
-                        if node_name not in result or result.get(node_name) is None:
-                            all_concrete = False
-                            continue
-                        any_concrete = True
-                        ok_count, avg_ms, resolved_ip = _parse_check_host_packets(result.get(node_name))
-                        if ok_count >= 3:
-                            if resolved_ip:
-                                _PING_TARGET_IP_CACHE[target.lower()] = (time.monotonic(), resolved_ip)
-                            log.info(
-                                "✅ Iran Check-Host PASS %d/4 for %s (%s) -> avg %sms",
-                                min(ok_count, 4), target, node_name, avg_ms
-                            )
-                            return avg_ms, True, min(ok_count, 4)
-
-                    if any_concrete and all_concrete:
-                        log.info("❌ Iran Check-Host FAIL for %s: no Iran row reached 3/4", target)
-                        return 0, False, 0
-
-            await asyncio.sleep(0.65)
-
-        log.warning("⏳ Check-Host Iran ping stuck/incomplete for %s", target)
-        return 0, False, 0
-    except Exception as e:
-        log.warning("check-host.net Iran ping request failed for %s: %s", target, e)
-        return 0, False, 0
-
-
-async def ping_from_global(host):
-    """Global Ping mode: normal Check-Host rows, any concrete OK packet passes."""
-    target = str(host or "").strip()
-    if not target:
-        return 0, False, 0
-
-    try:
-        cl = await _get_ping_client()
-        r = await _check_host_submit(cl, target)
-        if r is None:
-            return 0, False, 0
-        if r.status_code != 200:
-            log.warning("check-host.net global ping submit status: %s", r.status_code)
-            return 0, False, 0
-
-        try:
-            created = r.json()
-        except json.JSONDecodeError:
-            log.warning("⚠️ Check-Host global ping returned invalid JSON for %s", target)
-            return 0, False, 0
-
-        if not isinstance(created, dict) or not created.get("ok") or not created.get("request_id"):
-            log.warning("⚠️ Check-Host global ping submit failed for %s: %s", target, created)
-            return 0, False, 0
-
-        node_meta = created.get("nodes") or {}
-        node_names = [str(n) for n in node_meta.keys()]
-        if not node_names:
-            return 0, False, 0
-
-        request_id = str(created["request_id"])
-        result_url = f"https://check-host.net/check-result/{quote(request_id, safe='')}"
-        deadline = time.monotonic() + 10.5
-
-        while time.monotonic() < deadline:
-            rr = await cl.get(result_url, headers={"Accept": "application/json"})
-            if rr.status_code == 200:
-                try:
-                    result = rr.json()
-                except json.JSONDecodeError:
-                    result = None
-                if isinstance(result, dict):
-                    any_concrete = False
-                    all_concrete = True
-                    for node_name in node_names:
-                        if node_name not in result or result.get(node_name) is None:
-                            all_concrete = False
-                            continue
-                        any_concrete = True
-                        ok_count, avg_ms, resolved_ip = _parse_check_host_packets(result.get(node_name))
-                        # Global mode keeps the broad behavior: any successful
-                        # ICMP packet from any Check-Host location is enough.
-                        if ok_count >= 1:
-                            if resolved_ip:
-                                _PING_TARGET_IP_CACHE[target.lower()] = (time.monotonic(), resolved_ip)
-                            log.info(
-                                "✅ Global Check-Host PASS %d/4 for %s (%s) -> avg %sms",
-                                min(ok_count, 4), target, node_name, avg_ms
-                            )
-                            return avg_ms, True, min(ok_count, 4)
-                    if any_concrete and all_concrete:
-                        log.info("❌ Global Check-Host FAIL for %s: no node returned an OK packet", target)
-                        return 0, False, 0
-            await asyncio.sleep(0.65)
-
-        log.warning("⏳ Check-Host global ping stuck/incomplete for %s", target)
-        return 0, False, 0
-    except Exception as e:
-        log.warning("check-host.net global ping request failed for %s: %s", target, e)
-        return 0, False, 0
-
 
 async def check_full_link_ping(url, ping_mode="global", perform_ping=True):
-    """Run exactly one of the two supported Check-Host Ping modes."""
+    """When enabled, test only the extracted host through Check-Host Ping."""
     if not perform_ping:
         return 0, True, 0
     host, _port = extract_host(url)
     if not host:
         return 0, False, 0
-    mode = _normalize_ping_mode(ping_mode)
-    if mode == "iran":
-        return await asyncio.wait_for(ping_from_iran_only(host), timeout=13.0)
-    return await asyncio.wait_for(ping_from_global(host), timeout=13.0)
+    # ping_mode is retained for compatibility with existing profile settings.
+    return await asyncio.wait_for(
+        ping_from_iran_only(host, allow_tcp_fallback=False),
+        timeout=15.0,
+    )
 
 # ======================================================================
 # اسکرپ (بهینه‌شده: استفاده از last_message_id برای توقف)
@@ -4795,10 +4683,7 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
             country_code = ""
             if host:
                 try:
-                    cached_ping = _PING_TARGET_IP_CACHE.get(host.strip().lower())
-                    ip = cached_ping[1] if cached_ping and time.monotonic() - cached_ping[0] < _PING_TARGET_IP_CACHE_TTL else None
-                    if not ip:
-                        ip = await host_to_ip(host)
+                    ip = await host_to_ip(host)
                     if ip:
                         flag, country_code = await get_flag_for_ip(ip)
                 except Exception as _e:
@@ -5316,7 +5201,7 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
     if enable_configs and new_configs:
         desired = max(1, int(get_profile_max_post_config(profile_id) or 1))
         log.info(f"[AUTO-CONFIG] profile={profile_id} candidates={len(new_configs)} max_post={desired} ping={ping_testing} smart_batch={batch_posting}")
-        sem=asyncio.Semaphore(3 if low_cost_mode else 4)
+        sem=asyncio.Semaphore(24 if low_cost_mode else 60)
 
         async def _check(item):
             u, src = item
@@ -5349,12 +5234,9 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
                     identity_hash = _config_identity_hash(item[0])
                     if identity_hash not in pending_hashes and not _batch_tested_recently(profile_id, "config", identity_hash):
                         fresh.append(item)
-                test_cap = min(len(fresh), max(24, min(120, desired * 12)))
+                test_cap = min(len(fresh), max(12, min(48, desired * 8)))
                 chunk = fresh[:test_cap]
-                rs = []
-                for offset in range(0, len(chunk), 4 if not low_cost_mode else 3):
-                    part = chunk[offset:offset + (4 if not low_cost_mode else 3)]
-                    rs.extend(await asyncio.gather(*[_check(item) for item in part], return_exceptions=True))
+                rs = await asyncio.gather(*[_check(item) for item in chunk], return_exceptions=True)
                 for item, r in zip(chunk, rs):
                     identity_hash = _config_identity_hash(item[0])
                     _batch_mark_tested(profile_id, "config", identity_hash)
@@ -5379,21 +5261,15 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
                 # look broken while hundreds of later candidates are available.
                 # Test a bounded but sufficiently large window and stop only
                 # after collecting the requested number of healthy configs.
-                test_limit = min(len(new_configs), max(60, min(240, desired * 30)))
+                test_limit = min(len(new_configs), max(24, min(60, desired * 15)))
                 to_test = new_configs[:test_limit]
                 log.info(f"📊 Testing {len(to_test)} configs... low_cost={low_cost_mode}")
-                # Check-Host is rate-limited; never launch hundreds of submissions at once.
-                chunk_size = 4 if not low_cost_mode else 3
-                for offset in range(0, len(to_test), chunk_size):
-                    chunk = to_test[offset:offset + chunk_size]
-                    rs = await asyncio.gather(*[_check(item) for item in chunk], return_exceptions=True)
-                    for r in rs:
-                        if not isinstance(r, Exception) and r[1]:
-                            working.append((r[0], r[2], r[3]))
-                            if len(working) >= desired:
-                                break
-                    if len(working) >= desired:
-                        break
+                rs = await asyncio.gather(*[_check(item) for item in to_test], return_exceptions=True)
+                for r in rs:
+                    if not isinstance(r, Exception) and r[1]:
+                        working.append((r[0], r[2], r[3]))
+                        if len(working) >= desired:
+                            break
                 log.info(f"📊 Working configs: {len(working)}")
         if not working:
             log.warning(f"[AUTO-CONFIG] profile={profile_id} no publishable configs in current window; cursor retained")
@@ -5406,7 +5282,7 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
         if valid_proxies:
             desired_proxy = max(1, int(get_profile_max_post_proxy(profile_id) or 1))
             log.info(f"📊 Processing proxies: candidates={len(valid_proxies)} target={desired_proxy} smart_batch={batch_posting}")
-            sem = asyncio.Semaphore(3 if low_cost_mode else 4)
+            sem = asyncio.Semaphore(24 if low_cost_mode else 60)
 
             async def check_proxy(proxy_url):
                 async with sem:
@@ -5414,15 +5290,12 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
                     flag, country_code = "🌐", ""
                     if host:
                         try:
-                            cached_ping = _PING_TARGET_IP_CACHE.get(host.strip().lower())
-                            ip = cached_ping[1] if cached_ping and time.monotonic() - cached_ping[0] < _PING_TARGET_IP_CACHE_TTL else None
-                            if not ip:
-                                ip = await host_to_ip(host)
+                            ip = await host_to_ip(host)
                             if ip:
                                 flag, country_code = await get_flag_for_ip(ip)
                         except Exception as e:
                             log.debug(f"[PROXY] GeoIP lookup failed for {host}: {e}")
-                    if not host:
+                    if not host or not port or not (1 <= int(port) <= 65535):
                         return proxy_url, 0, flag, country_code
                     if ping_testing:
                         try:
@@ -5448,12 +5321,9 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
                         identity_hash = _proxy_identity_hash(p)
                         if identity_hash not in pending_hashes and not _batch_tested_recently(profile_id, "proxy", identity_hash):
                             fresh.append(p)
-                    test_cap = min(len(fresh), max(24, min(120, desired_proxy * 12)))
+                    test_cap = min(len(fresh), max(12, min(48, desired_proxy * 8)))
                     chunk = fresh[:test_cap]
-                    results = []
-                    for offset in range(0, len(chunk), 4 if not low_cost_mode else 3):
-                        part = chunk[offset:offset + (4 if not low_cost_mode else 3)]
-                        results.extend(await asyncio.gather(*[check_proxy(p) for p in part], return_exceptions=True))
+                    results = await asyncio.gather(*[check_proxy(p) for p in chunk], return_exceptions=True)
                     for p, r in zip(chunk, results):
                         identity_hash = _proxy_identity_hash(p)
                         _batch_mark_tested(profile_id, "proxy", identity_hash)
@@ -5463,13 +5333,8 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
                     conn.commit()
                     log.info(f"📦 [AUTO-PROXY] strict queue tested={len(chunk)}/{len(fresh)} pending={len(proxy_with_ping)} target={desired_proxy}")
             else:
-                results = []
-                chunk_size = 4 if not low_cost_mode else 3
-                for offset in range(0, len(valid_proxies), chunk_size):
-                    part = valid_proxies[offset:offset + chunk_size]
-                    results.extend(await asyncio.gather(*[check_proxy(p) for p in part], return_exceptions=True))
-                    if len([x for x in results if not isinstance(x, Exception) and (not ping_testing or x[1] > 0)]) >= desired_proxy:
-                        break
+                proxy_window = valid_proxies[:min(len(valid_proxies), max(24, min(60, desired_proxy * 15)))]
+                results = await asyncio.gather(*[check_proxy(p) for p in proxy_window], return_exceptions=True)
                 for r in results:
                     if not isinstance(r, Exception):
                         proxy_with_ping.append(r)
@@ -6662,9 +6527,10 @@ def profile_admin_kb(profile_id):
             f"🧩 حالت انتشار کانفیگ: {'عادی (COPY CODE)' if get_profile_config_post_mode(profile_id) == 0 else 'Quote جمع‌شونده'}  🔄",
             callback_data=f"tgl_cfg_post_mode_{profile_id}", style="primary"
         )],
-        [InlineKeyboardButton(f"👁 نمایش Ping: {'✅' if prof.get('show_ping', 1) else '❌'}", callback_data=f"tgl_show_ping_{profile_id}", style="primary")],
-        [InlineKeyboardButton(f"🧩 Ping کانفیگ: {'🇮🇷 ایران' if get_profile_config_ping_mode(profile_id) == 'iran' else '🌍 جهانی'}", callback_data=f"toggle_ping_config_{profile_id}", style="primary"),
-         InlineKeyboardButton(f"🌐 Ping پروکسی: {'🇮🇷 ایران' if get_profile_proxy_ping_mode(profile_id) == 'iran' else '🌍 جهانی'}", callback_data=f"toggle_ping_proxy_{profile_id}", style="primary")],
+        [InlineKeyboardButton(f"👁 نمایش Ping: {'✅' if prof.get('show_ping', 1) else '❌'}", callback_data=f"tgl_show_ping_{profile_id}", style="primary"),
+         InlineKeyboardButton("📍 تنظیم مناطق Ping", callback_data=f"ping_regions_{profile_id}", style="primary")],
+        [InlineKeyboardButton(f"📍 Ping ویتوری: {'🇮🇷 ایران' if get_profile_config_ping_mode(profile_id) == 'iran' else '🌍 جهانی'}", callback_data=f"ping_region_config_{profile_id}", style="primary"),
+         InlineKeyboardButton(f"📍 Ping پروکسی: {'🇮🇷 ایران' if get_profile_proxy_ping_mode(profile_id) == 'iran' else '🌍 جهانی'}", callback_data=f"ping_region_proxy_{profile_id}", style="primary")],
         [InlineKeyboardButton(msg("btn_toggle_profile", status=profile_status), callback_data=f"tgl_profile_{profile_id}", style="danger")],
         [InlineKeyboardButton(cfg_btn, callback_data=f"tglcfg_{profile_id}", style="primary"),
          InlineKeyboardButton(prx_btn, callback_data=f"tglproxy_{profile_id}", style="primary")],
@@ -8450,26 +8316,6 @@ async def _on_callback_impl(u, ctx):
             await show_profile_admin(q.message, profile_id)
             return
 
-        if d.startswith("toggle_ping_config_") or d.startswith("toggle_ping_proxy_"):
-            try:
-                profile_id = int(d.rsplit("_", 1)[1])
-            except ValueError:
-                await q.answer("⚠️ شناسه نامعتبر")
-                return
-            if d.startswith("toggle_ping_config_"):
-                current = get_profile_config_ping_mode(profile_id)
-                new_mode = "iran" if current == "global" else "global"
-                set_profile_config_ping_mode(profile_id, new_mode)
-                label = "کانفیگ"
-            else:
-                current = get_profile_proxy_ping_mode(profile_id)
-                new_mode = "iran" if current == "global" else "global"
-                set_profile_proxy_ping_mode(profile_id, new_mode)
-                label = "پروکسی"
-            await q.answer(f"✅ Ping {label}: {'🇮🇷 ایران' if new_mode == 'iran' else '🌍 جهانی'}")
-            await show_profile_admin(q.message, profile_id)
-            return
-
         if d.startswith("ping_regions_"):
             try:
                 profile_id = int(d.rsplit("_", 1)[1])
@@ -9676,7 +9522,7 @@ async def show_profile_admin(msg_or_q, profile_id):
     sponsors = get_sponsors(profile_id)
     sponsor_st = f"{len(sponsors)} اسپانسر" if sponsors else "خالی"
     ping_mode = prof["ping_mode"]
-    ping_display = f"کانفیگ:{get_profile_config_ping_mode(profile_id)} / پروکسی:{get_profile_proxy_ping_mode(profile_id)}"
+    ping_display = f"ویتوری:{get_profile_config_ping_mode(profile_id)} / پروکسی:{get_profile_proxy_ping_mode(profile_id)}"
     ping_testing = get_profile_ping_enabled(profile_id)
     ping_status = "✅" if ping_testing else "❌"
     profile_enabled = get_profile_enabled(profile_id)
