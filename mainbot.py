@@ -1619,8 +1619,16 @@ async def _send_manual_queue_batch(bot, job):
     return sent
 
 
-CONFIG_RETENTION_HOURS = 24 * 7
-RUNTIME_RETENTION_HOURS = 24
+CONFIG_RETENTION_HOURS = 48
+RUNTIME_RETENTION_HOURS = 12
+DB_CLEAN_INTERVAL = 15 * 60
+DB_SOFT_LIMIT_BYTES = 9 * 1024 * 1024
+DB_HARD_LIMIT_BYTES = 10 * 1024 * 1024
+SEEN_ROWS_PER_PROFILE = 2500
+PROXY_ROWS_PER_PROFILE = 1500
+PENDING_ROWS_PER_PROFILE_KIND = 1000
+CHANNEL_POST_ROWS_PER_PROFILE = 300
+ADMIN_ACTIVITY_MAX_ROWS = 300
 
 def cleanup_expired_runtime_data():
     """Remove disposable runtime history after 7 days; profiles/settings and permanent dedup ledgers stay forever."""
@@ -2198,10 +2206,28 @@ def _pending_batch_upsert(profile_id, kind, identity_hash, url, source="", ping=
             "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (int(profile_id), kind, identity_hash, url, source or "", float(ping or 0), int(ping_count or 0), flag or "🌐", country_code or "", get_tehran_time())
         )
-        conn.commit()
     except sqlite3.Error:
         conn.rollback()
         log.exception("pending batch write failed for profile %s/%s", profile_id, kind)
+
+def _pending_batch_upsert_many(profile_id, kind, rows):
+    if not rows:
+        return 0
+    now = get_tehran_time()
+    payload = [(int(profile_id), kind, h, url, source or "", float(ping or 0), int(ping_count or 0), flag or "🌐", cc or "", now)
+               for h, url, source, ping, ping_count, flag, cc in rows]
+    try:
+        before = conn.total_changes
+        c.executemany(
+            "INSERT OR IGNORE INTO pending_batch_items "
+            "(profile_id,kind,identity_hash,url,source,ping,ping_count,flag,country_code,added_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)", payload)
+        conn.commit()
+        return max(0, conn.total_changes - before)
+    except sqlite3.Error:
+        conn.rollback()
+        log.exception("pending batch bulk write failed for profile %s/%s", profile_id, kind)
+        return 0
 
 def _pending_batch_remove_posted(profile_id, kind):
     try:
@@ -3877,7 +3903,9 @@ def set_stream_last_message_ids_batch(profile_id, stream, updates):
     c.executemany("""INSERT INTO source_stream_state
         (profile_id,source,stream,last_message_id,updated_at) VALUES (?,?,?,?,?)
         ON CONFLICT(profile_id,source,stream) DO UPDATE SET
-        last_message_id=excluded.last_message_id, updated_at=excluded.updated_at""", rows)
+        last_message_id=excluded.last_message_id,
+        updated_at=excluded.updated_at
+        WHERE source_stream_state.last_message_id IS NOT excluded.last_message_id""", rows)
     conn.commit()
 
 def set_stream_last_message_id(profile_id, source, stream, msg_id):
@@ -5858,6 +5886,187 @@ async def profile_loop_proxy(bot, profile_id):
             log.error(traceback.format_exc())
             await asyncio.sleep(60)
 
+
+# ======================================================================
+# Decoupled automatic pipeline: discovery/test and exact posting are separate
+# ======================================================================
+AUTO_SCAN_INTERVAL_SECONDS = 12.0
+AUTO_TEST_INTERVAL_SECONDS = 8.0
+AUTO_INSTANT_POST_POLL_SECONDS = 2.0
+AUTO_CONFIG_TEST_BATCH = 8
+AUTO_PROXY_TEST_BATCH = 8
+
+async def _auto_scan_stream(profile_id, stream):
+    pid=int(profile_id); profile=get_profile(pid)
+    if not profile or not get_profile_enabled(pid): return 0
+    if stream=="config":
+        if not get_profile_post_configs(pid): return 0
+    elif not get_profile_post_proxies(pid): return 0
+    expiry_raw=profile.get("timer_expiry")
+    if expiry_raw:
+        try:
+            expiry=datetime.fromisoformat(expiry_raw)
+            if expiry.tzinfo is None: expiry=TEHRAN_TZ.localize(expiry)
+            if expiry.astimezone(TEHRAN_TZ)>datetime.now(TEHRAN_TZ): return 0
+        except Exception: pass
+    sources=[normalize_channel_input(x) for x in get_profile_sources(pid)]
+    sources=[x for x in sources if x]
+    if not sources: return 0
+    sem=asyncio.Semaphore(20 if get_profile_low_cost_mode(pid) else 28)
+    async def one(src):
+        async with sem:
+            try:
+                return await asyncio.wait_for(scrape_channel_paginated(pid,src,max_pages=1,stream=stream),timeout=15.0)
+            except Exception as exc:
+                log.warning("[AUTO-SCAN][%s][profile=%s] %s failed: %s",stream,pid,src,exc); return None
+    results=await asyncio.gather(*[one(src) for src in sources])
+    pending_hashes={r[0] for r in _pending_batch_rows(pid,stream)}
+    ping_enabled=get_profile_ping_enabled(pid); inserted=0; cursor_updates=[]
+    for src,result in zip(sources,results):
+        if not result: continue
+        configs,proxies,newest_id=result
+        if newest_id: cursor_updates.append((src,newest_id))
+        candidates=configs if stream=="config" else [normalize_proxy_url(x) for x in proxies]
+        rows=[]
+        for raw in [x for x in candidates if x]:
+            h=_config_identity_hash(raw) if stream=="config" else _proxy_identity_hash(raw)
+            if h in pending_hashes: continue
+            if (is_already_posted(pid,raw) if stream=="config" else is_proxy_posted(pid,raw)): continue
+            rows.append((h,raw,src,1 if not ping_enabled else 0,0,"🌐","")); pending_hashes.add(h)
+        if rows: inserted += _pending_batch_upsert_many(pid,stream,rows)
+    if cursor_updates: set_stream_last_message_ids_batch(pid,stream,cursor_updates)
+    if inserted: log.info("[AUTO-SCAN][%s][profile=%s] queued=%d",stream,pid,inserted)
+    return inserted
+
+async def _auto_health_test_stream(profile_id, stream):
+    pid=int(profile_id); profile=get_profile(pid)
+    if not profile or not get_profile_enabled(pid): return 0
+    if not get_profile_ping_enabled(pid):
+        try:
+            cur=c.execute("UPDATE pending_batch_items SET ping=1 WHERE profile_id=? AND kind=? AND ping<=0",(pid,stream)); conn.commit(); return max(0,cur.rowcount)
+        except sqlite3.Error: conn.rollback(); return 0
+    limit=AUTO_CONFIG_TEST_BATCH if stream=="config" else AUTO_PROXY_TEST_BATCH
+    rows=c.execute("SELECT identity_hash,url,source FROM pending_batch_items WHERE profile_id=? AND kind=? AND ping<=0 ORDER BY added_at ASC LIMIT ?",(pid,stream,limit)).fetchall()
+    if not rows: return 0
+    sem=asyncio.Semaphore(3 if get_profile_low_cost_mode(pid) else 4)
+    mode=get_profile_config_ping_mode(pid) if stream=="config" else get_profile_proxy_ping_mode(pid)
+    async def test(row):
+        h,url,src=row
+        async with sem:
+            try:
+                ping,ok,count=await check_full_link_ping(url,mode,perform_ping=True)
+                return h,ping,count,ok
+            except Exception: return h,0,0,False
+    results=await asyncio.gather(*[test(r) for r in rows])
+    passed=failed=0
+    for h,ping,count,ok in results:
+        if ok and ping>0:
+            c.execute("UPDATE pending_batch_items SET ping=?,ping_count=? WHERE profile_id=? AND kind=? AND identity_hash=?",(float(ping),int(count),pid,stream,h)); passed+=1
+        else:
+            c.execute("DELETE FROM pending_batch_items WHERE profile_id=? AND kind=? AND identity_hash=?",(pid,stream,h)); failed+=1
+    conn.commit()
+    if passed or failed: log.info("[AUTO-TEST][%s][profile=%s] passed=%d failed=%d",stream,pid,passed,failed)
+    return passed
+
+async def _auto_scanner_worker(profile_id,stream):
+    name=f"auto_scan_{stream}_{profile_id}"; log.info("[AUTO-SCAN] started %s",name)
+    while True:
+        try:
+            _WORKER_HEARTBEATS[name]=time.time(); await _auto_scan_stream(profile_id,stream); await asyncio.sleep(AUTO_SCAN_INTERVAL_SECONDS)
+        except asyncio.CancelledError: return
+        except Exception: log.exception("[AUTO-SCAN] worker error %s",name); await asyncio.sleep(2)
+
+async def _auto_tester_worker(profile_id,stream):
+    name=f"auto_test_{stream}_{profile_id}"; log.info("[AUTO-TEST] started %s",name)
+    while True:
+        try:
+            _WORKER_HEARTBEATS[name]=time.time(); await _auto_health_test_stream(profile_id,stream); await asyncio.sleep(AUTO_TEST_INTERVAL_SECONDS)
+        except asyncio.CancelledError: return
+        except Exception: log.exception("[AUTO-TEST] worker error %s",name); await asyncio.sleep(2)
+
+async def _auto_post_pending(profile_id,stream,bot,force_instant=False):
+    pid=int(profile_id); profile=get_profile(pid)
+    if not profile or not get_profile_enabled(pid): return 0
+    if stream=="config":
+        if not get_profile_post_configs(pid): return 0
+        desired=max(1,int(get_profile_max_post_config(pid) or 1))
+    else:
+        if not get_profile_post_proxies(pid): return 0
+        desired=max(1,int(get_profile_max_post_proxy(pid) or 1))
+    rows=_pending_batch_rows(pid,stream)
+    if get_profile_ping_enabled(pid): rows=[r for r in rows if float(r[3] or 0)>0]
+    if not rows: return 0
+    if get_profile_batch_posting(pid) and len(rows)<desired: return 0
+    rows=rows[:desired]
+    if stream=="config":
+        sent=await post_configs(bot,pid,[(r[1],float(r[3] or 0),int(r[4] or 0)) for r in rows],source_for_seen="auto",is_instant=force_instant,max_post_override=desired)
+        if sent: _pending_batch_remove_posted(pid,"config")
+        return sent
+    items=[(r[1],float(r[3] or 0),r[5] or "🌐",r[6] or "") for r in rows]
+    cnt,payload,urls=await post_proxies(bot,pid,items,is_instant=force_instant,max_proxies_override=desired)
+    if cnt and payload:
+        text,buttons=payload
+        if await send_to_destination(bot,pid,text,buttons):
+            mark_proxies_posted_batch(pid,urls); _pending_batch_remove_posted(pid,"proxy"); return cnt
+    return 0
+
+async def _auto_exact_poster_worker(profile_id,stream,bot):
+    name=f"auto_post_{stream}_{profile_id}"; log.info("[AUTO-POST] started %s | timer independent",name)
+    loop=asyncio.get_running_loop(); next_deadline=None; interval_seconds=None
+    while True:
+        try:
+            _WORKER_HEARTBEATS[name]=time.time(); profile=get_profile(profile_id)
+            if not profile or not get_profile_enabled(profile_id): next_deadline=None; interval_seconds=None; await asyncio.sleep(1); continue
+            enabled=get_profile_post_configs(profile_id) if stream=="config" else get_profile_post_proxies(profile_id)
+            if not enabled: next_deadline=None; interval_seconds=None; await asyncio.sleep(1); continue
+            raw=get_profile_interval_config(profile_id) if stream=="config" else get_profile_interval_proxy(profile_id)
+            try: minutes=max(0,int(raw or 0))
+            except Exception: minutes=0
+            expiry_raw=profile.get("timer_expiry")
+            if expiry_raw:
+                try:
+                    expiry=datetime.fromisoformat(expiry_raw)
+                    if expiry.tzinfo is None: expiry=TEHRAN_TZ.localize(expiry)
+                    nowt=datetime.now(TEHRAN_TZ)
+                    if expiry.astimezone(TEHRAN_TZ)>nowt:
+                        next_deadline=None; interval_seconds=None; await asyncio.sleep(min(1,max(.05,(expiry.astimezone(TEHRAN_TZ)-nowt).total_seconds()))); continue
+                    clear_profile_timer(profile_id)
+                except Exception:
+                    clear_profile_timer(profile_id); next_deadline=None; interval_seconds=None
+            if minutes==0:
+                sent=await _auto_post_pending(profile_id,stream,bot,True)
+                if sent: log.info("[AUTO-POST][%s][profile=%s] instant sent=%d",stream,profile_id,sent)
+                await asyncio.sleep(AUTO_INSTANT_POST_POLL_SECONDS); continue
+            seconds=float(minutes*60)
+            if interval_seconds!=seconds or next_deadline is None:
+                interval_seconds=seconds; next_deadline=loop.time()
+            wait=next_deadline-loop.time()
+            if wait>0: await asyncio.sleep(wait); continue
+            scheduled=datetime.now(TEHRAN_TZ); log.info("[AUTO-POST] TICK profile=%s stream=%s scheduled=%s interval=%sm",profile_id,stream,scheduled.isoformat(),minutes)
+            now_mono=loop.time(); missed=max(0,int((now_mono-next_deadline)//seconds)); next_deadline+=(missed+1)*seconds
+            sent=await _auto_post_pending(profile_id,stream,bot,False)
+            log.info("[AUTO-POST] DONE profile=%s stream=%s sent=%d next_in=%.1fs",profile_id,stream,sent,max(0,next_deadline-loop.time()))
+        except asyncio.CancelledError: return
+        except Exception: log.exception("[AUTO-POST] error profile=%s stream=%s",profile_id,stream); await asyncio.sleep(.5)
+
+async def _auto_pipeline_supervisor(app):
+    while True:
+        try:
+            if ENABLE_AUTO:
+                for prof in get_profiles():
+                    pid=int(prof["id"])
+                    if not get_profile_enabled(pid): continue
+                    if get_profile_post_configs(pid):
+                        start_worker(app,f"auto_scan_config_{pid}",lambda pid=pid:_auto_scanner_worker(pid,"config"))
+                        start_worker(app,f"auto_test_config_{pid}",lambda pid=pid:_auto_tester_worker(pid,"config"))
+                        start_worker(app,f"auto_post_config_{pid}",lambda pid=pid:_auto_exact_poster_worker(pid,"config",app.bot))
+                    if get_profile_post_proxies(pid):
+                        start_worker(app,f"auto_scan_proxy_{pid}",lambda pid=pid:_auto_scanner_worker(pid,"proxy"))
+                        start_worker(app,f"auto_test_proxy_{pid}",lambda pid=pid:_auto_tester_worker(pid,"proxy"))
+                        start_worker(app,f"auto_post_proxy_{pid}",lambda pid=pid:_auto_exact_poster_worker(pid,"proxy",app.bot))
+            await asyncio.sleep(10)
+        except asyncio.CancelledError: return
+        except Exception: log.exception("[AUTO-PIPELINE] supervisor failed"); await asyncio.sleep(5)
 
 # ======================================================================
 # stable scheduler
@@ -10679,87 +10888,69 @@ async def export_backup(update, context, profile_id, backup_type, count=None):
 # ======================================================================
 # Automatic database garbage collector (v1.1.0)
 # ======================================================================
-DB_CLEAN_INTERVAL = 24 * 60 * 60
 
 
 def automatic_database_cleanup():
-    """Delete disposable runtime data only; permanent profiles/cursors/dedup stay intact."""
+    """Bound disposable DB history so long-running Railway instances stay small."""
     db = None
     try:
-        db = get_conn()
-        cur = db.cursor()
-        config_cutoff = (datetime.now(TEHRAN_TZ) - timedelta(hours=CONFIG_RETENTION_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+        db = get_conn(); cur = db.cursor(); deleted = {}
         runtime_cutoff = (datetime.now(TEHRAN_TZ) - timedelta(hours=RUNTIME_RETENTION_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
-        deleted = {}
-        try:
-            cur.execute("DELETE FROM manual_send_queue WHERE status IN ('done','cancelled','failed') AND updated_at < ?", (runtime_cutoff,))
-            deleted["manual_send_queue"] = max(0, cur.rowcount)
-        except sqlite3.Error:
-            deleted["manual_send_queue"] = 0
-        # Full config/proxy URL history stays 7 days. Permanent compact dedup hashes remain forever.
-        for table, col in (("seen", "last_posted"), ("proxies_seen", "last_posted")):
+        for table, cap in (("seen", SEEN_ROWS_PER_PROFILE), ("proxies_seen", PROXY_ROWS_PER_PROFILE)):
             try:
-                cur.execute(f"DELETE FROM {table} WHERE {col} IS NOT NULL AND {col} < ?", (config_cutoff,))
-                deleted[table] = max(0, cur.rowcount)
+                cur.execute(f"DELETE FROM {table} WHERE last_posted IS NOT NULL AND last_posted < ?", (runtime_cutoff,))
+                deleted[table+"_old"] = max(0, cur.rowcount)
+                pids = [r[0] for r in cur.execute(f"SELECT DISTINCT profile_id FROM {table}").fetchall()]
+                trimmed = 0
+                for pid in pids:
+                    cur.execute(f"DELETE FROM {table} WHERE profile_id=? AND rowid NOT IN (SELECT rowid FROM {table} WHERE profile_id=? ORDER BY last_posted DESC LIMIT ?)", (int(pid),int(pid),int(cap)))
+                    trimmed += max(0,cur.rowcount)
+                deleted[table+"_trimmed"] = trimmed
             except sqlite3.Error:
                 deleted[table] = 0
-
-        # NEVER delete country/flag cache; flags must remain available.
-        deleted["country_cache"] = 0
-        # Short-lived runtime history: one day. Scrape cursors are NOT disposable.
-        for table, col in (("processed_messages", "rowid"), ("posts", "created_at")):
+        for table, sql, args in [
+            ("processed_messages", "DELETE FROM processed_messages", ()),
+            ("posts", "DELETE FROM posts WHERE created_at < ?", (runtime_cutoff,)),
+            ("manual_send_queue", "DELETE FROM manual_send_queue WHERE status IN ('done','cancelled','failed') AND updated_at < ?", (runtime_cutoff,)),
+            ("pending_batch_items", "DELETE FROM pending_batch_items WHERE added_at < ?", (runtime_cutoff,)),
+        ]:
             try:
-                if table == "processed_messages":
-                    # processed_messages has no timestamp column; it is safe to remove
-                    # the old rows because source_stream_state is the real cursor.
-                    cur.execute("DELETE FROM processed_messages")
-                else:
-                    cur.execute("DELETE FROM posts WHERE created_at < ?", (runtime_cutoff,))
-                deleted[table] = max(0, cur.rowcount)
+                cur.execute(sql,args); deleted[table]=max(0,cur.rowcount)
             except sqlite3.Error:
-                deleted[table] = 0
+                deleted[table]=0
         try:
-            pending_cutoff = runtime_cutoff
-            cur.execute("DELETE FROM pending_batch_items WHERE added_at < ?", (pending_cutoff,))
-            deleted["pending_batch_items"] = max(0, cur.rowcount)
-        except sqlite3.Error:
-            deleted["pending_batch_items"] = 0
+            pids = cur.execute("SELECT DISTINCT profile_id,kind FROM pending_batch_items").fetchall(); trimmed=0
+            for pid,kind in pids:
+                cur.execute("DELETE FROM pending_batch_items WHERE profile_id=? AND kind=? AND rowid NOT IN (SELECT rowid FROM pending_batch_items WHERE profile_id=? AND kind=? ORDER BY added_at ASC LIMIT ?)", (int(pid),kind,int(pid),kind,int(PENDING_ROWS_PER_PROFILE_KIND)))
+                trimmed += max(0,cur.rowcount)
+            deleted["pending_trimmed"] = trimmed
+        except sqlite3.Error: deleted["pending_trimmed"] = 0
         try:
-            cache_cutoff = runtime_cutoff
-            cur.execute("DELETE FROM batch_test_cache WHERE tested_at < ?", (cache_cutoff,))
-            deleted["batch_test_cache"] = max(0, cur.rowcount)
-        except sqlite3.Error:
-            deleted["batch_test_cache"] = 0
-        # Admin activity is useful, but only recent 7-day activity is needed.
+            cache_cutoff=(datetime.now(TEHRAN_TZ)-timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
+            cur.execute("DELETE FROM batch_test_cache WHERE tested_at < ?",(cache_cutoff,)); deleted["batch_test_cache"]=max(0,cur.rowcount)
+        except sqlite3.Error: deleted["batch_test_cache"]=0
         try:
-            cur.execute("DELETE FROM admin_activity WHERE created_at < ?", (runtime_cutoff,))
-            deleted["admin_activity"] = max(0, cur.rowcount)
-        except sqlite3.Error:
-            deleted["admin_activity"] = 0
-        # channel_posts is the authoritative 7-day record of messages actually
-        # sent by each profile, including messages that were later deleted.
+            cur.execute("DELETE FROM channel_posts WHERE sent_at < ?",(runtime_cutoff,)); deleted["channel_posts_old"]=max(0,cur.rowcount)
+            for pid in [r[0] for r in cur.execute("SELECT DISTINCT profile_id FROM channel_posts").fetchall()]:
+                cur.execute("DELETE FROM channel_posts WHERE profile_id=? AND rowid NOT IN (SELECT rowid FROM channel_posts WHERE profile_id=? ORDER BY sent_at DESC LIMIT ?)",(int(pid),int(pid),int(CHANNEL_POST_ROWS_PER_PROFILE)))
+        except sqlite3.Error: pass
         try:
-            cur.execute("DELETE FROM channel_posts WHERE sent_at < ?", (config_cutoff,))
-            deleted["channel_posts"] = max(0, cur.rowcount)
-        except sqlite3.Error:
-            deleted["channel_posts"] = 0
+            cur.execute("DELETE FROM admin_activity WHERE id NOT IN (SELECT id FROM admin_activity ORDER BY id DESC LIMIT ?)",(int(ADMIN_ACTIVITY_MAX_ROWS),))
+            deleted["admin_activity_trimmed"]=max(0,cur.rowcount)
+        except sqlite3.Error: pass
         db.commit()
-        cur.execute("PRAGMA optimize")
-        try:
-            cur.execute("PRAGMA wal_checkpoint(PASSIVE)")
-        except sqlite3.Error:
-            pass
+        try: cur.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error: pass
+        try: cur.execute("PRAGMA optimize")
+        except sqlite3.Error: pass
         db.commit()
-        log.info("[DB CLEANER] disposable cleanup completed: %s; permanent ledgers preserved", deleted)
+        log.info("[DB CLEANER] bounded cleanup: %s", deleted)
         return deleted
     except sqlite3.Error:
-        if db:
-            db.rollback()
-        log.exception("[DB CLEANER] failed")
-        return {}
+        if db: db.rollback()
+        log.exception("[DB CLEANER] failed"); return {}
     finally:
-        if db:
-            db.close()
+        if db: db.close()
 
 def compact_database_once():
     """One-time physical compaction. Runs off the event loop and skips if DB is busy."""
@@ -10771,10 +10962,11 @@ def compact_database_once():
         row = db.execute("PRAGMA freelist_count").fetchone()
         free_pages = int(row[0] or 0) if row else 0
         page_size = int((db.execute("PRAGMA page_size").fetchone() or [4096])[0])
-        if free_pages * page_size < 256 * 1024:
-            log.info("[DB COMPACT] skipped; reclaimable space below 256 KiB")
+        db_size = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+        if db_size < DB_SOFT_LIMIT_BYTES and free_pages * page_size < 256 * 1024:
+            log.info("[DB COMPACT] skipped; size=%d KiB free=%d KiB", db_size//1024, (free_pages*page_size)//1024)
             return False
-        log.info("[DB COMPACT] starting one-time compaction: reclaimable=%d MiB", (free_pages * page_size) // (1024 * 1024))
+        log.info("[DB COMPACT] starting compaction: size=%d KiB reclaimable=%d MiB", db_size//1024, (free_pages * page_size) // (1024 * 1024))
         db.execute("VACUUM")
         log.info("[DB COMPACT] completed")
         return True
@@ -10795,7 +10987,7 @@ async def database_compact_worker():
         log.exception("[DB COMPACT] worker failed")
 
 async def database_cleanup_worker():
-    log.info('[DB CLEANER] worker started | config-retention=7d | runtime-retention=1d | flags=permanent | compact-after-cleanup')
+    log.info('[DB CLEANER] worker started | bounded URL history | runtime-retention=12h | compact-after-cleanup')
     # Never compete with startup/callback initialization.
     await asyncio.sleep(10)
     while True:
@@ -10940,25 +11132,9 @@ async def post_init(app):
     log.info("⏱️ Manual queue scheduler enabled")
 
     if ENABLE_AUTO:
-        # Use the fixed-deadline scheduler as the ONLY automatic scheduler.
-        # The legacy profile_loop_* workers used relative sleeps after each
-        # cycle and are intentionally not started: two schedulers for the same
-        # profile can race on cursors and make config posting appear broken.
-        for prof in profiles:
-            pid = int(prof["id"])
-            if get_profile_post_configs(pid):
-                log.info(f"⏰ Creating precise config scheduler for profile {pid} ({prof['dest_name']})")
-                start_worker(app, f"auto_config_{pid}", lambda pid=pid: _profile_scheduler_v16(app.bot, pid, "config"))
-            else:
-                log.info(f"⏸️ AUTO config scheduler not started for profile {pid}: posting disabled")
-            if get_profile_post_proxies(pid):
-                log.info(f"⏰ Creating precise proxy scheduler for profile {pid} ({prof['dest_name']})")
-                start_worker(app, f"auto_proxy_{pid}", lambda pid=pid: _profile_scheduler_v16(app.bot, pid, "proxy"))
-            else:
-                log.info(f"⏸️ AUTO proxy scheduler not started for profile {pid}: posting disabled")
-        log.info("⏰ Precise automatic scheduler started: only enabled streams are running")
-        start_worker(app, "profile_scheduler_supervisor", lambda: _profile_scheduler_supervisor(app))
-        log.info("🛡️ AUTO scheduler supervisor enabled (10s reconciliation)")
+        log.info("⏰ Decoupled AUTO pipeline starting: scanner/tester/poster")
+        start_worker(app, "auto_pipeline_supervisor", lambda: _auto_pipeline_supervisor(app))
+        log.info("🛡️ AUTO pipeline supervisor enabled (10s reconciliation)")
 
     start_worker(app, "cleanup", lambda: periodic_cleanup())
     start_worker(app, "database_cleaner", lambda: database_cleanup_worker())
