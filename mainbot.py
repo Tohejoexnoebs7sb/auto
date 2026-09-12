@@ -1,9 +1,9 @@
 # bot.py — 4.1.16
-APP_VERSION = "4.1.16"
+APP_VERSION = "4.1.17"
 APP_VERSION_MAJOR = 4
 APP_VERSION_MINOR = 1
-APP_VERSION_PATCH = 16
-APP_VERSION_LABEL = "4.1.16-stable"
+APP_VERSION_PATCH = 17
+APP_VERSION_LABEL = "4.1.17-stable"
 BOT_VERSION = APP_VERSION
 import os
 import glob
@@ -51,7 +51,7 @@ if not MAIN_ADMIN_ID:
 # ======================================================================
 # مسیر پایدار
 # ======================================================================
-DATA_DIR = os.getenv("DATA_DIR", "/app/data")
+DATA_DIR = "/app/data"
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "bot.db")
 BACKUP_DIR = os.path.join(DATA_DIR, "backups")
@@ -4063,21 +4063,17 @@ async def host_to_ip(host):
         return None
 
 _PING_TARGET_IP_CACHE = {}
-_PING_RESULT_CACHE = {}
-_PING_RESULT_CACHE_TTL = 20.0
-_PING_INFLIGHT = {}
-_PING_INFLIGHT_LOCK = asyncio.Lock()
 _PING_TARGET_IP_CACHE_TTL = 900
-_DNS_CACHE = {}
-_DNS_CACHE_TTL = 300
 
+# Check-Host is rate-limited. Keep submissions serialized and spaced so a
+# large scrape does not turn into dozens/hundreds of HTTP 429 responses.
 _CHECK_HOST_SUBMIT_LOCK = asyncio.Lock()
 _CHECK_HOST_LAST_SUBMIT = 0.0
-_CHECK_HOST_MIN_SUBMIT_INTERVAL = 0.55
+_CHECK_HOST_MIN_SUBMIT_INTERVAL = 0.80
 _CHECK_HOST_MAX_429_RETRIES = 2
 
 async def _check_host_submit(client, target):
-    """Submit Check-Host safely while avoiding bursts and duplicate requests."""
+    """Submit one normal Check-Host Ping request with global rate limiting."""
     global _CHECK_HOST_LAST_SUBMIT
     last_status = None
     for attempt in range(_CHECK_HOST_MAX_429_RETRIES + 1):
@@ -4094,161 +4090,224 @@ async def _check_host_submit(client, target):
                 )
             finally:
                 _CHECK_HOST_LAST_SUBMIT = time.monotonic()
+
         last_status = response.status_code
         if response.status_code != 429:
             return response
+
         retry_after = response.headers.get("Retry-After", "")
         try:
-            delay = max(1.5, min(float(retry_after), 10.0))
+            delay = max(2.0, min(float(retry_after), 15.0))
         except (TypeError, ValueError):
-            delay = 2.0 * (attempt + 1)
+            delay = 3.0 * (attempt + 1)
+        log.warning(
+            "⏳ Check-Host rate limited (429) for %s; retry %d/%d in %.1fs",
+            target, attempt + 1, _CHECK_HOST_MAX_429_RETRIES, delay
+        )
         await asyncio.sleep(delay)
-    log.warning("Check-Host submit failed after 429 retries for %s (status=%s)", target, last_status)
+
+    log.warning("❌ Check-Host submit failed after 429 retries for %s (status=%s)", target, last_status)
     return None
 
+
 def _parse_check_host_packets(node_result):
-    """Return (ok_count, avg_ms, resolved_ip) from the first Check-Host row."""
+    """Return (ok_count, avg_ms, resolved_ip) for a Check-Host ping row."""
     packets = None
-    if isinstance(node_result, list) and node_result and isinstance(node_result[0], list):
-        packets = node_result[0]
+    if isinstance(node_result, list) and node_result:
+        first = node_result[0]
+        if isinstance(first, list):
+            packets = first
     if not isinstance(packets, list) or not packets:
         return 0, 0, None
+
     ok_times = []
     resolved_ip = None
     for packet in packets[:4]:
-        if not isinstance(packet, list) or len(packet) < 2:
+        if not isinstance(packet, list) or not packet:
             continue
-        if str(packet[0] or "").upper() != "OK":
+        status = str(packet[0] or "").upper()
+        if status != "OK":
             continue
         try:
             seconds = float(packet[1])
-            if seconds >= 0:
-                ok_times.append(seconds)
-        except (TypeError, ValueError):
-            continue
+            ok_times.append(seconds)
+        except (IndexError, TypeError, ValueError):
+            pass
         if len(packet) >= 3 and packet[2]:
             resolved_ip = str(packet[2]).strip()
+
     ok_count = len(ok_times)
     avg_ms = int(round(sum(ok_times) / ok_count * 1000)) if ok_times else 0
     return ok_count, avg_ms, resolved_ip
 
-async def _fetch_check_host_result(target, wanted_country=None):
-    """One Check-Host request, parsed into stable rows.
-
-    wanted_country='ir' filters only Iranian nodes. No non-Iran node can make
-    Iran mode pass. Returns rows as (node, ok_count, avg_ms, ip).
-    """
-    cl = await _get_ping_client()
-    r = await _check_host_submit(cl, target)
-    if r is None or r.status_code != 200:
-        return []
-    try:
-        created = r.json()
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(created, dict) or not created.get("ok") or not created.get("request_id"):
-        return []
-
-    node_meta = created.get("nodes") or {}
-    selected = []
-    for node_name, info in node_meta.items():
-        country = str(info[0] or "").strip().lower() if isinstance(info, list) and info else ""
-        if wanted_country is None or country == wanted_country:
-            selected.append(str(node_name))
-    if not selected:
-        return []
-
-    result_url = f"https://check-host.net/check-result/{quote(str(created['request_id']), safe='')}"
-    deadline = time.monotonic() + 8.0
-    last_rows = []
-    while time.monotonic() < deadline:
-        try:
-            rr = await cl.get(result_url, headers={"Accept": "application/json"})
-            result = rr.json() if rr.status_code == 200 else None
-        except (httpx.HTTPError, json.JSONDecodeError):
-            result = None
-        if isinstance(result, dict):
-            rows = []
-            for node_name in selected:
-                if result.get(node_name) is None:
-                    continue
-                ok_count, avg_ms, resolved_ip = _parse_check_host_packets(result.get(node_name))
-                if ok_count:
-                    rows.append((node_name, ok_count, avg_ms, resolved_ip))
-            if rows:
-                last_rows = rows
-                # As soon as at least one selected node has all four packets,
-                # the measurement is complete enough; otherwise keep polling.
-                if any(row[1] >= 4 for row in rows):
-                    break
-            if len(last_rows) == len(selected) and last_rows:
-                break
-        await asyncio.sleep(0.45)
-    return last_rows
-
-async def _cached_ping(target, mode):
-    key = (str(mode or "global").lower(), str(target or "").strip().lower())
-    now = time.monotonic()
-    cached = _PING_RESULT_CACHE.get(key)
-    if cached and now - cached[0] < _PING_RESULT_CACHE_TTL:
-        return cached[1]
-
-    async with _PING_INFLIGHT_LOCK:
-        task = _PING_INFLIGHT.get(key)
-        if task is None:
-            task = asyncio.create_task(_uncached_ping(target, mode))
-            _PING_INFLIGHT[key] = task
-    try:
-        result = await task
-        _PING_RESULT_CACHE[key] = (time.monotonic(), result)
-        return result
-    finally:
-        async with _PING_INFLIGHT_LOCK:
-            if _PING_INFLIGHT.get(key) is task:
-                _PING_INFLIGHT.pop(key, None)
-
-async def _uncached_ping(target, mode):
-    if not target:
-        return 0, False, 0
-    if mode == "iran":
-        rows = await _fetch_check_host_result(target, wanted_country="ir")
-        # Iran result = median latency of the best reliable Iranian rows.
-        # One lucky node no longer decides the whole result.
-        reliable = [r for r in rows if r[1] >= 3]
-        if not reliable:
-            return 0, False, 0
-        reliable.sort(key=lambda r: (r[2], -r[1]))
-        latencies = sorted(r[2] for r in reliable)
-        median_ms = int(round(latencies[len(latencies) // 2])) if len(latencies) % 2 else int(round(sum(latencies[len(latencies)//2-1:len(latencies)//2+1]) / 2))
-        best = reliable[0]
-        if best[3]:
-            _PING_TARGET_IP_CACHE[target.lower()] = (time.monotonic(), best[3])
-        return median_ms, True, min(4, max(r[1] for r in reliable))
-
-    rows = await _fetch_check_host_result(target, wanted_country=None)
-    if not rows:
-        return 0, False, 0
-    # Global mode still accepts a single successful node, but prefers the
-    # fastest reliable row and returns its packet count.
-    best = min(rows, key=lambda r: (r[2], -r[1]))
-    if best[3]:
-        _PING_TARGET_IP_CACHE[target.lower()] = (time.monotonic(), best[3])
-    return best[2], True, min(4, best[1])
 
 async def ping_from_iran_only(host, port=None, allow_tcp_fallback=False):
-    return await _cached_ping(host, "iran")
+    """Strict Iran Ping mode.
+
+    Uses only the normal Check-Host Ping request. Iran is identified from the
+    API's node metadata (country code == ``ir``), never by node-name keywords.
+    PASS requires at least one Iranian row with 2/4, 3/4, or 4/4 OK packets.
+    Other countries are ignored completely. No TCP/HTTP/DNS fallback is used.
+    """
+    target = str(host or "").strip()
+    if not target:
+        return 0, False, 0
+
+    try:
+        cl = await _get_ping_client()
+        r = await _check_host_submit(cl, target)
+        if r is None:
+            return 0, False, 0
+        if r.status_code != 200:
+            log.warning("check-host.net ping submit status: %s", r.status_code)
+            return 0, False, 0
+
+        try:
+            created = r.json()
+        except json.JSONDecodeError:
+            log.warning("⚠️ Check-Host returned invalid JSON for %s", target)
+            return 0, False, 0
+
+        if not isinstance(created, dict) or not created.get("ok") or not created.get("request_id"):
+            log.warning("⚠️ Check-Host ping submit failed for %s: %s", target, created)
+            return 0, False, 0
+
+        node_meta = created.get("nodes") or {}
+        iran_nodes = []
+        for node_name, info in node_meta.items():
+            if isinstance(info, list) and info and str(info[0] or "").strip().lower() == "ir":
+                iran_nodes.append(str(node_name))
+
+        if not iran_nodes:
+            log.warning("⚠️ Check-Host returned no Iranian rows for %s", target)
+            return 0, False, 0
+
+        request_id = str(created["request_id"])
+        result_url = f"https://check-host.net/check-result/{quote(request_id, safe='')}"
+        deadline = time.monotonic() + 10.5
+
+        while time.monotonic() < deadline:
+            rr = await cl.get(result_url, headers={"Accept": "application/json"})
+            if rr.status_code == 200:
+                try:
+                    result = rr.json()
+                except json.JSONDecodeError:
+                    result = None
+
+                if isinstance(result, dict):
+                    any_concrete = False
+                    all_concrete = True
+                    for node_name in iran_nodes:
+                        if node_name not in result or result.get(node_name) is None:
+                            all_concrete = False
+                            continue
+                        any_concrete = True
+                        ok_count, avg_ms, resolved_ip = _parse_check_host_packets(result.get(node_name))
+                        if ok_count >= 2:
+                            if resolved_ip:
+                                _PING_TARGET_IP_CACHE[target.lower()] = (time.monotonic(), resolved_ip)
+                            log.info(
+                                "✅ Iran Check-Host PASS %d/4 for %s (%s) -> avg %sms",
+                                min(ok_count, 4), target, node_name, avg_ms
+                            )
+                            return avg_ms, True, min(ok_count, 4)
+
+                    if any_concrete and all_concrete:
+                        log.info("❌ Iran Check-Host FAIL for %s: no Iran row reached 2/4", target)
+                        return 0, False, 0
+
+            await asyncio.sleep(0.65)
+
+        log.warning("⏳ Check-Host Iran ping stuck/incomplete for %s", target)
+        return 0, False, 0
+    except Exception as e:
+        log.warning("check-host.net Iran ping request failed for %s: %s", target, e)
+        return 0, False, 0
+
 
 async def ping_from_global(host):
-    return await _cached_ping(host, "global")
+    """Global Ping mode: normal Check-Host rows, any concrete OK packet passes."""
+    target = str(host or "").strip()
+    if not target:
+        return 0, False, 0
+
+    try:
+        cl = await _get_ping_client()
+        r = await _check_host_submit(cl, target)
+        if r is None:
+            return 0, False, 0
+        if r.status_code != 200:
+            log.warning("check-host.net global ping submit status: %s", r.status_code)
+            return 0, False, 0
+
+        try:
+            created = r.json()
+        except json.JSONDecodeError:
+            log.warning("⚠️ Check-Host global ping returned invalid JSON for %s", target)
+            return 0, False, 0
+
+        if not isinstance(created, dict) or not created.get("ok") or not created.get("request_id"):
+            log.warning("⚠️ Check-Host global ping submit failed for %s: %s", target, created)
+            return 0, False, 0
+
+        node_meta = created.get("nodes") or {}
+        node_names = [str(n) for n in node_meta.keys()]
+        if not node_names:
+            return 0, False, 0
+
+        request_id = str(created["request_id"])
+        result_url = f"https://check-host.net/check-result/{quote(request_id, safe='')}"
+        deadline = time.monotonic() + 10.5
+
+        while time.monotonic() < deadline:
+            rr = await cl.get(result_url, headers={"Accept": "application/json"})
+            if rr.status_code == 200:
+                try:
+                    result = rr.json()
+                except json.JSONDecodeError:
+                    result = None
+                if isinstance(result, dict):
+                    any_concrete = False
+                    all_concrete = True
+                    for node_name in node_names:
+                        if node_name not in result or result.get(node_name) is None:
+                            all_concrete = False
+                            continue
+                        any_concrete = True
+                        ok_count, avg_ms, resolved_ip = _parse_check_host_packets(result.get(node_name))
+                        # Global mode: every Check-Host country is eligible; one complete 4/4 row
+                        # from any country is enough to publish the item.
+                        if ok_count >= 4:
+                            if resolved_ip:
+                                _PING_TARGET_IP_CACHE[target.lower()] = (time.monotonic(), resolved_ip)
+                            log.info(
+                                "✅ Global Check-Host PASS %d/4 for %s (%s) -> avg %sms",
+                                min(ok_count, 4), target, node_name, avg_ms
+                            )
+                            return avg_ms, True, min(ok_count, 4)
+                    if any_concrete and all_concrete:
+                        log.info("❌ Global Check-Host FAIL for %s: no country/node returned a complete 4/4 result", target)
+                        return 0, False, 0
+            await asyncio.sleep(0.65)
+
+        log.warning("⏳ Check-Host global ping stuck/incomplete for %s", target)
+        return 0, False, 0
+    except Exception as e:
+        log.warning("check-host.net global ping request failed for %s: %s", target, e)
+        return 0, False, 0
+
 
 async def check_full_link_ping(url, ping_mode="global", perform_ping=True):
+    """Run exactly one of the two supported Check-Host Ping modes."""
     if not perform_ping:
         return 0, True, 0
     host, _port = extract_host(url)
     if not host:
         return 0, False, 0
     mode = _normalize_ping_mode(ping_mode)
-    return await asyncio.wait_for(_cached_ping(host, mode), timeout=10.0)
+    if mode == "iran":
+        return await asyncio.wait_for(ping_from_iran_only(host), timeout=13.0)
+    return await asyncio.wait_for(ping_from_global(host), timeout=13.0)
 
 # ======================================================================
 # اسکرپ (بهینه‌شده: استفاده از last_message_id برای توقف)
@@ -5320,7 +5379,7 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
                 # look broken while hundreds of later candidates are available.
                 # Test a bounded but sufficiently large window and stop only
                 # after collecting the requested number of healthy configs.
-                test_limit = min(len(new_configs), max(60, min(240, desired * 30)))
+                test_limit = min(len(new_configs), max(24, min(120, desired * 15)))
                 to_test = new_configs[:test_limit]
                 log.info(f"📊 Testing {len(to_test)} configs... low_cost={low_cost_mode}")
                 # Check-Host is rate-limited; never launch hundreds of submissions at once.
@@ -6639,23 +6698,24 @@ def profile_admin_kb(profile_id):
     ])
 
 def ping_regions_kb(profile_id):
+    """Exactly two Ping mode buttons: one for configs and one for proxies."""
     cfg = get_profile_config_ping_mode(profile_id)
     prx = get_profile_proxy_ping_mode(profile_id)
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🧩 ویتوری: {'🇮🇷 ایران' if cfg == 'iran' else '🌍 جهانی'}", callback_data=f"ping_region_config_{profile_id}", style="primary")],
-        [InlineKeyboardButton(f"🌐 پروکسی: {'🇮🇷 ایران' if prx == 'iran' else '🌍 جهانی'}", callback_data=f"ping_region_proxy_{profile_id}", style="primary")],
-        [InlineKeyboardButton("🌍 هر دو = جهانی", callback_data=f"ping_region_all_global_{profile_id}", style="success")],
-        [InlineKeyboardButton("↩️ بازگشت", callback_data=f"prof_{profile_id}", style="primary")],
+        [InlineKeyboardButton(
+            f"🧩 Ping کانفیگ: {'🇮🇷 ایران' if cfg == 'iran' else '🌍 جهانی'}",
+            callback_data=f"toggle_ping_config_{profile_id}", style="primary"
+        )],
+        [InlineKeyboardButton(
+            f"🌐 Ping پروکسی: {'🇮🇷 ایران' if prx == 'iran' else '🌍 جهانی'}",
+            callback_data=f"toggle_ping_proxy_{profile_id}", style="primary"
+        )],
     ])
 
 def ping_region_choice_kb(profile_id, kind):
-    current = get_profile_config_ping_mode(profile_id) if kind == "config" else get_profile_proxy_ping_mode(profile_id)
-    title = "ویتوری/کانفیگ" if kind == "config" else "پروکسی"
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"{'◉' if current == 'global' else '○'} 🌍 جهانی", callback_data=f"set_ping_region_{kind}_global_{profile_id}", style="success" if current == "global" else "primary")],
-        [InlineKeyboardButton(f"{'◉' if current == 'iran' else '○'} 🇮🇷 ایران", callback_data=f"set_ping_region_{kind}_iran_{profile_id}", style="success" if current == "iran" else "primary")],
-        [InlineKeyboardButton("↩️ بازگشت به مناطق Ping", callback_data=f"ping_regions_{profile_id}", style="primary")],
-    ])
+    # Backward-compatible entry point for old callbacks. The UI intentionally
+    # exposes only the two direct stream buttons now.
+    return ping_regions_kb(profile_id)
 
 def destinations_kb(profile_id):
     dest = get_profile_dest(profile_id)
@@ -8408,7 +8468,10 @@ async def _on_callback_impl(u, ctx):
                 set_profile_proxy_ping_mode(profile_id, new_mode)
                 label = "پروکسی"
             await q.answer(f"✅ Ping {label}: {'🇮🇷 ایران' if new_mode == 'iran' else '🌍 جهانی'}")
-            await show_profile_admin(q.message, profile_id)
+            await q.edit_message_text(
+                "📡 <b>حالت Ping</b>\n\nفقط دو دکمه فعال است: کانفیگ و پروکسی.",
+                parse_mode="HTML", reply_markup=ping_regions_kb(profile_id)
+            )
             return
 
         if d.startswith("ping_regions_"):
@@ -8416,56 +8479,23 @@ async def _on_callback_impl(u, ctx):
                 profile_id = int(d.rsplit("_", 1)[1])
             except ValueError:
                 await q.answer("⚠️ شناسه نامعتبر"); return
-            await q.edit_message_text("📍 <b>تنظیم مستقل مناطق Ping</b>\n\nبرای ویتوری و پروکسی می‌توانی منطقه جداگانه انتخاب کنی.\nپیش‌فرض هر دو: 🌍 جهانی", parse_mode="HTML", reply_markup=ping_regions_kb(profile_id))
+            await q.edit_message_text(
+                "📡 <b>حالت Ping</b>\n\nفقط دو حالت مستقل برای کانفیگ و پروکسی وجود دارد. با زدن هر دکمه، بین 🌍 جهانی و 🇮🇷 ایران جابه‌جا می‌شود.",
+                parse_mode="HTML", reply_markup=ping_regions_kb(profile_id)
+            )
             return
 
-        if d.startswith("ping_region_config_"):
+        if d.startswith("ping_region_config_") or d.startswith("ping_region_proxy_") or d.startswith("ping_region_all_global_") or d.startswith("set_ping_region_"):
+            # Legacy callbacks: never expose the old multi-button selector.
             try:
                 profile_id = int(d.rsplit("_", 1)[1])
             except ValueError:
                 await q.answer("⚠️ شناسه نامعتبر"); return
-            await q.edit_message_text("🧩 منطقه Ping ویتوری/کانفیگ را انتخاب کن:", reply_markup=ping_region_choice_kb(profile_id, "config"))
-            return
-
-        if d.startswith("ping_region_proxy_"):
-            try:
-                profile_id = int(d.rsplit("_", 1)[1])
-            except ValueError:
-                await q.answer("⚠️ شناسه نامعتبر"); return
-            await q.edit_message_text("🌐 منطقه Ping پروکسی را انتخاب کن:", reply_markup=ping_region_choice_kb(profile_id, "proxy"))
-            return
-
-        if d.startswith("set_ping_region_"):
-            parts = d.split("_")
-            if len(parts) != 5:
-                await q.answer("⚠️ داده نامعتبر"); return
-            _, _, kind, mode, profile_raw = parts
-            try:
-                profile_id = int(profile_raw)
-            except ValueError:
-                await q.answer("⚠️ شناسه نامعتبر"); return
-            mode = _normalize_ping_mode(mode)
-            if kind == "config":
-                set_profile_config_ping_mode(profile_id, mode)
-                label = "ویتوری/کانفیگ"
-            elif kind == "proxy":
-                set_profile_proxy_ping_mode(profile_id, mode)
-                label = "پروکسی"
-            else:
-                await q.answer("⚠️ نوع نامعتبر"); return
-            await q.answer(f"✅ منطقه Ping {label}: {'جهانی' if mode == 'global' else 'ایران'}")
-            await q.edit_message_text(f"🧩 منطقه Ping {label} تنظیم شد.", reply_markup=ping_region_choice_kb(profile_id, kind))
-            return
-
-        if d.startswith("ping_region_all_global_"):
-            try:
-                profile_id = int(d.rsplit("_", 1)[1])
-            except ValueError:
-                await q.answer("⚠️ شناسه نامعتبر"); return
-            set_profile_config_ping_mode(profile_id, "global")
-            set_profile_proxy_ping_mode(profile_id, "global")
-            await q.answer("🌍 هر دو منطقه Ping روی جهانی قرار گرفت")
-            await q.edit_message_text("🌍 منطقه Ping ویتوری و پروکسی هر دو روی جهانی تنظیم شدند.", reply_markup=ping_regions_kb(profile_id))
+            await q.answer("📡 انتخاب قدیمی است؛ از دو دکمه مستقیم کانفیگ/پروکسی استفاده کن.")
+            await q.edit_message_text(
+                "📡 <b>حالت Ping</b>\n\nفقط دو دکمه فعال است: کانفیگ و پروکسی.",
+                parse_mode="HTML", reply_markup=ping_regions_kb(profile_id)
+            )
             return
 
         if d.startswith("tglping_"):
