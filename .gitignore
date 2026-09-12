@@ -1,0 +1,22 @@
+# Secrets
+.env
+*.env
+
+# Runtime state — NEVER commit Railway data
+app/data/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+backups/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS/IDE
+.DS_Store
+.idea/
+.vscode/
