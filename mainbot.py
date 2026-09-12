@@ -1077,7 +1077,7 @@ def migrate_old_config():
     for dest in dest_list:
         c.execute("""INSERT INTO profiles
             (dest_name, sources, banner_config, banner_proxy, interval_min,
-             max_post, max_proxies, post_configs, post_proxies, ping_mode, last_num, created_at,
+             max_post, max_proxies, post_configs, post_proxies, ping_mode, config_ping_mode, proxy_ping_mode, last_num, created_at,
              show_numbers, custom_query, show_date_config, show_date_proxy, schedule_cron, last_backup_count,
              timer_expiry, timer_duration, backup_interval,
              interval_config, interval_proxy, max_post_config, max_post_proxy,
@@ -1771,10 +1771,21 @@ async def _force_manual_queue_send(bot, profile_id, job_id):
         log.exception(f"[MANUAL_FORCE] job={job_id} profile={profile_id} failed")
         update_manual_queue_job(job_id, profile_id, status="pending", last_error=str(exc)[:500], next_run_at=_queue_iso(_queue_now()+timedelta(seconds=10)))
 
-# Normalize missing Ping mode to the new default (Global) without overwriting explicit user choices.
-c.execute("UPDATE profiles SET ping_mode=? WHERE ping_mode IS NULL OR TRIM(ping_mode)=?", ("global", ""))
-c.execute("UPDATE profiles SET config_ping_mode=CASE WHEN LOWER(TRIM(COALESCE(ping_mode, 'global')))='iran' THEN 'iran' ELSE 'global' END WHERE config_ping_mode IS NULL OR TRIM(config_ping_mode)=?", ("",))
-c.execute("UPDATE profiles SET proxy_ping_mode=CASE WHEN LOWER(TRIM(COALESCE(ping_mode, 'global')))='iran' THEN 'iran' ELSE 'global' END WHERE proxy_ping_mode IS NULL OR TRIM(proxy_ping_mode)=?", ("",))
+# Ping defaults: Iran. Existing profiles are migrated once; after that an explicit
+# user choice (e.g. Global) is preserved across restarts.
+try:
+    c.execute("SELECT v FROM cfg WHERE k='ping_default_iran_v1'")
+    _ping_default_migrated = c.fetchone()
+except Exception:
+    _ping_default_migrated = None
+
+if not _ping_default_migrated:
+    c.execute("UPDATE profiles SET ping_mode='iran', config_ping_mode='iran', proxy_ping_mode='iran'")
+    c.execute("INSERT OR REPLACE INTO cfg (k, v) VALUES ('ping_default_iran_v1', '1')")
+else:
+    c.execute("UPDATE profiles SET ping_mode='iran' WHERE ping_mode IS NULL OR TRIM(ping_mode)=''")
+    c.execute("UPDATE profiles SET config_ping_mode='iran' WHERE config_ping_mode IS NULL OR TRIM(config_ping_mode)=''")
+    c.execute("UPDATE profiles SET proxy_ping_mode='iran' WHERE proxy_ping_mode IS NULL OR TRIM(proxy_ping_mode)=''")
 conn.commit()
 
 # ======================================================================
@@ -1823,7 +1834,7 @@ def get_profile(profile_id):
 
 def create_profile(dest_name, sources="", banner_config=None, banner_proxy=None,
                    interval_min=5, max_post=8, max_proxies=10,
-                   post_configs=1, post_proxies=1, ping_mode="global", last_num=0,
+                   post_configs=1, post_proxies=1, ping_mode="iran", last_num=0,
                    show_numbers=1, custom_query="",
                    show_date_config=1, show_date_proxy=1, schedule_cron="", backup_interval=1000,
                    interval_config=5, interval_proxy=5, max_post_config=8, max_post_proxy=10,
@@ -1836,7 +1847,7 @@ def create_profile(dest_name, sources="", banner_config=None, banner_proxy=None,
         banner_proxy = "🌐 <b>Proxies</b>\n━━━━━━━━━━━━━━━━━━\n📅 {date}\n✅ {count} proxies\n━━━━━━━━━━━━━━━━━━\n\n{proxies}\n━━━━━━━━━━━━━━━━━━"
     c.execute("""INSERT INTO profiles
         (dest_name, sources, banner_config, banner_proxy, interval_min,
-         max_post, max_proxies, post_configs, post_proxies, ping_mode, last_num, created_at,
+         max_post, max_proxies, post_configs, post_proxies, ping_mode, config_ping_mode, proxy_ping_mode, last_num, created_at,
          show_numbers, custom_query, show_date_config, show_date_proxy, schedule_cron, last_backup_count,
          timer_expiry, timer_duration, backup_interval,
          interval_config, interval_proxy, max_post_config, max_post_proxy,
@@ -1845,7 +1856,7 @@ def create_profile(dest_name, sources="", banner_config=None, banner_proxy=None,
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (dest_name, sources, banner_config, banner_proxy,
          interval_min, max_post, max_proxies,
-         post_configs, post_proxies, ping_mode, last_num,
+         post_configs, post_proxies, ping_mode, "iran", "iran", last_num,
          get_tehran_time(), show_numbers, custom_query,
          show_date_config, show_date_proxy, schedule_cron, 0, None, 0, backup_interval,
          interval_config, interval_proxy, max_post_config, max_post_proxy,
@@ -1956,7 +1967,7 @@ def _normalize_ping_mode(mode):
 def get_profile_ping_mode(profile_id):
     """Backward-compatible master ping mode; new UI uses per-stream modes."""
     prof = get_profile(profile_id)
-    return _normalize_ping_mode(prof.get("ping_mode", "global")) if prof else "global"
+    return _normalize_ping_mode(prof.get("ping_mode", "iran")) if prof else "iran"
 
 def set_profile_ping_mode(profile_id, mode):
     mode = _normalize_ping_mode(mode)
@@ -1965,8 +1976,8 @@ def set_profile_ping_mode(profile_id, mode):
 def get_profile_config_ping_mode(profile_id):
     prof = get_profile(profile_id)
     if not prof:
-        return "global"
-    return _normalize_ping_mode(prof.get("config_ping_mode", "global"))
+        return "iran"
+    return _normalize_ping_mode(prof.get("config_ping_mode", "iran"))
 
 def set_profile_config_ping_mode(profile_id, mode):
     update_profile(profile_id, config_ping_mode=_normalize_ping_mode(mode))
@@ -1974,8 +1985,8 @@ def set_profile_config_ping_mode(profile_id, mode):
 def get_profile_proxy_ping_mode(profile_id):
     prof = get_profile(profile_id)
     if not prof:
-        return "global"
-    return _normalize_ping_mode(prof.get("proxy_ping_mode", "global"))
+        return "iran"
+    return _normalize_ping_mode(prof.get("proxy_ping_mode", "iran"))
 
 def set_profile_proxy_ping_mode(profile_id, mode):
     update_profile(profile_id, proxy_ping_mode=_normalize_ping_mode(mode))
@@ -4193,6 +4204,37 @@ def _parse_check_host_packets(node_result):
     return ok_count, avg_ms, resolved_ip, complete
 
 
+def get_iran_ping_min_ok():
+    """Global minimum successful probes required for every Iranian Check-Host node (0..4)."""
+    try:
+        row = c.execute("SELECT v FROM cfg WHERE k='iran_ping_min_ok'").fetchone()
+        value = int(row[0]) if row and row[0] is not None else 2
+    except Exception:
+        value = 2
+    return max(0, min(4, value))
+
+
+def set_iran_ping_min_ok(value, apply_all_profiles=True):
+    """Persist the Iran Ping threshold and optionally synchronize every profile."""
+    value = max(0, min(4, int(value)))
+    c.execute("INSERT OR REPLACE INTO cfg (k, v) VALUES ('iran_ping_min_ok', ?)", (str(value),))
+    if apply_all_profiles:
+        # Keep every profile consistent with the admin-wide default.
+        c.execute("UPDATE profiles SET ping_mode='iran', config_ping_mode='iran', proxy_ping_mode='iran'")
+    conn.commit()
+    return value
+
+
+# Ensure the admin-wide default exists.
+try:
+    row = c.execute("SELECT v FROM cfg WHERE k='iran_ping_min_ok'").fetchone()
+    if not row:
+        c.execute("INSERT OR REPLACE INTO cfg (k, v) VALUES ('iran_ping_min_ok', '2')")
+        conn.commit()
+except Exception:
+    conn.rollback()
+
+
 async def _check_host_ping(host, mode):
     """Run one exact Check-Host Ping and apply the selected mode's rule."""
     target = str(host or "").strip()
@@ -4228,7 +4270,7 @@ async def _check_host_ping(host, mode):
                 if isinstance(info, list) and info
                 and str(info[0] or "").strip().lower() == "ir"
             ]
-            required = 2
+            required = get_iran_ping_min_ok()
         else:
             relevant_nodes = [str(name) for name in node_meta.keys()]
             required = 4
@@ -4281,24 +4323,52 @@ async def _check_host_ping(host, mode):
                     best_avg, best_ip = avg_ms, resolved_ip
 
                 # STRICT acceptance:
-                # Iran: at least one Iranian location is 2/4, 3/4, or 4/4.
-                # Global: at least one location is exactly 4/4.
-                if complete and ok_count >= required:
-                    if resolved_ip:
-                        _PING_TARGET_IP_CACHE[target.lower()] = (time.monotonic(), resolved_ip)
-                    log.info(
-                        "✅ Check-Host %s PASS %d/4 for %s (%s) -> avg %sms",
-                        mode.upper(), ok_count, target, node_name, avg_ms
-                    )
-                    return avg_ms, True, ok_count
+                # Iran: EVERY Iranian Check-Host location shown in the response
+                # must finish all 4 probes and meet the configured minimum successful probes
+                # (default 2/4). One missing/failed Iranian location rejects the host.
+                # Global: retain the existing rule of at least one location at 4/4.
 
-            # If every relevant node has a finished four-packet result and no
-            # node satisfied the rule, this check is definitively failed.
-            if all_relevant_concrete and len(concrete_nodes) == len(relevant_nodes):
-                if mode == "iran":
-                    log.info("❌ Check-Host IRAN FAIL for %s: best result %d/4", target, best_ok)
-                else:
-                    log.info("❌ Check-Host GLOBAL FAIL for %s: best result %d/4", target, best_ok)
+            # Iran is intentionally ALL-or-NOTHING: we do not accept a host just
+            # because one Iranian location passed. Every IR node returned by
+            # Check-Host must be present, complete (4 packets), and >= the configured threshold.
+            if mode == "iran" and all_relevant_concrete and len(concrete_nodes) == len(relevant_nodes):
+                iran_results = []
+                iran_ok = True
+                for node_name in relevant_nodes:
+                    raw = result.get(node_name)
+                    ok_count, avg_ms, resolved_ip, complete = _parse_check_host_packets(raw)
+                    iran_results.append((node_name, ok_count, avg_ms, complete))
+                    if not complete or ok_count < required:
+                        iran_ok = False
+
+                if iran_ok and iran_results:
+                    avg_values = [x[2] for x in iran_results if x[2] > 0]
+                    final_avg = int(round(sum(avg_values) / len(avg_values))) if avg_values else 0
+                    min_ok = min(x[1] for x in iran_results)
+                    # Cache an IP only when the complete Iran-wide check passed.
+                    for node_name, ok_count, avg_ms, complete in iran_results:
+                        raw = result.get(node_name)
+                        _oc, _avg, resolved_ip, _complete = _parse_check_host_packets(raw)
+                        if resolved_ip:
+                            _PING_TARGET_IP_CACHE[target.lower()] = (time.monotonic(), resolved_ip)
+                            break
+                    log.info(
+                        "✅ Check-Host IRAN ALL PASS for %s: %d Iranian locations, minimum %d/4, avg %sms",
+                        target, len(iran_results), min_ok, final_avg
+                    )
+                    return final_avg, True, min_ok
+
+                failed = [f"{n}={ok}/4" for n, ok, _avg, complete in iran_results if (not complete or ok < required)]
+                log.info(
+                    "❌ Check-Host IRAN FAIL for %s: every IR location must be >=2/4; failed=%s",
+                    target, ", ".join(failed) or "unknown"
+                )
+                return 0, False, 0
+
+            # Global: if every relevant node is concrete and no node satisfied
+            # the existing 4/4 rule, this check is definitively failed.
+            if mode != "iran" and all_relevant_concrete and len(concrete_nodes) == len(relevant_nodes):
+                log.info("❌ Check-Host GLOBAL FAIL for %s: best result %d/4", target, best_ok)
                 return 0, False, 0
 
             await asyncio.sleep(0.75)
@@ -6541,7 +6611,8 @@ T = {
                        "🧩 عنوان کانفیگ: {config_header_status} | ⚡ کم‌مصرف: {low_cost_status}\n",
         "general_settings": "⚙️ **تنظیمات عمومی**\n\n"
                             "زبان فعلی: {lang}\n"
-                            "تعداد ادمین‌ها: {admins_count}",
+                            "تعداد ادمین‌ها: {admins_count}\n"
+                            "🎯 حداقل Ping ایران: {iran_ping_min_ok}/4",
         "btn_back": "🔙 برگشت",
         "btn_add_source": "➕ منبع",
         "btn_add_dest": "➕ مقصد جدید",
@@ -6558,7 +6629,7 @@ T = {
         "btn_test": "🧪 تست",
         "btn_clear": "🗑 پاک DB",
         "btn_reset": "🔢 ریست شماره",
-        "btn_ping_mode": "🌍 ایران‌فقط",
+        "btn_ping_mode": "🇮🇷 پینگ ایران",
         "btn_runnow": "▶️ اجرا کن",
         "btn_instant": "⚡ اپدیت لحظه‌ای",
         "btn_manual_send": "📤 ارسال دستی",
@@ -6854,109 +6925,76 @@ def channel_delete_confirm_kb(profile_id, count):
     ])
 
 
+def profile_config_settings_kb(profile_id):
+    prof = get_profile(profile_id) or {}
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"📡 انتشار کانفیگ: {'✅' if prof.get('post_configs',1) else '❌'}", callback_data=f"tglcfg_{profile_id}", style="primary"),
+         InlineKeyboardButton(f"⏰ زمان کانفیگ: {get_profile_interval_config(profile_id)} دقیقه", callback_data=f"set_cfg_interval_{profile_id}", style="primary")],
+        [InlineKeyboardButton(f"📊 حداکثر کانفیگ: {get_profile_max_post_config(profile_id)}", callback_data=f"set_cfg_max_{profile_id}", style="primary")],
+        [InlineKeyboardButton(f"🧩 Ping کانفیگ: {'🇮🇷 ایران' if get_profile_config_ping_mode(profile_id)=='iran' else '🌍 جهانی'}", callback_data=f"toggle_ping_config_{profile_id}", style="primary"),
+         InlineKeyboardButton(f"📡 تست Ping: {'✅' if get_profile_ping_enabled(profile_id) else '❌'}", callback_data=f"tgl_ping_test_{profile_id}", style="primary")],
+        [InlineKeyboardButton(f"👁 نمایش Ping: {'✅' if prof.get('show_ping',1) else '❌'}", callback_data=f"tgl_show_ping_{profile_id}", style="primary"),
+         InlineKeyboardButton(f"🧩 حالت انتشار: {'Quote جمع‌شونده' if get_profile_config_post_mode(profile_id) else 'عادی'}", callback_data=f"tgl_cfg_post_mode_{profile_id}", style="primary")],
+        [InlineKeyboardButton(f"🧩 عنوان کانفیگ: {'✅' if prof.get('config_header_enabled',1) else '❌'}", callback_data=f"tgl_cfg_header_{profile_id}", style="primary")],
+        [InlineKeyboardButton(f"🏷 قالب عنوان: {get_profile_config_header_template(profile_id)}", callback_data=f"cfg_header_tpl_{profile_id}", style="primary")],
+        [InlineKeyboardButton("📝 بنر کانفیگ", callback_data=f"ab_config_{profile_id}", style="primary"),
+         InlineKeyboardButton("📅 تاریخ: " + ("✅" if prof.get('show_date_config',1) else "❌"), callback_data=f"tgl_date_cfg_{profile_id}", style="primary")],
+        [InlineKeyboardButton("↩️ بازگشت به تنظیمات پروفایل", callback_data=f"prof_{profile_id}", style="primary")],
+    ])
+
+
+def profile_proxy_settings_kb(profile_id):
+    prof = get_profile(profile_id) or {}
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🌐 انتشار پروکسی: {'✅' if prof.get('post_proxies',1) else '❌'}", callback_data=f"tglproxy_{profile_id}", style="primary"),
+         InlineKeyboardButton(f"⏰ زمان پروکسی: {get_profile_interval_proxy(profile_id)} دقیقه", callback_data=f"set_prx_interval_{profile_id}", style="primary")],
+        [InlineKeyboardButton(f"📊 حداکثر پروکسی: {get_profile_max_post_proxy(profile_id)}", callback_data=f"set_prx_max_{profile_id}", style="primary")],
+        [InlineKeyboardButton(f"🌐 Ping پروکسی: {'🇮🇷 ایران' if get_profile_proxy_ping_mode(profile_id)=='iran' else '🌍 جهانی'}", callback_data=f"toggle_ping_proxy_{profile_id}", style="primary"),
+         InlineKeyboardButton(f"📡 تست Ping: {'✅' if get_profile_ping_enabled(profile_id) else '❌'}", callback_data=f"tgl_ping_test_{profile_id}", style="primary")],
+        [InlineKeyboardButton(f"🧩 حالت انتشار: {'شیشه‌ای' if get_profile_proxy_post_mode(profile_id) else 'عادی'}", callback_data=f"tgl_prx_mode_{profile_id}", style="primary")],
+        [InlineKeyboardButton(f"👁 نمایش Ping: {'✅' if prof.get('show_ping',1) else '❌'}", callback_data=f"tgl_show_ping_{profile_id}", style="primary"),
+         InlineKeyboardButton("📅 تاریخ: " + ("✅" if prof.get('show_date_proxy',1) else "❌"), callback_data=f"tgl_date_prx_{profile_id}", style="primary")],
+        [InlineKeyboardButton("📝 بنر پروکسی", callback_data=f"ab_proxy_{profile_id}", style="primary")],
+        [InlineKeyboardButton("↩️ بازگشت به تنظیمات پروفایل", callback_data=f"prof_{profile_id}", style="primary")],
+    ])
+
+
 def profile_admin_kb(profile_id):
     prof = get_profile(profile_id)
     if not prof:
         return None
-    ping_mode = prof["ping_mode"]
-    ping_label = "🌍 ایران‌فقط" if ping_mode == "iran" else "🌍 جهانی"
-    ping_testing = get_profile_ping_enabled(profile_id)
-    ping_testing_label = "✅" if ping_testing else "❌"
-    profile_enabled = get_profile_enabled(profile_id)
-    profile_status = "✅" if profile_enabled else "❌"
-
-    post_cfg = prof["post_configs"] == 1
-    post_prx = prof["post_proxies"] == 1
-    show_num = prof["show_numbers"] == 1
-    show_date_cfg = prof["show_date_config"] == 1
-    show_date_prx = prof["show_date_proxy"] == 1
-    cfg_status = "✅" if post_cfg else "❌"
-    prx_status = "✅" if post_prx else "❌"
-    num_status = "✅" if show_num else "❌"
-    date_cfg_status = "✅" if show_date_cfg else "❌"
-    date_prx_status = "✅" if show_date_prx else "❌"
-
-    country_display = prof.get("country_display", 2)
-    country_display_modes = {0: "خاموش", 1: "انگلیسی", 2: "انگلیسی+فارسی"}
-    country_label = country_display_modes.get(country_display, "انگلیسی+فارسی")
-
-    sponsors = get_sponsors(profile_id, include_disabled=True)
-    sponsor_count = len(sponsors)
-    sponsor_status = f"{sponsor_count} اسپانسر" if sponsor_count > 0 else "خالی"
-
-    expiry, remaining = get_profile_timer(profile_id)
-    if expiry:
-        timer_status = msg("timer_status_active", remaining=remaining)
-    else:
-        timer_status = msg("timer_status_inactive")
-
-    cfg_btn = msg("btn_toggle_configs", status=cfg_status)
-    prx_btn = msg("btn_toggle_proxies", status=prx_status)
-    num_btn = msg("btn_toggle_numbers", status=num_status)
-
+    profile_status = "✅" if get_profile_enabled(profile_id) else "❌"
+    batch = get_profile_batch_posting(profile_id)
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(msg("btn_manage_sources"), callback_data=f"src_list_{profile_id}", style="primary"),
-         InlineKeyboardButton(msg("btn_dest_list"), callback_data=f"dl_{profile_id}", style="primary")],
-        [InlineKeyboardButton(f"📢 اسپانسر: {sponsor_status}", callback_data=f"sponsor_list_{profile_id}", style="primary"),
-         InlineKeyboardButton(msg("btn_set_name"), callback_data=f"ac_{profile_id}", style="primary")],
+        [InlineKeyboardButton("📡 مدیریت منابع", callback_data=f"src_list_{profile_id}", style="primary"),
+         InlineKeyboardButton("🎯 مقصد", callback_data=f"dl_{profile_id}", style="primary")],
+        [InlineKeyboardButton("🧩 تنظیمات کانفیگ", callback_data=f"cfg_settings_{profile_id}", style="primary"),
+         InlineKeyboardButton("🌐 تنظیمات پروکسی", callback_data=f"prx_settings_{profile_id}", style="primary")],
+        [InlineKeyboardButton(f"📦 تست و ارسال تجمیعی: {'✅ فعال' if batch else '❌ خاموش'}", callback_data=f"tgl_batch_post_{profile_id}", style="success" if batch else "danger")],
+        [InlineKeyboardButton(f"⚡ کم‌مصرف: {'✅' if prof.get('low_cost_mode',1) else '❌'}", callback_data=f"tgl_low_cost_{profile_id}", style="primary"),
+         InlineKeyboardButton(f"🔘 پروفایل: {profile_status}", callback_data=f"tgl_profile_{profile_id}", style="primary")],
         [InlineKeyboardButton("⚙️ مدیریت پروتکل‌ها", callback_data=f"proto_menu_{profile_id}", style="primary")],
-        [InlineKeyboardButton(f"🧩 عنوان کانفیگ: {'✅ فعال' if prof.get('config_header_enabled', 1) else '❌ حذف'}", callback_data=f"tgl_cfg_header_{profile_id}", style="success" if prof.get('config_header_enabled', 1) else "danger"),
-         InlineKeyboardButton(f"⚡ کم‌مصرف: {'✅ فعال' if prof.get('low_cost_mode', 1) else '❌ خاموش'}", callback_data=f"tgl_low_cost_{profile_id}", style="success" if prof.get('low_cost_mode', 1) else "danger")],
-        [InlineKeyboardButton(f"🏷 قالب عنوان: {get_profile_config_header_template(profile_id)}", callback_data=f"cfg_header_tpl_{profile_id}", style="primary")],
-        [InlineKeyboardButton(msg("btn_set_banner_config"), callback_data=f"ab_config_{profile_id}", style="primary"),
-         InlineKeyboardButton(msg("btn_set_banner_proxy"), callback_data=f"ab_proxy_{profile_id}", style="primary")],
-        [InlineKeyboardButton("⏰ بازه کانفیگ", callback_data=f"set_cfg_interval_{profile_id}", style="primary"),
-         InlineKeyboardButton("⏰ بازه پروکسی", callback_data=f"set_prx_interval_{profile_id}", style="primary")],
-        [InlineKeyboardButton("📊 تعداد کانفیگ", callback_data=f"set_cfg_max_{profile_id}", style="primary"),
-         InlineKeyboardButton("📊 تعداد پروکسی", callback_data=f"set_prx_max_{profile_id}", style="primary")],
-        [InlineKeyboardButton(
-            f"⚙️ حالت نمایش کانفیگ: {'نام کانال' if get_header_modes(profile_id)[0] == 'channel' else 'پروتکل'}",
-            callback_data=f"hm_config_menu_{profile_id}", style="primary"
-        ),
-         InlineKeyboardButton(
-            f"⚙️ حالت نمایش پروکسی: {'نام کانال' if get_header_modes(profile_id)[1] == 'channel' else 'پروتکل'}",
-            callback_data=f"hm_proxy_menu_{profile_id}", style="primary"
-        )],
-        [InlineKeyboardButton(f"🌐 حالت انتشار پروکسی: {'شیشه‌ای' if get_profile_proxy_post_mode(profile_id) == 1 else 'عادی'}", callback_data=f"tgl_prx_mode_{profile_id}", style="primary"),
-         InlineKeyboardButton(f"📡 تست Ping: {'✅' if ping_testing else '❌'}", callback_data=f"tgl_ping_test_{profile_id}", style="primary")],
-        [InlineKeyboardButton(f"📦 تست و ارسال تجمیعی: {'✅ فعال' if get_profile_batch_posting(profile_id) else '❌ خاموش'}", callback_data=f"tgl_batch_post_{profile_id}", style="success" if get_profile_batch_posting(profile_id) else "danger")],
-        [InlineKeyboardButton(
-            f"🧩 حالت انتشار کانفیگ: {'عادی (COPY CODE)' if get_profile_config_post_mode(profile_id) == 0 else 'Quote جمع‌شونده'}  🔄",
-            callback_data=f"tgl_cfg_post_mode_{profile_id}", style="primary"
-        )],
-        [InlineKeyboardButton(f"👁 نمایش Ping: {'✅' if prof.get('show_ping', 1) else '❌'}", callback_data=f"tgl_show_ping_{profile_id}", style="primary")],
-        [InlineKeyboardButton(f"🧩 Ping کانفیگ: {'🇮🇷 ایران' if get_profile_config_ping_mode(profile_id) == 'iran' else '🌍 جهانی'}", callback_data=f"toggle_ping_config_{profile_id}", style="primary"),
-         InlineKeyboardButton(f"🌐 Ping پروکسی: {'🇮🇷 ایران' if get_profile_proxy_ping_mode(profile_id) == 'iran' else '🌍 جهانی'}", callback_data=f"toggle_ping_proxy_{profile_id}", style="primary")],
-        [InlineKeyboardButton(msg("btn_toggle_profile", status=profile_status), callback_data=f"tgl_profile_{profile_id}", style="danger")],
-        [InlineKeyboardButton(cfg_btn, callback_data=f"tglcfg_{profile_id}", style="primary"),
-         InlineKeyboardButton(prx_btn, callback_data=f"tglproxy_{profile_id}", style="primary")],
-        [InlineKeyboardButton(num_btn, callback_data=f"togglenum_{profile_id}", style="primary")],
-        [InlineKeyboardButton(f"📅 تاریخ کانفیگ: {date_cfg_status}", callback_data=f"tgl_date_cfg_{profile_id}", style="primary"),
-         InlineKeyboardButton(f"📅 تاریخ پروکسی: {date_prx_status}", callback_data=f"tgl_date_prx_{profile_id}", style="primary")],
-        [InlineKeyboardButton(msg("btn_set_custom_query"), callback_data=f"setquery_{profile_id}", style="primary"),
-         InlineKeyboardButton(msg("btn_stats"), callback_data=f"ast_{profile_id}", style="primary")],
-        [InlineKeyboardButton(msg("btn_set_backup_interval"), callback_data=f"setbackupinterval_{profile_id}", style="primary"),
-         InlineKeyboardButton(msg("btn_test"), callback_data=f"sendtest_{profile_id}", style="primary")],
-        [InlineKeyboardButton(msg("btn_runnow"), callback_data=f"runnow_{profile_id}", style="success"),
-         InlineKeyboardButton(msg("btn_instant"), callback_data=f"instant_{profile_id}", style="primary")],
-        [InlineKeyboardButton(msg("btn_manual_send"), callback_data=f"manual_{profile_id}", style="primary"),
+        [InlineKeyboardButton("📢 اسپانسر", callback_data=f"sponsor_list_{profile_id}", style="primary"),
+         InlineKeyboardButton("🎨 نام پروفایل", callback_data=f"ac_{profile_id}", style="primary")],
+        [InlineKeyboardButton("🔗 لینک کانال", callback_data=f"set_channel_link_{profile_id}", style="primary"),
+         InlineKeyboardButton("🏷 قالب نام", callback_data=f"set_naming_{profile_id}", style="primary")],
+        [InlineKeyboardButton("🔢 شماره‌گذاری: " + ("✅" if prof.get('show_numbers',1) else "❌"), callback_data=f"togglenum_{profile_id}", style="primary"),
+         InlineKeyboardButton("🌍 کشور: " + str(prof.get('country_display',2)), callback_data=f"tgl_country_{profile_id}", style="primary")],
+        [InlineKeyboardButton("🔎 کوئری سفارشی", callback_data=f"setquery_{profile_id}", style="primary"),
+         InlineKeyboardButton("📊 آمار", callback_data=f"ast_{profile_id}", style="primary")],
+        [InlineKeyboardButton("⏱️ تایمر", callback_data=f"timer_menu_{profile_id}", style="primary"),
+         InlineKeyboardButton("📜 لاگ", callback_data=f"log_menu_{profile_id}", style="primary")],
+        [InlineKeyboardButton("📤 ارسال دستی", callback_data=f"manual_{profile_id}", style="primary"),
          InlineKeyboardButton("📋 صف ارسال دستی", callback_data=f"mq_list_{profile_id}", style="primary")],
-        [InlineKeyboardButton("🗑 حذف پست‌های کانال", callback_data=f"delposts_menu_{profile_id}", style="danger")],
-        [InlineKeyboardButton(msg("btn_blacklist"), callback_data=f"bl_list_{profile_id}", style="danger")],
-        [InlineKeyboardButton(msg("btn_set_schedule_cron"), callback_data=f"setcron_{profile_id}", style="primary"),
-         InlineKeyboardButton(msg("btn_backup"), callback_data=f"backup_{profile_id}", style="success")],
-        [InlineKeyboardButton(msg("btn_backup_export"), callback_data=f"backup_export_menu_{profile_id}", style="primary"),
-         InlineKeyboardButton(msg("btn_timer"), callback_data=f"timer_menu_{profile_id}", style="primary")],
-        [InlineKeyboardButton(f"⏱️ {timer_status}", callback_data="dummy", style="primary"),
-         InlineKeyboardButton(msg("btn_log_menu"), callback_data=f"log_menu_{profile_id}", style="primary")],
-        [InlineKeyboardButton("🧪 دیباگ عمیق", callback_data="run_deep_debug", style="primary")],
-        [InlineKeyboardButton(msg("btn_set_naming_template"), callback_data=f"set_naming_{profile_id}", style="primary"),
-         InlineKeyboardButton(msg("btn_set_channel_link"), callback_data=f"set_channel_link_{profile_id}", style="primary")],
-        [InlineKeyboardButton(f"🌐 کشور: {country_label}", callback_data=f"tgl_country_{profile_id}", style="primary")],
-        [InlineKeyboardButton(msg("btn_reset"), callback_data=f"rn_{profile_id}", style="primary"),
-         InlineKeyboardButton(msg("btn_clear"), callback_data=f"cd1_{profile_id}", style="danger")],
-        [InlineKeyboardButton("❌ Delete Profile", callback_data=f"delprof_{profile_id}", style="danger")],
-        [InlineKeyboardButton(msg("btn_back"), callback_data="profiles_list", style="primary")],
+        [InlineKeyboardButton("🗑 حذف پست‌های کانال", callback_data=f"delposts_menu_{profile_id}", style="danger"),
+         InlineKeyboardButton("🚫 بلک‌لیست", callback_data=f"bl_list_{profile_id}", style="danger")],
+        [InlineKeyboardButton("💾 بک‌آپ", callback_data=f"backup_{profile_id}", style="success"),
+         InlineKeyboardButton("🧪 تست", callback_data=f"sendtest_{profile_id}", style="primary")],
+        [InlineKeyboardButton("▶️ اجرا کن", callback_data=f"runnow_{profile_id}", style="success"),
+         InlineKeyboardButton("⚡ آپدیت لحظه‌ای", callback_data=f"instant_{profile_id}", style="primary")],
+        [InlineKeyboardButton("🗑 پاک DB", callback_data=f"cd1_{profile_id}", style="danger"),
+         InlineKeyboardButton("❌ حذف پروفایل", callback_data=f"delprof_{profile_id}", style="danger")],
+        [InlineKeyboardButton("↩️ بازگشت", callback_data="profiles_list", style="primary")],
     ])
 
 def ping_regions_kb(profile_id):
@@ -7339,6 +7377,7 @@ def general_settings_kb():
         [InlineKeyboardButton(f"🌐 زبان: {lang_text}", callback_data="toggle_lang", style="primary")],
         [InlineKeyboardButton(msg("btn_admins"), callback_data="manage_admins", style="primary")],
         [InlineKeyboardButton(msg("btn_backup"), callback_data="backup_db", style="primary")],
+        [InlineKeyboardButton(f"🎯 حداقل Ping ایران: {get_iran_ping_min_ok()}/4", callback_data="set_iran_ping_threshold", style="primary")],
         [InlineKeyboardButton(msg("btn_replace_database"), callback_data="replace_db", style="danger")],
         [InlineKeyboardButton("🧪 دیباگ عمیق با شماره لاین", callback_data="run_deep_debug", style="primary")],
         [InlineKeyboardButton("📜 فعالیت ۵۰ عمل آخر ادمین", callback_data="activity_log", style="primary")],
@@ -7675,11 +7714,32 @@ async def _on_callback_impl(u, ctx):
             await q.answer("📜 فایل فعالیت ارسال شد.")
             return
 
+        if d.startswith("cfg_settings_"):
+            try: profile_id=int(d.rsplit("_",1)[1])
+            except Exception: await q.answer("⚠️ شناسه نامعتبر", show_alert=True); return
+            await q.edit_message_text(f"🧩 <b>تنظیمات کانفیگ پروفایل {profile_id}</b>\n\nتعداد، زمان، Ping، تست و نحوه انتشار کانفیگ را جداگانه تنظیم کن.", parse_mode="HTML", reply_markup=profile_config_settings_kb(profile_id))
+            return
+
+        if d.startswith("prx_settings_"):
+            try: profile_id=int(d.rsplit("_",1)[1])
+            except Exception: await q.answer("⚠️ شناسه نامعتبر", show_alert=True); return
+            await q.edit_message_text(f"🌐 <b>تنظیمات پروکسی پروفایل {profile_id}</b>\n\nتعداد، زمان، Ping و نحوه انتشار پروکسی را جداگانه تنظیم کن.", parse_mode="HTML", reply_markup=profile_proxy_settings_kb(profile_id))
+            return
+
+        if d == "set_iran_ping_threshold":
+            current=get_iran_ping_min_ok()
+            ctx.user_data["action"]="set_iran_ping_threshold"
+            await q.edit_message_text(
+                f"🎯 <b>حداقل Ping ایران</b>\n\nمقدار فعلی: <b>{current}/4</b>\n\nیک عدد صحیح از <b>۰ تا ۴</b> بفرست.\nاین مقدار برای <b>تمامی پروفایل‌ها و هر دو نوع کانفیگ/پروکسی</b> اعمال می‌شود.\nمثلاً ۲ یعنی هر محل ایران باید حداقل ۲ پاسخ موفق از ۴ پاسخ داشته باشد؛ اگر حتی یک محل ایران ناقص/غایب باشد، رد می‌شود.",
+                parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ برگشت", callback_data="general_settings", style="primary")]])
+            )
+            return
+
         if d == "general_settings":
             lang = get_lang()
             lang_text = "فارسی" if lang == "fa" else "English"
             admins = list_admins()
-            txt = msg("general_settings", lang=lang_text, admins_count=len(admins)+1)
+            txt = msg("general_settings", lang=lang_text, admins_count=len(admins)+1, iran_ping_min_ok=get_iran_ping_min_ok())
             await q.edit_message_text(txt, parse_mode="HTML", reply_markup=general_settings_kb())
             return
 
@@ -7708,7 +7768,7 @@ async def _on_callback_impl(u, ctx):
             await q.answer(msg("lang_changed", lang=new_lang))
             lang_text = "فارسی" if new_lang == "fa" else "English"
             admins = list_admins()
-            txt = msg("general_settings", lang=lang_text, admins_count=len(admins)+1)
+            txt = msg("general_settings", lang=lang_text, admins_count=len(admins)+1, iran_ping_min_ok=get_iran_ping_min_ok())
             await q.edit_message_text(txt, parse_mode="HTML", reply_markup=general_settings_kb())
             return
 
@@ -10275,6 +10335,19 @@ async def _on_text_impl(u, ctx):
             "حذف از <b>جدیدترین پست‌های کانال</b> شروع می‌شود.\n\nآیا مطمئنی؟",
             parse_mode="HTML", reply_markup=channel_delete_confirm_kb(profile_id, count)
         )
+        return
+
+    if a == "set_iran_ping_threshold":
+        try:
+            value = int(t)
+            if not 0 <= value <= 4:
+                raise ValueError
+            set_iran_ping_min_ok(value, apply_all_profiles=True)
+            ctx.user_data.pop("action", None)
+            await u.message.reply_text(f"✅ حداقل Ping ایران برای همه پروفایل‌ها روی {value}/4 تنظیم شد.")
+            await u.message.reply_text(msg("general_settings", lang=("فارسی" if get_lang()=="fa" else "English"), admins_count=len(list_admins())+1, iran_ping_min_ok=get_iran_ping_min_ok()), parse_mode="HTML", reply_markup=general_settings_kb())
+        except ValueError:
+            await u.message.reply_text("❌ فقط عدد صحیح بین ۰ تا ۴ وارد کن.")
         return
 
     if a.startswith("setbackupinterval_"):
