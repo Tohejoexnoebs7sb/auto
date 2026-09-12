@@ -4947,37 +4947,62 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
         buttons.append([sponsor_button])
     reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
 
-    html_messages = [full_text]
-    message_entry_batches = [list(posted_entries)]
-    if config_mode == 1 and len(full_text) > 4096:
-        marker = "__CONFIGS__"
-        try:
-            probe = banner_template.format(configs=marker)
-        except KeyError:
-            probe = f"✦ V2Ray Config List\n\n{marker}\n\n◈ 📢 Channel\n↳ @Auto_Server\n◈ #کانفیگ #ویتوری"
-        before, sep, after = probe.partition(marker)
-        if not sep:
-            before, after = "", ""
-        html_messages = []
-        message_entry_batches = []
-        batch = []
-        entry_batch = []
-        for line, entry in zip(config_blocks, posted_entries):
-            candidate = batch + [line]
-            quote_block = "<blockquote expandable><code>" + "\n".join(candidate) + "</code></blockquote>"
-            if batch and len(before + quote_block + after) > 4096:
-                quote_block = "<blockquote expandable><code>" + "\n".join(batch) + "</code></blockquote>"
-                html_messages.append(before + quote_block + after)
-                message_entry_batches.append(list(entry_batch))
-                batch = [line]
-                entry_batch = [entry]
-            else:
-                batch = candidate
-                entry_batch.append(entry)
-        if batch:
-            quote_block = "<blockquote expandable><code>" + "\n".join(batch) + "</code></blockquote>"
-            html_messages.append(before + quote_block + after)
+    # Telegram has a hard 4096-character limit for text messages. Build the
+    # largest possible messages for BOTH config modes instead of relying on a
+    # failed send + truncated fallback. A small safety margin avoids edge cases
+    # caused by HTML entity expansion. The per-profile max_post remains the
+    # upper bound on configs in this call (set it to 30 to target 30/config post).
+    TELEGRAM_TEXT_LIMIT = 4096
+    TELEGRAM_SAFE_LIMIT = 4050
+
+    marker = "__CONFIGS__"
+    try:
+        probe = banner_template.format(configs=marker)
+    except KeyError:
+        probe = f"✦ V2Ray Config List\n\n{marker}\n\n◈ 📢 Channel\n↳ @Auto_Server\n◈ #کانفیگ #ویتوری"
+    before, sep, after = probe.partition(marker)
+    if not sep:
+        before, after = "", ""
+
+    html_messages = []
+    message_entry_batches = []
+    batch = []
+    entry_batch = []
+
+    def _render_batch(lines):
+        if config_mode == 1:
+            payload = "\n".join(lines)
+            return before + "<blockquote expandable><code>" + payload + "</code></blockquote>" + after
+        # Normal mode: keep the existing visual formatting, but pack as many
+        # complete config blocks as Telegram permits.
+        payload = "\n\n".join(lines)
+        return before + payload + after
+
+    for line, entry in zip(config_blocks, posted_entries):
+        candidate = batch + [line]
+        candidate_text = _render_batch(candidate)
+        if batch and len(candidate_text) > TELEGRAM_SAFE_LIMIT:
+            html_messages.append(_render_batch(batch))
             message_entry_batches.append(list(entry_batch))
+            batch = [line]
+            entry_batch = [entry]
+        else:
+            batch = candidate
+            entry_batch.append(entry)
+
+    if batch:
+        html_messages.append(_render_batch(batch))
+        message_entry_batches.append(list(entry_batch))
+
+    # Never silently truncate a config message. If a single rendered block is
+    # itself too large, Telegram cannot carry it as one text message; log it and
+    # leave it to the normal retry/state path rather than corrupting the URL.
+    for _idx, _msg in enumerate(html_messages, 1):
+        if len(_msg) > TELEGRAM_TEXT_LIMIT:
+            log.warning(
+                f"⚠️ [CONFIG][profile={profile_id}] message {_idx} exceeds Telegram limit "
+                f"({len(_msg)} chars); this usually means one config block is too large."
+            )
 
     ok = True
     sent_count = 0
@@ -5223,15 +5248,15 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
     low_cost_mode=get_profile_low_cost_mode(profile_id)
     batch_posting = bool(get_profile_batch_posting(profile_id))
     if not batch_posting:
-        # OFF means OFF: no persistent batch queue is allowed to participate in
-        # automatic posting. Clear only transient batch state; profiles/settings
-        # and permanent dedup ledgers are never touched.
+        # Normal mode now keeps a small persistent config backlog. This is NOT
+        # strict-batch mode: items are posted as soon as they are ready. The
+        # backlog exists only so the source cursor can advance immediately and
+        # the next cycle never has to rescan already-seen Telegram messages.
         try:
-            _pending_batch_clear(profile_id, "config")
             _pending_batch_clear(profile_id, "proxy")
             conn.commit()
         except Exception:
-            log.exception(f"[BATCH][profile={profile_id}] failed clearing disabled batch state")
+            log.exception(f"[BATCH][profile={profile_id}] failed clearing disabled proxy batch state")
     log.info(f"📦 [profile={profile_id}] smart_batch={int(batch_posting)} (default OFF)")
     # Responsive incremental scan. A cycle must never walk hundreds of historical
     # Telegram pages. Four pages per source are enough for normal interval runs;
@@ -5361,37 +5386,68 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
                 conn.commit()
                 log.info(f"📦 [AUTO-CONFIG] strict queue tested={len(chunk)}/{len(fresh)} pending={len(working)} target={desired}")
         else:
-            # Normal mode: when ping testing is OFF, do not spend time in the
-            # health-test pipeline. Any structurally valid, new config is
-            # publishable and at least one must be selected when available.
-            if not ping_testing:
-                working = [(u, 0, 0) for u, _src in new_configs[:desired]]
+            # Incremental normal mode: persist every newly discovered config
+            # before advancing the source cursor. Then only the pending queue is
+            # tested/posted. This is the key change that prevents rescanning old
+            # Telegram pages when a source produced more configs than one post can
+            # contain.
+            _pending_batch_remove_posted(profile_id, "config")
+            for u, src in new_configs:
+                identity_hash = _config_identity_hash(u)
+                if not is_already_posted(profile_id, u):
+                    _pending_batch_upsert(profile_id, "config", identity_hash, u, src, 0, 0)
+            conn.commit()
+
+            pending_rows = _pending_batch_rows(profile_id, "config")
+            if not pending_rows:
+                working = []
+            elif not ping_testing:
+                # No health testing: publish the oldest pending configs first.
+                working = [(url, 0, 0) for _h, url, _src, _ping, _pc, _flag, _cc in pending_rows[:desired]]
                 log.info(
                     f"📊 Ping testing OFF for profile={profile_id}; "
-                    f"publishing {len(working)} new configs without health filtering"
+                    f"publishing {len(working)} pending configs"
                 )
             else:
-                # Do not stop after only desired*2 candidates. A temporary
-                # outage in the first few sources must not make the profile
-                # look broken while hundreds of later candidates are available.
-                # Test a bounded but sufficiently large window and stop only
-                # after collecting the requested number of healthy configs.
-                test_limit = min(len(new_configs), max(24, min(120, desired * 15)))
-                to_test = new_configs[:test_limit]
-                log.info(f"📊 Testing {len(to_test)} configs... low_cost={low_cost_mode}")
-                # Check-Host is rate-limited; never launch hundreds of submissions at once.
-                chunk_size = 4 if not low_cost_mode else 3
-                for offset in range(0, len(to_test), chunk_size):
-                    chunk = to_test[offset:offset + chunk_size]
-                    rs = await asyncio.gather(*[_check(item) for item in chunk], return_exceptions=True)
-                    for r in rs:
-                        if not isinstance(r, Exception) and r[1]:
-                            working.append((r[0], r[2], r[3]))
+                # Test pending items first. The bounded window is taken from the
+                # queue, not from Telegram, so old source messages are never
+                # revisited just because the previous post was full.
+                test_rows = pending_rows[:max(24, min(120, desired * 15))]
+                to_test = []
+                for identity_hash, url, src, ping, ping_count, flag, cc in test_rows:
+                    if ping and float(ping) > 0:
+                        working.append((url, ping, ping_count))
+                        if len(working) >= desired:
+                            break
+                    else:
+                        to_test.append((identity_hash, url, src))
+
+                if len(working) < desired and to_test:
+                    log.info(f"📊 Testing {len(to_test)} pending configs... low_cost={low_cost_mode}")
+                    chunk_size = 4 if not low_cost_mode else 3
+                    for offset in range(0, len(to_test), chunk_size):
+                        chunk = to_test[offset:offset + chunk_size]
+                        rs = await asyncio.gather(*[_check((u, src)) for _h, u, src in chunk], return_exceptions=True)
+                        for (identity_hash, url, src), r in zip(chunk, rs):
+                            if not isinstance(r, Exception) and r[1]:
+                                _pending_batch_upsert(profile_id, "config", identity_hash, r[0], src, r[2], r[3])
+                                working.append((r[0], r[2], r[3]))
+                                if len(working) >= desired:
+                                    break
+                        if len(working) >= desired:
+                            break
+                    conn.commit()
+
+                # Re-read so any healthy item inserted above is available, while
+                # preserving queue order and the configured per-post ceiling.
+                if len(working) < desired:
+                    pending_rows = _pending_batch_rows(profile_id, "config")
+                    for _h, url, _src, ping, ping_count, _flag, _cc in pending_rows:
+                        if ping and float(ping) > 0 and not any(url == x[0] for x in working):
+                            working.append((url, ping, ping_count))
                             if len(working) >= desired:
                                 break
-                    if len(working) >= desired:
-                        break
-                log.info(f"📊 Working configs: {len(working)}")
+                log.info(f"📊 Working pending configs: {len(working)}")
         if not working:
             log.warning(f"[AUTO-CONFIG] profile={profile_id} no publishable configs in current window; cursor retained")
     else:
@@ -5571,7 +5627,7 @@ async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, 
     # Never move a stream cursor past unpublished candidates. If the current
     # window contains more new items than the configured per-post limit, the
     # next cycle must revisit the same window and publish the remainder.
-    config_ok = (not enable_configs) or (not new_configs) or (total_configs >= len(new_configs))
+    config_ok = (not enable_configs) or (not new_configs) or (not batch_posting) or (total_configs >= len(new_configs))
     proxy_ok = (not enable_proxies) or (not new_proxies) or (total_proxies >= len(new_proxies))
     if stream == "combined":
         if config_ok:
