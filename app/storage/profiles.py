@@ -319,7 +319,11 @@ def set_profile_config_header_template(profile_id, template):
     template = (template or "[Protocol] [Flag] [Country]").strip()
     if not template:
         template = "[Protocol] [Flag] [Country]"
-    allowed = ("Protocol", "Flag", "Country", "COUNTRY_EN", "COUNTRY_FA", "CHANNEL_ID", "COUNT", "PING")
+    allowed = (
+        "Protocol", "Flag", "Country", "COUNTRY_EN", "COUNTRY_FA",
+        "CHANNEL_ID", "COUNT", "INDEX", "NUMBER", "HOST", "PORT",
+        "DATE", "TIME", "PING", "SOURCE",
+    )
     cleaned = template
     # Keep unknown placeholders visible to the admin instead of silently corrupting output.
     unknown = re.findall(r"[\[{]([A-Za-z_]+)[\]}]", cleaned)
@@ -562,9 +566,21 @@ def _pending_batch_clear(profile_id, kind=None):
     except sqlite3.Error:
         conn.rollback()
 
-def render_naming_template(template, *, protocol, flag, country_code, channel_link, count):
-    """Render {TOKEN} and [TOKEN] placeholders."""
+def render_naming_template(template, *, protocol, flag, country_code, channel_link, count,
+                           ping=0, url="", source=""):
+    """Render {TOKEN} and [TOKEN] placeholders for config names."""
     template = str(template or "{Flag} | ⚡️Telegram = {CHANNEL_ID}")
+
+    host = ""
+    port = ""
+    try:
+        host, port_value = extract_host(url)
+        host = str(host or "")
+        port = str(port_value or "")
+    except Exception:
+        pass
+
+    ping_text = f"{int(round(float(ping)))} ms" if ping and float(ping) > 0 else ""
     values = {
         "Protocol": protocol or "", "PROTOCOL": protocol or "",
         "Flag": flag or "", "FLAG": flag or "",
@@ -572,7 +588,16 @@ def render_naming_template(template, *, protocol, flag, country_code, channel_li
         "COUNTRY_FA": COUNTRY_NAMES_FA.get(country_code, ""),
         "Country": COUNTRY_NAMES_EN.get(country_code, ""),
         "COUNTRY": COUNTRY_NAMES_EN.get(country_code, ""),
-        "CHANNEL_ID": channel_link or "", "COUNT": str(count), "PING": "",
+        "CHANNEL_ID": channel_link or "",
+        "COUNT": str(count),
+        "INDEX": str(count),
+        "NUMBER": str(count),
+        "HOST": host,
+        "PORT": port,
+        "DATE": get_tehran_date(),
+        "TIME": get_tehran_time(),
+        "PING": ping_text,
+        "SOURCE": source or "",
     }
     out = template
     for key,value in values.items():
