@@ -545,7 +545,10 @@ def general_settings_kb():
         [InlineKeyboardButton(msg("btn_admins"), callback_data="manage_admins", style="primary")],
         [InlineKeyboardButton(msg("btn_backup"), callback_data="backup_db", style="primary")],
         [InlineKeyboardButton(f"🎯 حداقل Ping ایران: {get_iran_ping_min_ok()}/4", callback_data="set_iran_ping_threshold", style="primary")],
-        [InlineKeyboardButton(f"⚡ حالت Ping: {'عادی' if get_ping_engine_mode()==0 else ('Core / Real Delay' if get_ping_engine_mode()==1 else 'Core + Host Check')}", callback_data="toggle_ping_engine_mode", style="primary")],
+        [InlineKeyboardButton(
+            f"⚡ حالت Ping: {'عادی / Check-Host' if get_ping_engine_mode()==0 else ('Core / Relay Delay' if get_ping_engine_mode()==1 else 'Core + Relay Delay + Check-Host')}",
+            callback_data="toggle_ping_engine_mode", style="primary"
+        )],
         [InlineKeyboardButton(msg("btn_replace_database"), callback_data="replace_db", style="danger")],
         [InlineKeyboardButton("🧪 دیباگ عمیق با شماره لاین", callback_data="run_deep_debug", style="primary")],
         [InlineKeyboardButton("📜 فعالیت ۵۰ عمل آخر ادمین", callback_data="activity_log", style="primary")],
