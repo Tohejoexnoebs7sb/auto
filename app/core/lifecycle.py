@@ -224,6 +224,15 @@ async def worker_watchdog():
             log.exception("[WATCHDOG] monitor error")
             await asyncio.sleep(60)
 
+def _get_enable_auto():
+    """Resolve AUTO flag from bootstrap after modular startup is complete."""
+    try:
+        import app.bootstrap as _bootstrap
+        return bool(getattr(_bootstrap, "ENABLE_AUTO", True))
+    except Exception:
+        return True
+
+
 async def post_init(app):
     global BOT_REF, BOT_START_TIME
     BOT_REF = app.bot
@@ -245,7 +254,7 @@ async def post_init(app):
         new_id = create_profile("", sources="")
         log.info(f"✅ Created default profile with id {new_id}.")
         profiles = get_profiles()
-    log.info(f"✅ INIT done: {len(profiles)} profiles, AUTO={ENABLE_AUTO}")
+    log.info(f"✅ INIT done: {len(profiles)} profiles, AUTO={_get_enable_auto()}")
     for _prof in profiles:
         log.info(
             f"[PROFILE-BOOT] id={_prof['id']} dest={_prof.get('dest_name','')} "
@@ -281,7 +290,7 @@ async def post_init(app):
     start_worker(app, "manual_queue", lambda: manual_queue_worker(app.bot))
     log.info("⏱️ Manual queue scheduler enabled")
 
-    if ENABLE_AUTO:
+    if _get_enable_auto():
         log.info("⏰ Decoupled AUTO pipeline starting: scanner/tester/poster")
         start_worker(app, "auto_pipeline_supervisor", lambda: _auto_pipeline_supervisor(app))
         log.info("🛡️ AUTO pipeline supervisor enabled (10s reconciliation)")
