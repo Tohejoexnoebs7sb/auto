@@ -4,6 +4,7 @@ from __future__ import annotations
 # Function bodies are preserved; shared names are injected by app.loader after
 # all feature modules are imported, so cross-module dependencies remain compatible.
 from app.core.runtime import *  # noqa: F401,F403
+from app.storage.database import get_conn
 
 # Module-local database handles. The original monolith exposed these as
 # globals; after modularization each module needs its own initialized handles.
