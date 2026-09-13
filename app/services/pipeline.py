@@ -686,6 +686,23 @@ async def _auto_scan_stream(profile_id, stream):
     results=await asyncio.gather(*[one(src) for src in sources])
     pending_hashes={r[0] for r in _pending_batch_rows(pid,stream)}
     ping_enabled=get_profile_ping_enabled(pid); inserted=0; cursor_updates=[]
+
+    async def _resolve_proxy_geo(proxy_url):
+        """Resolve proxy country metadata when a proxy enters the persistent queue."""
+        flag, country_code = "🌐", ""
+        try:
+            host, _port = extract_host(proxy_url)
+            if host:
+                cached_ping = _PING_TARGET_IP_CACHE.get(host.strip().lower())
+                ip = cached_ping[1] if cached_ping and time.monotonic() - cached_ping[0] < _PING_TARGET_IP_CACHE_TTL else None
+                if not ip:
+                    ip = await host_to_ip(host)
+                if ip:
+                    flag, country_code = await get_flag_for_ip(ip)
+        except Exception as exc:
+            log.debug("[AUTO-SCAN][proxy] geo lookup failed for %s: %s", str(proxy_url)[:90], exc)
+        return flag, country_code
+
     for src,result in zip(sources,results):
         if not result: continue
         configs,proxies,newest_id=result
@@ -696,7 +713,11 @@ async def _auto_scan_stream(profile_id, stream):
             h=_config_identity_hash(raw) if stream=="config" else _proxy_identity_hash(raw)
             if h in pending_hashes: continue
             if (is_already_posted(pid,raw) if stream=="config" else is_proxy_posted(pid,raw)): continue
-            rows.append((h,raw,src,1 if not ping_enabled else 0,0,"🌐","")); pending_hashes.add(h)
+            if stream == "proxy":
+                flag, country_code = await _resolve_proxy_geo(raw)
+            else:
+                flag, country_code = "🌐", ""
+            rows.append((h,raw,src,1 if not ping_enabled else 0,0,flag,country_code)); pending_hashes.add(h)
         if rows: inserted += _pending_batch_upsert_many(pid,stream,rows)
     if cursor_updates: set_stream_last_message_ids_batch(pid,stream,cursor_updates)
     if inserted: log.info("[AUTO-SCAN][%s][profile=%s] queued=%d",stream,pid,inserted)
@@ -770,6 +791,41 @@ async def _auto_post_pending(profile_id,stream,bot,force_instant=False):
         if not get_profile_post_proxies(pid): return 0
         desired=max(1,int(get_profile_max_post_proxy(pid) or 1))
     rows=_pending_batch_rows(pid,stream)
+    if stream == "proxy":
+        # Repair legacy pending rows created before proxy GeoIP metadata was
+        # persisted. This keeps existing queues intact while ensuring proxy
+        # posts receive their country flag/name as soon as the data is needed.
+        repaired_rows = []
+        repair_limit = max(1, desired)
+        for row_index, row in enumerate(rows):
+            if row_index >= repair_limit:
+                repaired_rows.extend(rows[repair_limit:])
+                break
+            identity_hash, url, source, ping, ping_count, flag, country_code = row
+            if not flag or flag == "🌐" or not country_code:
+                try:
+                    host, _port = extract_host(url)
+                    ip = None
+                    if host:
+                        cached_ping = _PING_TARGET_IP_CACHE.get(host.strip().lower())
+                        ip = cached_ping[1] if cached_ping and time.monotonic() - cached_ping[0] < _PING_TARGET_IP_CACHE_TTL else None
+                        if not ip:
+                            ip = await host_to_ip(host)
+                    if ip:
+                        resolved_flag, resolved_country = await get_flag_for_ip(ip)
+                        if resolved_flag:
+                            flag = resolved_flag
+                        if resolved_country:
+                            country_code = resolved_country
+                        c.execute(
+                            "UPDATE pending_batch_items SET flag=?, country_code=? WHERE profile_id=? AND kind='proxy' AND identity_hash=?",
+                            (flag or "🌐", country_code or "", pid, identity_hash)
+                        )
+                except Exception as exc:
+                    log.debug("[AUTO-POST][proxy] metadata repair failed for %s: %s", str(url)[:90], exc)
+            repaired_rows.append((identity_hash, url, source, ping, ping_count, flag, country_code))
+        conn.commit()
+        rows = repaired_rows
     if get_profile_ping_enabled(pid): rows=[r for r in rows if float(r[3] or 0)>0]
     if not rows: return 0
     if get_profile_batch_posting(pid) and len(rows)<desired: return 0
@@ -815,7 +871,10 @@ async def _auto_exact_poster_worker(profile_id,stream,bot):
                 await asyncio.sleep(AUTO_INSTANT_POST_POLL_SECONDS); continue
             seconds=float(minutes*60)
             if interval_seconds!=seconds or next_deadline is None:
-                interval_seconds=seconds; next_deadline=loop.time()
+                # A positive interval is a complete accumulation window. Do not
+                # publish immediately when the worker starts or when the setting
+                # changes; the first deadline is one full interval from now.
+                interval_seconds=seconds; next_deadline=loop.time()+seconds
             wait=next_deadline-loop.time()
             if wait>0: await asyncio.sleep(wait); continue
             scheduled=datetime.now(TEHRAN_TZ); log.info("[AUTO-POST] TICK profile=%s stream=%s scheduled=%s interval=%sm",profile_id,stream,scheduled.isoformat(),minutes)
@@ -964,9 +1023,9 @@ async def _profile_scheduler_v16(bot, profile_id, mode):
                 # interval), then every configured interval from that fixed
                 # anchor. This also keeps the cadence independent of scrape time.
                 interval_seconds = seconds
-                # First automatic run is immediate. Future runs use a fixed
-                # monotonic cadence independent of network duration.
-                next_deadline = loop.time()
+                # Positive intervals are full accumulation windows. The first
+                # scheduled publication is after the configured interval.
+                next_deadline = loop.time() + seconds
 
             wait = next_deadline - loop.time()
             if wait > 0:

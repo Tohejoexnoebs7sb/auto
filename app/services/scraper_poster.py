@@ -395,7 +395,13 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
     if not working:
         return 0
 
-    max_post = max_post_override if max_post_override is not None else get_profile_max_post_config(profile_id)
+    configured_max_post = max(1, int(get_profile_max_post_config(profile_id) or 1))
+    if max_post_override is None:
+        max_post = configured_max_post
+    else:
+        # The profile setting is an absolute safety ceiling. A caller may lower
+        # the limit for a specific operation, but can never raise it.
+        max_post = min(configured_max_post, max(1, int(max_post_override)))
     # Instant/manual execution must respect the configured max-post exactly.
 
     blacklist_words = get_blacklist(profile_id)
@@ -492,6 +498,13 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
 
     for i, (url, ping, node_count) in enumerate(items, 1):
         n = last_n + i
+        try:
+            _item_host, _item_port = extract_host(url)
+        except Exception:
+            _item_host, _item_port = None, None
+        _item_host = str(_item_host or "")
+        _item_port = str(_item_port or "")
+        _ping_text = f"{int(round(float(ping)))} ms" if ping and float(ping) > 0 else ""
 
         # MTProto Telegram proxy links are NOT V2Ray configs.
         # Keep them raw: no fragment, no custom query, no channel tag injection.
@@ -548,7 +561,15 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
                 "COUNTRY_EN": COUNTRY_NAMES_EN.get(country_code, "") if country_display in (1,2) else "",
                 "COUNTRY_FA": COUNTRY_NAMES_FA.get(country_code, "") if country_display == 2 else "",
                 "CHANNEL_ID": channel_link or dest or "",
-                "COUNT": str(n), "PING": "",
+                "COUNT": str(n),
+                "INDEX": str(i),
+                "NUMBER": str(n),
+                "HOST": _item_host,
+                "PORT": _item_port,
+                "DATE": get_tehran_date(),
+                "TIME": get_tehran_time(),
+                "PING": _ping_text,
+                "SOURCE": source_for_seen or "",
             }
             header = config_header_template
             for _key, _value in header_values.items():
@@ -561,7 +582,8 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
 
         fragment_text = render_naming_template(
             naming_template, protocol=config_title, flag=flag,
-            country_code=country_code, channel_link=channel_link, count=n
+            country_code=country_code, channel_link=channel_link, count=n,
+            ping=ping, url=url, source=source_for_seen
         )
         encoded_fragment = quote(fragment_text, safe='')
         protocol = url.split('://')[0].lower() if '://' in url else ''
@@ -737,11 +759,15 @@ async def post_proxies(bot, profile_id, proxies_with_ping, is_instant=False, max
     """Build a proxy post. Does NOT mark anything posted; caller does that only after Telegram success."""
     if not proxies_with_ping:
         return 0, None, []
-    max_proxies = max_proxies_override if max_proxies_override is not None else get_profile_max_post_proxy(profile_id)
-    try:
-        max_proxies = max(1, int(max_proxies))
-    except Exception:
-        max_proxies = 10
+    configured_max_proxies = max(1, int(get_profile_max_post_proxy(profile_id) or 1))
+    if max_proxies_override is None:
+        max_proxies = configured_max_proxies
+    else:
+        # The profile setting is an absolute ceiling for every posting path.
+        try:
+            max_proxies = min(configured_max_proxies, max(1, int(max_proxies_override)))
+        except Exception:
+            max_proxies = configured_max_proxies
     # Instant mode changes scheduling responsiveness only; it must never
     # silently reduce the profile's configured posting limit.
     mode = get_profile_proxy_post_mode(profile_id)
