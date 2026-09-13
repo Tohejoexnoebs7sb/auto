@@ -439,7 +439,7 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
     show_numbers = get_profile_show_numbers(profile_id)
     custom_query = get_profile_custom_query(profile_id)
     dest = get_profile_dest(profile_id)
-    banner_template = get_profile_banner_config(profile_id) or "✦ V2Ray Config List\n\n{configs}\n\n◈ 📢 Channel\n↳ @Auto_Server\n◈ #کانفیگ #ویتوری"
+    banner_template = get_profile_banner_config(profile_id) or "✦ V2Ray Config List\n\n{configs}\n\n◈ #کانفیگ #ویتوری"
     naming_template = get_profile_naming_template(profile_id)
     channel_link = get_profile_channel_link(profile_id)
     if not channel_link:
@@ -609,7 +609,7 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
     try:
         full_text = banner_template.format(configs=configs_text)
     except KeyError:
-        full_text = f"✦ V2Ray Config List\n\n{configs_text}\n\n◈ 📢 Channel\n↳ @Auto_Server\n◈ #کانفیگ #ویتوری"
+        full_text = f"✦ V2Ray Config List\n\n{configs_text}\n\n◈ #کانفیگ #ویتوری"
 
     # Optional proxy glass-button rows are inserted ABOVE the sponsor.
     # Each row is already a list of InlineKeyboardButton objects.
@@ -636,7 +636,7 @@ async def post_configs(bot, profile_id, working, source_for_seen="", is_instant=
     try:
         probe = banner_template.format(configs=marker)
     except KeyError:
-        probe = f"✦ V2Ray Config List\n\n{marker}\n\n◈ 📢 Channel\n↳ @Auto_Server\n◈ #کانفیگ #ویتوری"
+        probe = f"✦ V2Ray Config List\n\n{marker}\n\n◈ #کانفیگ #ویتوری"
     before, sep, after = probe.partition(marker)
     if not sep:
         before, after = "", ""
@@ -775,7 +775,7 @@ async def post_proxies(bot, profile_id, proxies_with_ping, is_instant=False, max
             # Per-profile fallback: never use a hard-coded @VaslZone for another profile.
             prof = get_profile(profile_id) or {}
             fallback = str(prof.get("dest_name") or "").strip()
-            channel_label = fallback if fallback.startswith("@") else (f"@{fallback}" if fallback else "@Channel")
+            channel_label = fallback if fallback.startswith("@") else (f"@{fallback}" if fallback else "Proxies")
         # IMPORTANT: proxy_post_mode controls ONLY the publication layout (normal vs glass).
         # The proxy header naming is controlled independently by proxy_header_mode.
         # Therefore switching to Glass MUST NOT change @ChannelName into a protocol.
