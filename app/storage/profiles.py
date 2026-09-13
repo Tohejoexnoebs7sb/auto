@@ -4,7 +4,6 @@ from __future__ import annotations
 # Function bodies are preserved; shared names are injected by app.loader after
 # all feature modules are imported, so cross-module dependencies remain compatible.
 from app.core.runtime import *  # noqa: F401,F403
-from app.storage.database import get_conn
 
 # Module-local database handles. The original monolith exposed these as
 # globals; after modularization each module needs its own initialized handles.
@@ -177,6 +176,27 @@ def get_profile_last_num(profile_id):
 
 def set_profile_last_num(profile_id, num):
     update_profile(profile_id, last_num=num)
+
+def _normalize_ping_engine_mode(mode):
+    try:
+        value = int(mode)
+    except (TypeError, ValueError):
+        value = 0
+    return max(0, min(2, value))
+
+def get_ping_engine_mode():
+    """0=current Check-Host, 1=Xray real-delay, 2=Xray + Iran Check-Host."""
+    try:
+        row = c.execute("SELECT v FROM cfg WHERE k='ping_engine_mode'").fetchone()
+        return _normalize_ping_engine_mode(row[0] if row else 0)
+    except Exception:
+        return 0
+
+def set_ping_engine_mode(mode):
+    mode = _normalize_ping_engine_mode(mode)
+    c.execute("INSERT OR REPLACE INTO cfg (k, v) VALUES ('ping_engine_mode', ?)", (str(mode),))
+    conn.commit()
+    return mode
 
 def _normalize_ping_mode(mode):
     return "iran" if str(mode).lower().strip() == "iran" else "global"
