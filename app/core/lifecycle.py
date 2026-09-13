@@ -343,6 +343,13 @@ async def on_callback(u, ctx):
     before=_audit_snapshot()
     try:
         await _on_callback_impl(u, ctx)
+    except BadRequest as exc:
+        # Telegram raises this when an edit would produce exactly the same
+        # content/keyboard. It is a harmless idempotent callback, not a bot error.
+        if "Message is not modified" in str(exc):
+            log.debug("[CALLBACK] ignored idempotent edit: %s", exc)
+            return
+        raise
     finally:
         try:
             admin=getattr(getattr(u,"effective_user",None),"id",0)
