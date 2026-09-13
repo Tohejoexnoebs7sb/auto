@@ -1350,7 +1350,7 @@ T = {
         "btn_list_admins": "📋 لیست ادمین‌ها",
         "only_admin": "❌ فقط ادمین‌ها می‌توانند از این بات استفاده کنند.",
         "btn_set_naming_template": "🏷️ قالب نام‌گذاری",
-        "naming_template_prompt": "🏷️ قالب نام‌گذاری را وارد کنید.\n\nمتغیرها: `{Protocol}`، `{Flag}`، `{COUNTRY_EN}`، `{COUNTRY_FA}`، `{CHANNEL_ID}`، `{COUNT}`\nفرمت `{TOKEN}` یا `[TOKEN]` هر دو قابل استفاده‌اند.\nمثال: `[Protocol] [Flag] [COUNTRY_EN] • [COUNTRY_FA]`",
+        "naming_template_prompt": "🏷️ قالب نام‌گذاری را وارد کنید.\n\nتوکن‌ها: `{Protocol}`، `{Flag}`، `{Country}`، `{COUNTRY_EN}`، `{COUNTRY_FA}`، `{CHANNEL_ID}`، `{COUNT}`، `{INDEX}`، `{NUMBER}`، `{HOST}`، `{PORT}`، `{DATE}`، `{TIME}`، `{PING}`، `{SOURCE}`\nفرمت `{TOKEN}` یا `[TOKEN]` هر دو قابل استفاده‌اند.\nمثال: `[Protocol] [Flag] [COUNTRY_EN] • [HOST]:[PORT] • [PING]`",
         "naming_template_set": "✅ قالب نام‌گذاری تنظیم شد: {template}",
         "btn_set_channel_link": "🔗 لینک کانال",
         "channel_link_prompt": "🔗 لینک کانال را وارد کنید (مثلاً `MyChannel`):\n\nاین مقدار در قالب نام‌گذاری به جای `{CHANNEL_ID}` قرار می‌گیرد.\nاگر خالی بگذارید، از نام پروفایل استفاده می‌شود.",
