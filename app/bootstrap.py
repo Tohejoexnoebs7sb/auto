@@ -1450,17 +1450,11 @@ _WORKER_TASKS = {}
 
 _WORKER_HEARTBEATS = {}
 
+# Keep worker registries shared across extracted modules.
+for _mod in _loaded_modules:
+    vars(_mod)["_WORKER_TASKS"] = _WORKER_TASKS
+    vars(_mod)["_WORKER_HEARTBEATS"] = _WORKER_HEARTBEATS
+
 BOT_REF = None
 
 ENABLE_AUTO = True
-
-# Final compatibility sync: bootstrap defines many runtime globals after
-# app.loader has imported the feature modules. Python module globals are not
-# dynamically shared, so late-defined names (e.g. ENABLE_AUTO, dedup caches,
-# DB handles and worker state) must be injected once initialization is complete.
-# Do not copy dunder/module metadata; only the application's compatibility
-# namespace is synchronized. Mutable objects remain shared by reference.
-_compat_globals = {k: v for k, v in globals().items() if not k.startswith("__")}
-for _mod in _loaded_modules:
-    vars(_mod).update(_compat_globals)
-del _compat_globals, _mod
