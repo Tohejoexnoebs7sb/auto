@@ -5,9 +5,10 @@ from __future__ import annotations
 # all feature modules are imported, so cross-module dependencies remain compatible.
 from app.core.runtime import *  # noqa: F401,F403
 
-# Bootstrap later replaces these with the shared registries.
-_WORKER_TASKS = {}
-_WORKER_HEARTBEATS = {}
+# ENABLE_AUTO is defined by bootstrap.py after modules are loaded.  This
+# module keeps its own function globals, so resolve the same stable default
+# here instead of depending on a later cross-module injection.
+ENABLE_AUTO = True
 
 async def post_working_configs(bot, profile_id, working, proxies_with_ping, force=False, skip_duplicate=False):
     total_configs = 0
