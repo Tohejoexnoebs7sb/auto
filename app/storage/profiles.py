@@ -5,6 +5,11 @@ from __future__ import annotations
 # all feature modules are imported, so cross-module dependencies remain compatible.
 from app.core.runtime import *  # noqa: F401,F403
 
+# Module-local database handles. The original monolith exposed these as
+# globals; after modularization each module needs its own initialized handles.
+conn = get_conn()
+c = conn.cursor()
+
 def clean_source_name(name: str) -> str:
     if not name:
         return ""
