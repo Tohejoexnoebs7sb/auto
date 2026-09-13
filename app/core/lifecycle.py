@@ -242,7 +242,7 @@ async def post_init(app):
 
     profiles = get_profiles()
     if not profiles:
-        new_id = create_profile("@VaslZone", sources="@Cfox_Server")
+        new_id = create_profile("", sources="")
         log.info(f"✅ Created default profile with id {new_id}.")
         profiles = get_profiles()
     log.info(f"✅ INIT done: {len(profiles)} profiles, AUTO={ENABLE_AUTO}")
