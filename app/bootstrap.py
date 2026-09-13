@@ -1458,3 +1458,13 @@ for _mod in _loaded_modules:
 BOT_REF = None
 
 ENABLE_AUTO = True
+
+# Final compatibility sync: loader can only merge names that already exist when
+# modules are imported. Bootstrap defines many runtime/config globals later,
+# while extracted modules still resolve those names from their own globals.
+# Inject only missing shared names so existing module-local values are untouched.
+for _mod in _loaded_modules:
+    _mod_globals = vars(_mod)
+    for _name, _value in list(globals().items()):
+        if (_name.isupper() or _name.startswith("_")) and _name not in _mod_globals:
+            _mod_globals[_name] = _value
