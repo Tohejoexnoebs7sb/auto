@@ -83,7 +83,11 @@ async def _on_callback_impl(u, ctx):
             current = get_ping_engine_mode()
             new_mode = (current + 1) % 3
             set_ping_engine_mode(new_mode)
-            labels = {0: "عادی", 1: "Core / Real Delay", 2: "Core + Host Check"}
+            labels = {
+                0: "عادی / Check-Host",
+                1: "Core / Relay Delay",
+                2: "Core + Relay Delay + Check-Host",
+            }
             await q.answer(f"⚡ حالت Ping: {labels[new_mode]}")
             lang = get_lang()
             lang_text = "فارسی" if lang == "fa" else "English"
@@ -2242,7 +2246,7 @@ async def _on_callback_impl(u, ctx):
             await q.edit_message_text(
                 "🏷 <b>قالب عنوان کانفیگ</b>\n\n"
                 f"قالب فعلی: <code>{html.escape(current)}</code>\n\n"
-                "توکن‌ها: [Protocol] [Flag] [Country] [COUNTRY_EN] [COUNTRY_FA] [CHANNEL_ID] [COUNT] [PING]\n\n"
+                "توکن‌ها: [Protocol] [Flag] [Country] [COUNTRY_EN] [COUNTRY_FA] [CHANNEL_ID] [COUNT] [INDEX] [NUMBER] [HOST] [PORT] [DATE] [TIME] [PING] [SOURCE]\n\n"
                 "قالب پیش‌فرض: <code>[Protocol] [Flag] [Country]</code>",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([
@@ -2842,19 +2846,11 @@ async def _on_text_impl(u, ctx):
         await u.message.reply_text(msg("profile_added", name=dest_name))
         del ctx.user_data["action"]
         if ENABLE_AUTO:
-            bot = u.get_bot()
-            # A new profile must use the same precise scheduler as profiles
-            # loaded at startup. Do not call Bot.create_task (Bot has no such
-            # API); schedule these coroutines on the running event loop.
-            # Use the current Application when available; otherwise schedule on the running loop.
-            app_obj = getattr(ctx, "application", None)
-            if app_obj is not None:
-                start_worker(app_obj, f"auto_config_{new_id}", lambda: _profile_scheduler_v16(bot, new_id, "config"))
-                start_worker(app_obj, f"auto_proxy_{new_id}", lambda: _profile_scheduler_v16(bot, new_id, "proxy"))
-            else:
-                asyncio.create_task(_profile_scheduler_v16(bot, new_id, "config"), name=f"auto_config_{new_id}")
-                asyncio.create_task(_profile_scheduler_v16(bot, new_id, "proxy"), name=f"auto_proxy_{new_id}")
-            log.info(f"⏰ Started precise auto schedulers for new profile {new_id}")
+            # The single AUTO pipeline supervisor reconciles newly-created
+            # profiles automatically. Starting the legacy per-profile scheduler
+            # here as well would create a second publisher and could cause
+            # duplicate/early posts.
+            log.info(f"⏰ New profile {new_id} will be picked up by AUTO pipeline supervisor")
         await show_profiles_list(u.message)
         return
 
@@ -3045,7 +3041,12 @@ async def _on_text_impl(u, ctx):
             await u.message.reply_text("❌ قالب خالی است.")
             return
         normalized_template = template.replace("[", "{").replace("]", "}")
-        allowed_tokens = ("{Flag}", "{FLAG}", "{Protocol}", "{PROTOCOL}", "{COUNTRY_EN}", "{COUNTRY_FA}", "{Country}", "{COUNTRY}", "{CHANNEL_ID}", "{COUNT}", "{PING}")
+        allowed_tokens = (
+            "{Flag}", "{FLAG}", "{Protocol}", "{PROTOCOL}", "{COUNTRY_EN}",
+            "{COUNTRY_FA}", "{Country}", "{COUNTRY}", "{CHANNEL_ID}", "{COUNT}",
+            "{INDEX}", "{NUMBER}", "{HOST}", "{PORT}", "{DATE}", "{TIME}",
+            "{PING}", "{SOURCE}",
+        )
         if not any(token in normalized_template for token in allowed_tokens):
             await u.message.reply_text("❌ قالب باید حداقل یکی از متغیرهای Protocol / Flag / Country / Channel / Count را داشته باشد.")
             return
