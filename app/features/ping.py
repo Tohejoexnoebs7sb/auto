@@ -4,6 +4,69 @@ from __future__ import annotations
 # Function bodies are preserved; shared names are injected by app.loader after
 # all feature modules are imported, so cross-module dependencies remain compatible.
 from app.core.runtime import *  # noqa: F401,F403
+import platform
+import zipfile
+
+# v2rayNG 2.2.5 uses Xray-core v26.6.1 for this release. The bot downloads
+# the matching Linux core automatically when Core modes are first used.
+_XRAY_CORE_VERSION = "26.6.1"
+_XRAY_CORE_DIR = os.path.join(DATA_DIR, "xray-core")
+_XRAY_CORE_BIN = os.path.join(_XRAY_CORE_DIR, "xray")
+_XRAY_CORE_LOCK = asyncio.Lock()
+_XRAY_CORE_URLS = {
+    "x86_64": "https://github.com/XTLS/Xray-core/releases/download/v26.6.1/Xray-linux-64.zip",
+    "amd64": "https://github.com/XTLS/Xray-core/releases/download/v26.6.1/Xray-linux-64.zip",
+    "aarch64": "https://github.com/XTLS/Xray-core/releases/download/v26.6.1/Xray-linux-arm64-v8a.zip",
+    "arm64": "https://github.com/XTLS/Xray-core/releases/download/v26.6.1/Xray-linux-arm64-v8a.zip",
+    "armv7l": "https://github.com/XTLS/Xray-core/releases/download/v26.6.1/Xray-linux-arm32-v7a.zip",
+    "i386": "https://github.com/XTLS/Xray-core/releases/download/v26.6.1/Xray-linux-32.zip",
+    "i686": "https://github.com/XTLS/Xray-core/releases/download/v26.6.1/Xray-linux-32.zip",
+}
+
+def _xray_platform_url():
+    return _XRAY_CORE_URLS.get(platform.machine().lower())
+
+async def _ensure_xray_core():
+    if os.path.isfile(_XRAY_CORE_BIN) and os.access(_XRAY_CORE_BIN, os.X_OK):
+        return _XRAY_CORE_BIN
+    async with _XRAY_CORE_LOCK:
+        if os.path.isfile(_XRAY_CORE_BIN) and os.access(_XRAY_CORE_BIN, os.X_OK):
+            return _XRAY_CORE_BIN
+        url = _xray_platform_url()
+        if not url:
+            log.warning("❌ Unsupported CPU for Xray core: %s", platform.machine())
+            return None
+        os.makedirs(_XRAY_CORE_DIR, exist_ok=True)
+        archive = os.path.join(_XRAY_CORE_DIR, "xray.zip")
+        tmp = archive + ".part"
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=15.0), follow_redirects=True) as hc:
+                async with hc.stream("GET", url, headers={"User-Agent": "VaslZoneBot/XrayCore"}) as resp:
+                    resp.raise_for_status()
+                    with open(tmp, "wb") as fh:
+                        async for chunk in resp.aiter_bytes(1024 * 256):
+                            fh.write(chunk)
+            with zipfile.ZipFile(tmp) as zf:
+                member = next((n for n in zf.namelist() if n.endswith("/xray") or n == "xray"), None)
+                if not member:
+                    raise RuntimeError("Xray binary missing from release archive")
+                data = zf.read(member)
+            with open(_XRAY_CORE_BIN, "wb") as fh:
+                fh.write(data)
+            os.chmod(_XRAY_CORE_BIN, 0o755)
+            return _XRAY_CORE_BIN
+        except Exception as exc:
+            log.warning("❌ Xray core setup failed: %s", exc)
+            try: os.remove(_XRAY_CORE_BIN)
+            except OSError: pass
+            return None
+        finally:
+            try: os.remove(tmp)
+            except OSError: pass
+
+def _is_core_config_url(url):
+    scheme = str(url or "").split(":", 1)[0].lower()
+    return scheme in {"vless", "vmess", "trojan", "ss", "shadowsocks", "socks", "socks5", "http"}
 
 def add_custom_query_to_url(url, custom_query, protocol):
     if not custom_query or protocol.lower() == 'vmess':
@@ -567,25 +630,43 @@ async def _run_full_config_core(url, core_path, kind):
         shutil.rmtree(work,ignore_errors=True)
 
 async def full_config_ping(url):
-    """End-to-end config test. Prefer sing-box for broad protocol coverage, then Xray."""
-    last="no_core"
-    for kind in ("singbox","xray"):
-        core=_find_core(kind)
-        if not core: continue
-        try:
-            return await asyncio.wait_for(_run_full_config_core(url,core,kind),timeout=_FULL_TEST_TIMEOUT)
-        except Exception as exc:
-            last=str(exc)[:180]
-    return 0,False,last
+    """Run a v2rayNG-like real-delay test through Xray-core 26.6.1."""
+    core = await _ensure_xray_core()
+    if not core:
+        return 0, False, "xray_core_unavailable"
+    try:
+        return await asyncio.wait_for(_run_full_config_core(url, core, "xray"), timeout=_FULL_TEST_TIMEOUT)
+    except Exception as exc:
+        return 0, False, str(exc)[:180]
 
 async def check_full_link_ping(url, ping_mode="global", perform_ping=True):
-    """Legacy Host/Check-Host test only."""
+    """Mode 0: current Check-Host behavior. Mode 1: Xray real-delay.
+    Mode 2: Xray real-delay followed by the configured Iran Check-Host rule.
+    Non-config proxy links retain the current Check-Host behavior.
+    """
     if not perform_ping:
         return 0, True, 0
     host, _port = extract_host(url)
     if not host:
         return 0, False, 0
-    return await asyncio.wait_for(
-        _check_host_ping(host, _normalize_ping_mode(ping_mode)),
+
+    engine_mode = get_ping_engine_mode()
+    if engine_mode == 0 or not _is_core_config_url(url):
+        return await asyncio.wait_for(
+            _check_host_ping(host, _normalize_ping_mode(ping_mode)),
+            timeout=18.0,
+        )
+
+    real_delay, core_ok, _detail = await full_config_ping(url)
+    if not core_ok or real_delay <= 0:
+        return 0, False, 0
+    if engine_mode == 1:
+        return real_delay, True, 0
+
+    _host_delay, host_ok, host_count = await asyncio.wait_for(
+        _check_host_ping(host, "iran"),
         timeout=18.0,
     )
+    if not host_ok:
+        return 0, False, 0
+    return real_delay, True, host_count
