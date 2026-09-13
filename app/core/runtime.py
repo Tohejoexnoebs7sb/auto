@@ -30,6 +30,10 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, unquote, urlparse, parse_qs, urlencode, urlunparse
 import httpx
 import pytz
+
+# Foundational timezone constant: this module is imported before bootstrap.py
+# finishes loading, so modules must be able to resolve it during import.
+TEHRAN_TZ = pytz.timezone("Asia/Tehran")
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
