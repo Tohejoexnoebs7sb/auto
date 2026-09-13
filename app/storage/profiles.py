@@ -58,7 +58,7 @@ def create_profile(dest_name, sources="", banner_config=None, banner_proxy=None,
                    ping_enabled=1, profile_enabled=1,
                    country_display=2, show_ping=1, proxy_banner_template="", ping_testing=1):
     if not banner_config:
-        banner_config = "✦ V2Ray Config List\n\n{configs}\n\n◈ 📢 Channel\n↳ @Auto_Server\n◈ #کانفیگ #ویتوری"
+        banner_config = "✦ V2Ray Config List\n\n{configs}\n\n◈ #کانفیگ #ویتوری"
     if not banner_proxy:
         banner_proxy = "🌐 <b>Proxies</b>\n━━━━━━━━━━━━━━━━━━\n📅 {date}\n✅ {count} proxies\n━━━━━━━━━━━━━━━━━━\n\n{proxies}\n━━━━━━━━━━━━━━━━━━"
     c.execute("""INSERT INTO profiles
