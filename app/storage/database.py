@@ -17,6 +17,12 @@ def get_conn():
     db.execute("PRAGMA mmap_size=134217728")
     return db
 
+# Module-local database handles. The original monolith exposed these as
+# globals; after modularization database functions must have real handles
+# in this module's global namespace.
+conn = get_conn()
+c = conn.cursor()
+
 def _sqlite_signature(path):
     try:
         with open(path, "rb") as f:
@@ -93,6 +99,15 @@ def _reopen_database_after_replace():
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     c = conn.cursor()
+    # The active DB handle changed; refresh compatibility globals in all loaded app modules.
+    try:
+        import sys
+        for _name, _mod in list(sys.modules.items()):
+            if _name.startswith("app.") and _mod is not None:
+                setattr(_mod, "conn", conn)
+                setattr(_mod, "c", c)
+    except Exception:
+        pass
 
 def prepare_replaced_database():
     """Run the same compatibility migrations needed by an imported DB."""
@@ -476,9 +491,9 @@ def migrate_old_config():
         r = c.execute("SELECT v FROM cfg WHERE k=?", (k,)).fetchone()
         return r[0] if r else default
 
-    old_dests = old_cfg("destinations", "@VaslZone")
-    old_sources = old_cfg("sources", "@Cfox_Server")
-    old_banner_config = old_cfg("banner_config", "✦ V2Ray Config List\n\n{configs}\n\n◈ 📢 Channel\n↳ @Auto_Server\n◈ #کانفیگ #ویتوری")
+    old_dests = old_cfg("destinations", "")
+    old_sources = old_cfg("sources", "")
+    old_banner_config = old_cfg("banner_config", "✦ V2Ray Config List\n\n{configs}\n\n◈ #کانفیگ #ویتوری")
     old_banner_proxy = old_cfg("banner_proxy", "🌐 <b>Proxies</b>\n━━━━━━━━━━━━━━━━━━\n📅 {date}\n✅ {count} proxies\n━━━━━━━━━━━━━━━━━━\n\n{proxies}\n━━━━━━━━━━━━━━━━━━")
     old_interval = int(old_cfg("interval_min", "5"))
     old_max_post = int(old_cfg("max_post", "8"))
@@ -490,7 +505,7 @@ def migrate_old_config():
 
     dest_list = [x.strip() for x in old_dests.split(",") if x.strip()]
     if not dest_list:
-        dest_list = ["@VaslZone"]
+        dest_list = []
 
     for dest in dest_list:
         c.execute("""INSERT INTO profiles
