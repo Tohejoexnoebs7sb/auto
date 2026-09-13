@@ -5,6 +5,12 @@ from __future__ import annotations
 # all feature modules are imported, so cross-module dependencies remain compatible.
 from app.core.runtime import *  # noqa: F401,F403
 
+# Module-local state used by the dedup cache. The original monolith kept these
+# in its global namespace; after modularization they must exist in this module.
+_SEEN_CONFIG_KEYS = set()
+_SEEN_PROXY_KEYS = set()
+_DEDUP_CACHE_READY = False
+
 def get_country_info(code):
     """Return (flag, english_name, persian_name) for a country code."""
     if not code or len(code) != 2:
