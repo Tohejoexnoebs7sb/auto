@@ -166,6 +166,13 @@ import app.storage.database as _database_module
 _database_module.conn = conn
 _database_module.c = c
 
+# Keep compatibility globals synchronized across extracted modules.
+# The original monolith shared conn/c/TEHRAN_TZ in one namespace.
+for _mod in _loaded_modules:
+    vars(_mod)["conn"] = conn
+    vars(_mod)["c"] = c
+    vars(_mod)["TEHRAN_TZ"] = TEHRAN_TZ
+
 DB_REPLACE_MAX_BYTES = 45 * 1024 * 1024
 
 DB_REPLACE_LOCK = asyncio.Lock()
