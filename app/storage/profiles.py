@@ -5,11 +5,6 @@ from __future__ import annotations
 # all feature modules are imported, so cross-module dependencies remain compatible.
 from app.core.runtime import *  # noqa: F401,F403
 
-# Module-local database handles. The original monolith exposed these as
-# globals; after modularization each module needs its own initialized handles.
-conn = get_conn()
-c = conn.cursor()
-
 def clean_source_name(name: str) -> str:
     if not name:
         return ""
@@ -56,7 +51,7 @@ def create_profile(dest_name, sources="", banner_config=None, banner_proxy=None,
                    interval_config=5, interval_proxy=5, max_post_config=8, max_post_proxy=10,
                    naming_template="{Flag} | ⚡️Telegram = {CHANNEL_ID}", channel_link="",
                    ping_enabled=1, profile_enabled=1,
-                   country_display=2, show_ping=1, proxy_banner_template="", ping_testing=1):
+                   country_display=2, show_ping=1, proxy_banner_template="", proxy_post_mode=0, ping_testing=1):
     if not banner_config:
         banner_config = "✦ V2Ray Config List\n\n{configs}\n\n◈ #کانفیگ #ویتوری"
     if not banner_proxy:
@@ -69,7 +64,7 @@ def create_profile(dest_name, sources="", banner_config=None, banner_proxy=None,
          interval_config, interval_proxy, max_post_config, max_post_proxy,
          naming_template, channel_link, ping_enabled, profile_enabled,
          country_display, show_ping, proxy_banner_template, proxy_post_mode, ping_testing)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (dest_name, sources, banner_config, banner_proxy,
          interval_min, max_post, max_proxies,
          post_configs, post_proxies, ping_mode, "iran", "iran", last_num,
