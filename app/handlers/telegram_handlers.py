@@ -79,6 +79,19 @@ async def _on_callback_impl(u, ctx):
             await q.edit_message_text(f"🌐 <b>تنظیمات پروکسی پروفایل {profile_id}</b>\n\nتعداد، زمان، Ping و نحوه انتشار پروکسی را جداگانه تنظیم کن.", parse_mode="HTML", reply_markup=profile_proxy_settings_kb(profile_id))
             return
 
+        if d == "toggle_ping_engine_mode":
+            current = get_ping_engine_mode()
+            new_mode = (current + 1) % 3
+            set_ping_engine_mode(new_mode)
+            labels = {0: "عادی", 1: "Core / Real Delay", 2: "Core + Host Check"}
+            await q.answer(f"⚡ حالت Ping: {labels[new_mode]}")
+            lang = get_lang()
+            lang_text = "فارسی" if lang == "fa" else "English"
+            admins = list_admins()
+            txt = msg("general_settings", lang=lang_text, admins_count=len(admins)+1, iran_ping_min_ok=get_iran_ping_min_ok())
+            await q.edit_message_text(txt + f"\n⚡ حالت Ping: <b>{labels[new_mode]}</b>", parse_mode="HTML", reply_markup=general_settings_kb())
+            return
+
         if d == "set_iran_ping_threshold":
             current=get_iran_ping_min_ok()
             ctx.user_data["action"]="set_iran_ping_threshold"
