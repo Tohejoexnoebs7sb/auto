@@ -144,7 +144,7 @@ async def _check_host_submit(client, target):
                 # No node=, max_nodes=, DNS resolution, TCP fallback, or other
                 # target transformation is used. Accept: application/json only
                 # selects the API representation of the same check.
-                check_url = f"https://check-host.net/check-ping?host={quote(target, safe="")}"
+                check_url = f"https://check-host.net/check-ping?host={quote(target, safe='')}"
                 log.debug("🔎 Check-Host URL: %s", check_url)
                 response = await client.get(
                     check_url,
