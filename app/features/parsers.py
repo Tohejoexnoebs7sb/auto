@@ -10,6 +10,153 @@ from app.core.runtime import *  # noqa: F401,F403
 _SEEN_CONFIG_KEYS = set()
 _SEEN_PROXY_KEYS = set()
 _DEDUP_CACHE_READY = False
+_ARCHIVED_CONFIG_KEYS = set()
+_ARCHIVED_PROXY_KEYS = set()
+_ARCHIVE_LOCK = threading.Lock()
+
+def _archive_path(kind):
+    return CONFIG_ARCHIVE_FILE if kind == "config" else PROXY_ARCHIVE_FILE
+
+def _load_archive(kind):
+    """Load compact gzip archive entries. Config rows may include backup_num."""
+    result = []
+    path = _archive_path(kind)
+    if not os.path.isfile(path):
+        return result
+    try:
+        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if "\t" not in line:
+                    continue
+                parts = line.split("\t", 2)
+                try:
+                    pid = int(parts[0])
+                except ValueError:
+                    continue
+                if kind == "config" and len(parts) == 3:
+                    try: backup_num = int(parts[1] or 0)
+                    except ValueError: backup_num = 0
+                    value = parts[2]
+                    if value: result.append((pid, value, backup_num))
+                elif len(parts) >= 2 and parts[1]:
+                    result.append((pid, parts[1]))
+    except Exception:
+        log.exception("archive load failed: %s", path)
+    return result
+
+def _append_archive(kind, rows):
+    if not rows:
+        return 0
+    path = _archive_path(kind)
+    seen = _ARCHIVED_CONFIG_KEYS if kind == "config" else _ARCHIVED_PROXY_KEYS
+    written = 0
+    with _ARCHIVE_LOCK:
+        os.makedirs(ARCHIVE_DIR, exist_ok=True)
+        try:
+            with gzip.open(path, "at", encoding="utf-8") as f:
+                for row in rows:
+                    pid = row[0]
+                    value = row[1] if len(row) > 1 else ""
+                    extra = row[2] if len(row) > 2 else None
+                    if not value:
+                        continue
+                    key = (int(pid), _config_identity_hash(value) if kind == "config" else _proxy_identity_hash(value))
+                    if key in seen:
+                        continue
+                    if kind == "config" and extra is not None:
+                        f.write(f"{int(pid)}\t{int(extra or 0)}\t{value}\n")
+                    else:
+                        f.write(f"{int(pid)}\t{value}\n")
+                    seen.add(key)
+                    written += 1
+        except Exception:
+            log.exception("archive write failed: %s", path)
+    return written
+
+def archive_current_posted_data():
+    """Move short-lived URL copies into compact gzip archives before DB cleanup."""
+    counts = {"configs": 0, "proxies": 0, "ok": True}
+    try:
+        cfg_rows = c.execute("SELECT profile_id,full_url,backup_num FROM seen WHERE full_url IS NOT NULL AND full_url!=''").fetchall()
+        prx_rows = c.execute("SELECT profile_id,proxy_url FROM proxies_seen WHERE proxy_url IS NOT NULL AND proxy_url!=''").fetchall()
+        counts["configs"] = _append_archive("config", cfg_rows)
+        counts["proxies"] = _append_archive("proxy", prx_rows)
+    except sqlite3.Error:
+        counts["ok"] = False
+        log.exception("archive current posted data failed")
+    return counts
+
+def load_archive_dedup_cache():
+    global _ARCHIVED_CONFIG_KEYS, _ARCHIVED_PROXY_KEYS
+    for row in _load_archive("config"):
+        pid, url = row[0], row[1]
+        _ARCHIVED_CONFIG_KEYS.add((pid, _config_identity_hash(url)))
+    for row in _load_archive("proxy"):
+        pid, url = row[0], row[1]
+        _ARCHIVED_PROXY_KEYS.add((pid, _proxy_identity_hash(url)))
+    _SEEN_CONFIG_KEYS.update(_ARCHIVED_CONFIG_KEYS)
+    _SEEN_PROXY_KEYS.update(_ARCHIVED_PROXY_KEYS)
+    log.info("[ARCHIVE] dedup archive loaded: configs=%d proxies=%d", len(_ARCHIVED_CONFIG_KEYS), len(_ARCHIVED_PROXY_KEYS))
+
+def backup_archive_file(kind, destination):
+    source = _archive_path(kind)
+    if not os.path.isfile(source):
+        return False
+    shutil.copy2(source, destination)
+    return True
+
+def replace_archive_file(kind, source_path):
+    """Validate and atomically replace one compact archive, then refresh memory dedup."""
+    path = _archive_path(kind)
+    tmp = path + ".tmp"
+    # Parse first so a corrupt upload can never replace the active archive.
+    rows = []
+    try:
+        with gzip.open(source_path, "rt", encoding="utf-8", errors="strict") as f:
+            for line in f:
+                line=line.rstrip("\n")
+                if "\t" not in line: continue
+                parts=line.split("\t",2)
+                if kind == "config" and len(parts) == 3:
+                    rows.append((int(parts[0]), parts[2], int(parts[1] or 0)))
+                elif len(parts) >= 2:
+                    rows.append((int(parts[0]), parts[1]))
+    except Exception as exc:
+        return False, f"آرشیو معتبر نیست: {str(exc)[:180]}"
+    try:
+        with gzip.open(tmp, "wt", encoding="utf-8") as f:
+            seen_local=set()
+            for row in rows:
+                pid,value=row[0],row[1]
+                extra=row[2] if len(row)>2 else None
+                if not value: continue
+                key=(pid, _config_identity_hash(value) if kind=="config" else _proxy_identity_hash(value))
+                if key in seen_local: continue
+                seen_local.add(key)
+                if kind=="config" and extra is not None:
+                    f.write(f"{pid}\t{int(extra or 0)}\t{value}\n")
+                else:
+                    f.write(f"{pid}\t{value}\n")
+        os.replace(tmp, path)
+        _ARCHIVED_CONFIG_KEYS.clear()
+        _ARCHIVED_PROXY_KEYS.clear()
+        _SEEN_CONFIG_KEYS.clear()
+        _SEEN_PROXY_KEYS.clear()
+        global _DEDUP_CACHE_READY
+        _DEDUP_CACHE_READY = False
+        load_dedup_cache()
+        return True, f"{len(rows)} رکورد بررسی شد."
+    except Exception as exc:
+        try: os.remove(tmp)
+        except OSError: pass
+        return False, f"جایگزینی انجام نشد: {str(exc)[:180]}"
+
+def export_archive_rows(kind, profile_id=None):
+    rows = _load_archive(kind)
+    if profile_id is not None:
+        rows = [row for row in rows if int(row[0])==int(profile_id)]
+    return rows
 
 def get_country_info(code):
     """Return (flag, english_name, persian_name) for a country code."""
@@ -708,6 +855,7 @@ def load_dedup_cache():
     if _DEDUP_CACHE_READY:
         return
     try:
+        load_archive_dedup_cache()
         cur = conn.cursor()
         cur.execute("SELECT profile_id,full_url,first_seen,source FROM seen WHERE full_url IS NOT NULL AND full_url!=''")
         while True:
