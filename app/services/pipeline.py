@@ -736,42 +736,21 @@ async def _auto_health_test_stream(profile_id, stream):
     sem=asyncio.Semaphore(3 if get_profile_low_cost_mode(pid) else 4)
     host_mode=get_profile_config_ping_mode(pid) if stream=="config" else get_profile_proxy_ping_mode(pid)
     test_mode=get_profile_config_test_mode(pid) if stream=="config" else get_profile_proxy_test_mode(pid)
-    # A profile test mode of 0 keeps the existing global Ping engine behavior.
-    # Modes 1/2 are explicit per-profile overrides.
-    effective_test_mode = test_mode if test_mode in (1,2) else get_ping_engine_mode()
-    log.info("[AUTO-TEST][%s][profile=%s] candidates=%d mode=%d host=%s", stream, pid, len(rows), effective_test_mode, host_mode)
-
     async def test(row):
         h,url,src=row
         async with sem:
             try:
-                # Mode 0: Check-Host. Mode 1: Xray/Core real delay.
-                # Mode 2: Xray/Core real delay followed by one direct Check-Host
-                # request. Do not call check_full_link_ping in mode 2 because
-                # that helper also applies the global engine mode and would run
-                # Xray a second time when the global mode is Core + Host.
-                if effective_test_mode in (1,2):
-                    full_ms, full_ok, detail = await full_config_ping(url)
+                # 0 = current Check-Host only; 1 = real full-config; 2 = full-config then host.
+                if test_mode in (1,2):
+                    full_ms, full_ok, _detail = await full_config_ping(url)
                     if not full_ok:
-                        log.debug("[AUTO-TEST][%s][profile=%s] core failed url=%s detail=%s", stream, pid, str(url)[:100], detail)
                         return h,0,0,False
                 else:
                     full_ms=0
-                if effective_test_mode==1:
+                if test_mode==1:
                     return h,float(full_ms),1,True
-                host, _port = extract_host(url)
-                if not host:
-                    return h,0,0,False
-                host_ms,host_ok,count=await asyncio.wait_for(
-                    _check_host_ping(host, _normalize_ping_mode(host_mode)),
-                    timeout=18.0,
-                )
-                if not host_ok:
-                    return h,0,0,False
-                # Mode 0 reports Check-Host delay; mode 2 keeps the Core delay
-                # as the displayed/recorded real-delay value while requiring
-                # the host check to pass.
-                return h,float(full_ms if effective_test_mode==2 and full_ms>0 else host_ms),count,True
+                host_ms,host_ok,count=await check_full_link_ping(url,host_mode,perform_ping=True)
+                return h,host_ms,count,host_ok
             except Exception as exc:
                 log.debug("[AUTO-TEST] failed %s: %s", h, exc)
                 return h,0,0,False
@@ -812,7 +791,6 @@ async def _auto_post_pending(profile_id,stream,bot,force_instant=False):
         if not get_profile_post_proxies(pid): return 0
         desired=max(1,int(get_profile_max_post_proxy(pid) or 1))
     rows=_pending_batch_rows(pid,stream)
-    log.info("[AUTO-POST][%s][profile=%s] queue=%d target=%d batch=%d ping=%d", stream, pid, len(rows), desired, int(bool(get_profile_batch_posting(pid))), int(bool(get_profile_ping_enabled(pid))))
     if stream == "proxy":
         # Repair legacy pending rows created before proxy GeoIP metadata was
         # persisted. This keeps existing queues intact while ensuring proxy
@@ -1093,9 +1071,15 @@ async def check_and_auto_backup(profile_id):
             backup_locks[profile_id] = lock
 
         async with lock:
-            total = c.execute(
-                "SELECT COUNT(*) FROM seen WHERE profile_id=? AND full_url != '' AND backup_num > 0",
-                (profile_id,)).fetchone()[0]
+            archive_rows = export_archive_rows("config", profile_id)
+            archive_nums = [(int(r[2] or 0), r[1]) for r in archive_rows if len(r) > 2 and int(r[2] or 0) > 0]
+            current_rows = c.execute(
+                "SELECT backup_num,full_url FROM seen WHERE profile_id=? AND full_url != '' AND backup_num > 0 ORDER BY backup_num",
+                (profile_id,)).fetchall()
+            all_numbered = {int(n): url for n,url in archive_nums}
+            for n,url in current_rows:
+                if int(n) > 0 and url: all_numbered[int(n)] = url
+            total = max(all_numbered.keys(), default=0)
             last_backup = get_profile_last_backup_count(profile_id)
 
             last_backup_block = last_backup // backup_interval if backup_interval > 0 else 0
@@ -1108,11 +1092,7 @@ async def check_and_auto_backup(profile_id):
                 start_num = (block - 1) * backup_interval + 1
                 end_num = block * backup_interval
 
-                rows = c.execute(
-                    "SELECT full_url FROM seen WHERE profile_id=? AND full_url != '' AND backup_num BETWEEN ? AND ? ORDER BY backup_num",
-                    (profile_id, start_num, end_num)
-                ).fetchall()
-                links = [r[0] for r in rows if r[0]]
+                links = [all_numbered[n] for n in range(start_num, end_num + 1) if all_numbered.get(n)]
                 if not links:
                     continue
 
@@ -1149,17 +1129,7 @@ async def delete_file_after_delay(filepath, delay_seconds):
         log.error(f"Error deleting file {filepath}: {e}")
 
 async def get_logs(update, context, profile_id, log_type="full", time_range_minutes=30):
-    """Export recent records from the active bot.log file."""
-    # FileHandler keeps the descriptor open; flush it before reading so the
-    # Telegram log button sees records written immediately before the request.
-    try:
-        for handler in logging.getLogger().handlers:
-            try:
-                handler.flush()
-            except Exception:
-                pass
-    except Exception:
-        pass
+    """Export the actual rotating bot.log files; safe for callback buttons too."""
     message = getattr(update, "effective_message", None) or getattr(update, "message", None)
     if message is None:
         log.error("[LOGS] no effective message")
