@@ -28,7 +28,7 @@ async def _on_callback_impl(u, ctx):
         navigation_prefixes = (
             "back_", "prof_", "profiles_list", "general_settings", "manage_admins",
             "list_admins", "sponsor_list_", "sp_detail_", "sp_delete_",
-            "src_list_", "dl_", "bl_list_", "backup_", "ast_", "home_", "delposts_"
+            "src_list_", "dl_", "bl_list_", "backup_", "data_management", "ast_", "home_", "delposts_"
         )
         if ("cancel" in d.lower() or "back" in d.lower() or d in ("back_home", "profiles_list", "general_settings", "manage_admins", "list_admins")
                 or any(d.startswith(p) for p in navigation_prefixes)):
@@ -111,6 +111,42 @@ async def _on_callback_impl(u, ctx):
             admins = list_admins()
             txt = msg("general_settings", lang=lang_text, admins_count=len(admins)+1, iran_ping_min_ok=get_iran_ping_min_ok())
             await q.edit_message_text(txt, parse_mode="HTML", reply_markup=general_settings_kb())
+            return
+
+        if d == "data_management":
+            await q.edit_message_text(
+                "🗄 <b>مدیریت دیتای حجیم</b>\n\n"
+                "کانفیگ‌ها و پروکسی‌های ثبت‌شده بعد از ۲۴ ساعت از SQLite پاک می‌شوند و به‌صورت فشرده در آرشیو gzip نگه‌داری می‌شوند.\n"
+                "شماره پست‌های تلگرام جداگانه و دائمی باقی می‌مانند.",
+                parse_mode="HTML", reply_markup=data_management_kb())
+            return
+
+        if d in ("backup_config_archive", "backup_proxy_archive"):
+            kind = "config" if d == "backup_config_archive" else "proxy"
+            path = CONFIG_ARCHIVE_FILE if kind == "config" else PROXY_ARCHIVE_FILE
+            label = "کانفیگ" if kind == "config" else "پروکسی"
+            try:
+                if not os.path.isfile(path):
+                    await q.answer(f"⚠️ آرشیو {label} هنوز ساخته نشده است.", show_alert=True)
+                    return
+                with open(path, "rb") as archive_file:
+                    await q.message.reply_document(document=archive_file, filename=os.path.basename(path), caption=f"💾 آرشیو فشرده {label}")
+                await q.answer("✅ ارسال شد")
+            except Exception as e:
+                log.exception("archive backup failed")
+                await q.answer("❌ ارسال بک‌آپ ناموفق بود.", show_alert=True)
+            return
+
+        if d in ("replace_config_archive", "replace_proxy_archive"):
+            kind = "config" if d == "replace_config_archive" else "proxy"
+            ctx.user_data["action"] = f"replace_{kind}_archive"
+            label = "کانفیگ" if kind == "config" else "پروکسی"
+            await q.edit_message_text(
+                f"🔄 <b>جایگزینی آرشیو {label}</b>\n\nفایل gzip آرشیو را ارسال کن.\n"
+                "⚠️ آرشیو فعلی فقط بعد از اعتبارسنجی فایل جدید جایگزین می‌شود.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(msg("btn_back"), callback_data="data_management", style="primary")]])
+            )
             return
 
         if d == "replace_db":
@@ -3145,6 +3181,29 @@ async def _on_document_impl(u, ctx):
         return
     a = ctx.user_data.get("action")
     if not a:
+        return
+
+    if a in ("replace_config_archive", "replace_proxy_archive"):
+        doc = u.message.document
+        if not doc:
+            return
+        kind = "config" if a == "replace_config_archive" else "proxy"
+        label = "کانفیگ" if kind == "config" else "پروکسی"
+        status = await u.message.reply_text(f"⏳ آرشیو {label} دریافت شد؛ در حال اعتبارسنجی و جایگزینی...")
+        temp_path = os.path.join(DATA_DIR, f"archive_upload_{kind}_{u.effective_user.id}_{int(time.time())}.gz")
+        try:
+            file = await doc.get_file()
+            await file.download_to_drive(temp_path)
+            ok, detail = replace_archive_file(kind, temp_path)
+            await status.edit_text((f"✅ آرشیو {label} جایگزین شد.\n\n{detail}" if ok else f"❌ {html.escape(detail)}"), parse_mode="HTML")
+        except Exception as e:
+            log.exception("Archive replacement error")
+            await status.edit_text(f"❌ خطا: {html.escape(str(e)[:300])}", parse_mode="HTML")
+        finally:
+            ctx.user_data.pop("action", None)
+            try:
+                if os.path.exists(temp_path): os.remove(temp_path)
+            except OSError: pass
         return
 
     if a == "replace_database":
