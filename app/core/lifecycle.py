@@ -33,11 +33,12 @@ async def export_backup(update, context, profile_id, backup_type, count=None):
         profile_name = profile["dest_name"].replace("@", "").strip() if profile else f"profile_{profile_id}"
 
         if backup_type == "configs":
-            if count is None or count == -1:
-                rows = c.execute("SELECT full_url FROM seen WHERE profile_id=? AND full_url != '' ORDER BY last_posted DESC", (profile_id,)).fetchall()
-            else:
-                rows = c.execute("SELECT full_url FROM seen WHERE profile_id=? AND full_url != '' ORDER BY last_posted DESC LIMIT ?", (profile_id, count)).fetchall()
-            links = [row[0] for row in rows if row[0]]
+            archive_rows = export_archive_rows("config", profile_id)
+            current_rows = c.execute("SELECT full_url FROM seen WHERE profile_id=? AND full_url != '' ORDER BY last_posted DESC", (profile_id,)).fetchall()
+            links = [row[1] for row in archive_rows if len(row) > 1 and row[1]] + [row[0] for row in current_rows if row[0]]
+            links = list(dict.fromkeys(links))
+            if count is not None and count != -1:
+                links = links[:int(count)]
             if not links:
                 await update.message.reply_text("❌ هیچ کانفیگی برای بک‌آپ یافت نشد.")
                 return
@@ -51,11 +52,12 @@ async def export_backup(update, context, profile_id, backup_type, count=None):
             return
 
         elif backup_type == "proxies":
-            if count is None or count == -1:
-                rows = c.execute("SELECT proxy_url FROM proxies_seen WHERE profile_id=? ORDER BY last_posted DESC", (profile_id,)).fetchall()
-            else:
-                rows = c.execute("SELECT proxy_url FROM proxies_seen WHERE profile_id=? ORDER BY last_posted DESC LIMIT ?", (profile_id, count)).fetchall()
-            links = [row[0] for row in rows if row[0]]
+            archive_rows = export_archive_rows("proxy", profile_id)
+            current_rows = c.execute("SELECT proxy_url FROM proxies_seen WHERE profile_id=? ORDER BY last_posted DESC", (profile_id,)).fetchall()
+            links = [row[1] for row in archive_rows if len(row) > 1 and row[1]] + [row[0] for row in current_rows if row[0]]
+            links = list(dict.fromkeys(links))
+            if count is not None and count != -1:
+                links = links[:int(count)]
             if not links:
                 await update.message.reply_text("❌ هیچ پروکسی برای بک‌آپ یافت نشد.")
                 return
@@ -74,23 +76,32 @@ async def export_backup(update, context, profile_id, backup_type, count=None):
         await update.message.reply_text(f"❌ خطا در بک‌آپ: {str(e)[:100]}")
 
 def automatic_database_cleanup():
-    """Bound disposable DB history so long-running Railway instances stay small."""
+    """Archive short-lived URL data, then purge disposable DB rows older than 24h."""
     db = None
     try:
+        archive_result = archive_current_posted_data()
+        if not archive_result.get("ok", False):
+            log.error("[DB CLEANER] archive failed; keeping seen/proxy rows for safety")
+            return {}
+
         db = get_conn(); cur = db.cursor(); deleted = {}
         runtime_cutoff = (datetime.now(TEHRAN_TZ) - timedelta(hours=RUNTIME_RETENTION_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
-        for table, cap in (("seen", SEEN_ROWS_PER_PROFILE), ("proxies_seen", PROXY_ROWS_PER_PROFILE)):
+
+        # URL copies are intentionally short-lived. The compact gzip archives
+        # retain the content outside SQLite while the in-memory dedup cache
+        # keeps once-posted protection across the full archive lifetime.
+        for table, where in (
+            ("seen", "last_posted IS NOT NULL AND last_posted < ?"),
+            ("proxies_seen", "last_posted IS NOT NULL AND last_posted < ?"),
+            ("posted_config_keys", "first_posted IS NOT NULL AND first_posted < ?"),
+            ("posted_proxy_keys", "first_posted IS NOT NULL AND first_posted < ?"),
+        ):
             try:
-                cur.execute(f"DELETE FROM {table} WHERE last_posted IS NOT NULL AND last_posted < ?", (runtime_cutoff,))
+                cur.execute(f"DELETE FROM {table} WHERE {where}", (runtime_cutoff,))
                 deleted[table+"_old"] = max(0, cur.rowcount)
-                pids = [r[0] for r in cur.execute(f"SELECT DISTINCT profile_id FROM {table}").fetchall()]
-                trimmed = 0
-                for pid in pids:
-                    cur.execute(f"DELETE FROM {table} WHERE profile_id=? AND rowid NOT IN (SELECT rowid FROM {table} WHERE profile_id=? ORDER BY last_posted DESC LIMIT ?)", (int(pid),int(pid),int(cap)))
-                    trimmed += max(0,cur.rowcount)
-                deleted[table+"_trimmed"] = trimmed
             except sqlite3.Error:
-                deleted[table] = 0
+                deleted[table+"_old"] = 0
+
         for table, sql, args in [
             ("processed_messages", "DELETE FROM processed_messages", ()),
             ("posts", "DELETE FROM posts WHERE created_at < ?", (runtime_cutoff,)),
@@ -98,42 +109,66 @@ def automatic_database_cleanup():
             ("pending_batch_items", "DELETE FROM pending_batch_items WHERE added_at < ?", (runtime_cutoff,)),
         ]:
             try:
-                cur.execute(sql,args); deleted[table]=max(0,cur.rowcount)
+                cur.execute(sql, args); deleted[table] = max(0, cur.rowcount)
             except sqlite3.Error:
-                deleted[table]=0
+                deleted[table] = 0
+
         try:
-            pids = cur.execute("SELECT DISTINCT profile_id,kind FROM pending_batch_items").fetchall(); trimmed=0
-            for pid,kind in pids:
-                cur.execute("DELETE FROM pending_batch_items WHERE profile_id=? AND kind=? AND rowid NOT IN (SELECT rowid FROM pending_batch_items WHERE profile_id=? AND kind=? ORDER BY added_at ASC LIMIT ?)", (int(pid),kind,int(pid),kind,int(PENDING_ROWS_PER_PROFILE_KIND)))
-                trimmed += max(0,cur.rowcount)
-            deleted["pending_trimmed"] = trimmed
-        except sqlite3.Error: deleted["pending_trimmed"] = 0
+            cache_cutoff = (datetime.now(TEHRAN_TZ) - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
+            cur.execute("DELETE FROM batch_test_cache WHERE tested_at < ?", (cache_cutoff,))
+            deleted["batch_test_cache"] = max(0, cur.rowcount)
+        except sqlite3.Error:
+            deleted["batch_test_cache"] = 0
+
+        # channel_posts is a permanent message-id ledger. Never delete it:
+        # exact post deletion must continue to work even after URL cleanup.
+
         try:
-            cache_cutoff=(datetime.now(TEHRAN_TZ)-timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
-            cur.execute("DELETE FROM batch_test_cache WHERE tested_at < ?",(cache_cutoff,)); deleted["batch_test_cache"]=max(0,cur.rowcount)
-        except sqlite3.Error: deleted["batch_test_cache"]=0
+            cur.execute("DELETE FROM admin_activity WHERE id NOT IN (SELECT id FROM admin_activity ORDER BY id DESC LIMIT ?)", (int(ADMIN_ACTIVITY_MAX_ROWS),))
+            deleted["admin_activity_trimmed"] = max(0, cur.rowcount)
+        except sqlite3.Error:
+            pass
+
+        # Keep automatic database-replacement backups bounded as well.
         try:
-            cur.execute("DELETE FROM channel_posts WHERE sent_at < ?",(runtime_cutoff,)); deleted["channel_posts_old"]=max(0,cur.rowcount)
-            for pid in [r[0] for r in cur.execute("SELECT DISTINCT profile_id FROM channel_posts").fetchall()]:
-                cur.execute("DELETE FROM channel_posts WHERE profile_id=? AND rowid NOT IN (SELECT rowid FROM channel_posts WHERE profile_id=? ORDER BY sent_at DESC LIMIT ?)",(int(pid),int(pid),int(CHANNEL_POST_ROWS_PER_PROFILE)))
-        except sqlite3.Error: pass
-        try:
-            cur.execute("DELETE FROM admin_activity WHERE id NOT IN (SELECT id FROM admin_activity ORDER BY id DESC LIMIT ?)",(int(ADMIN_ACTIVITY_MAX_ROWS),))
-            deleted["admin_activity_trimmed"]=max(0,cur.rowcount)
-        except sqlite3.Error: pass
+            backup_rows = sorted(
+                [os.path.join(BACKUP_DIR, x) for x in os.listdir(BACKUP_DIR)
+                 if x.startswith("before_replace_") and x.endswith(".db")],
+                key=lambda x: os.path.getmtime(x), reverse=True
+            )
+            for old in backup_rows[5:]:
+                try: os.remove(old)
+                except OSError: pass
+            deleted["old_db_backups"] = max(0, len(backup_rows) - 5)
+        except OSError:
+            deleted["old_db_backups"] = 0
+
         db.commit()
         try: cur.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except sqlite3.Error: pass
         try: cur.execute("PRAGMA optimize")
         except sqlite3.Error: pass
         db.commit()
-        log.info("[DB CLEANER] bounded cleanup: %s", deleted)
+        log.info("[DB CLEANER] 24h cleanup + compact archive: %s", deleted)
         return deleted
     except sqlite3.Error:
         if db: db.rollback()
         log.exception("[DB CLEANER] failed"); return {}
     finally:
         if db: db.close()
+
+async def log_cleanup_worker():
+    """Reset bot.log every 30 minutes; no rotated log backups are retained."""
+    log.info("[LOG CLEANER] worker started | reset every 30m")
+    while True:
+        try:
+            await asyncio.sleep(LOG_CLEAN_INTERVAL)
+            reset_bot_log()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            log.exception("[LOG CLEANER] worker error")
+
 
 def compact_database_once():
     """One-time physical compaction. Runs off the event loop and skips if DB is busy."""
@@ -293,6 +328,7 @@ async def post_init(app):
 
     start_worker(app, "cleanup", lambda: periodic_cleanup())
     start_worker(app, "database_cleaner", lambda: database_cleanup_worker())
+    start_worker(app, "log_cleaner", lambda: log_cleanup_worker())
     start_worker(app, "watchdog", lambda: worker_watchdog())
     log.info("🧹 Periodic cleanup task started")
 

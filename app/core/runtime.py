@@ -8,6 +8,7 @@ APP_VERSION_LABEL = "4.1.19-stable"
 BOT_VERSION = APP_VERSION
 import os
 import glob
+import gzip
 import re
 import asyncio
 import sqlite3
@@ -67,8 +68,55 @@ os.makedirs(BACKUP_DIR, exist_ok=True)
 # ======================================================================
 # تنظیم لاگ
 # ======================================================================
-# bootstrap.py installs the actual handlers after all compatibility modules
-# are imported. This module only exposes the shared logger and log path.
+from logging.handlers import RotatingFileHandler
+
+# All bot-visible/logged timestamps use Tehran time.
+logging.Formatter.converter = lambda *args: datetime.now(pytz.timezone("Asia/Tehran")).timetuple()
+
 _LOG_FILE = os.path.join(DATA_DIR, "bot.log")
+ARCHIVE_DIR = os.path.join(DATA_DIR, "archives")
+os.makedirs(ARCHIVE_DIR, exist_ok=True)
+CONFIG_ARCHIVE_FILE = os.path.join(ARCHIVE_DIR, "configs.gz")
+PROXY_ARCHIVE_FILE = os.path.join(ARCHIVE_DIR, "proxies.gz")
+
+def _remove_old_log_files():
+    try:
+        for path in glob.glob(_LOG_FILE + ".*"):
+            try: os.remove(path)
+            except OSError: pass
+        try: os.remove(_LOG_FILE)
+        except FileNotFoundError: pass
+    except Exception: pass
+
+def configure_bot_logging(reset=True):
+    """Install one active bot.log handler and optionally reset the file."""
+    root = logging.getLogger()
+    logging._acquireLock()
+    try:
+        for handler in list(root.handlers):
+            if isinstance(handler, logging.FileHandler):
+                try: handler.flush(); handler.close()
+                except Exception: pass
+                root.removeHandler(handler)
+        if reset:
+            _remove_old_log_files()
+        fh = logging.FileHandler(_LOG_FILE, mode="w" if reset else "a", encoding="utf-8")
+        fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        root.setLevel(logging.INFO)
+        if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler) for h in root.handlers):
+            sh = logging.StreamHandler(sys.stdout)
+            sh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+            root.addHandler(sh)
+        root.addHandler(fh)
+    finally:
+        logging._releaseLock()
+    logging.getLogger("bot").setLevel(logging.INFO)
+    logging.getLogger("bot").propagate = True
+
+def reset_bot_log():
+    configure_bot_logging(reset=True)
+
+# Every process/restart/deploy starts with a zero-length active log.
+configure_bot_logging(reset=True)
 log = logging.getLogger("bot")
 
