@@ -537,6 +537,15 @@ def log_menu_kb(profile_id):
         [InlineKeyboardButton(msg("btn_back"), callback_data=f"prof_{profile_id}", style="primary")],
     ])
 
+def data_management_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📡 بک‌آپ آرشیو کانفیگ‌ها", callback_data="backup_config_archive", style="primary")],
+        [InlineKeyboardButton("🔄 جایگزینی آرشیو کانفیگ‌ها", callback_data="replace_config_archive", style="danger")],
+        [InlineKeyboardButton("🌐 بک‌آپ آرشیو پروکسی‌ها", callback_data="backup_proxy_archive", style="primary")],
+        [InlineKeyboardButton("🔄 جایگزینی آرشیو پروکسی‌ها", callback_data="replace_proxy_archive", style="danger")],
+        [InlineKeyboardButton(msg("btn_back"), callback_data="general_settings", style="primary")],
+    ])
+
 def general_settings_kb():
     lang = get_lang()
     lang_text = "فارسی" if lang == "fa" else "English"
@@ -550,6 +559,7 @@ def general_settings_kb():
             callback_data="toggle_ping_engine_mode", style="primary"
         )],
         [InlineKeyboardButton(msg("btn_replace_database"), callback_data="replace_db", style="danger")],
+        [InlineKeyboardButton("🗄 مدیریت آرشیو و دیتای فشرده", callback_data="data_management", style="primary")],
         [InlineKeyboardButton("🧪 دیباگ عمیق با شماره لاین", callback_data="run_deep_debug", style="primary")],
         [InlineKeyboardButton("📜 فعالیت ۵۰ عمل آخر ادمین", callback_data="activity_log", style="primary")],
         [InlineKeyboardButton(msg("btn_back"), callback_data="back_home", style="primary")],
