@@ -104,38 +104,52 @@ logging.Formatter.converter = lambda *args: datetime.now(pytz.timezone("Asia/Teh
 
 _LOG_FILE = os.path.join(DATA_DIR, "bot.log")
 
-try:
-    for _old_log in glob.glob(_LOG_FILE + ".*"):
+def _configure_bot_logging():
+    """Create the single active log file and reset it on every process start."""
+    root = logging.getLogger()
+    for handler in list(root.handlers):
         try:
-            os.remove(_old_log)
-        except OSError:
+            handler.flush()
+        except Exception:
             pass
+        try:
+            handler.close()
+        except Exception:
+            pass
+        root.removeHandler(handler)
+
+    # Keep the requested behavior: every start/restart/deploy begins with a
+    # completely fresh bot.log. Database/backups are never touched here.
     try:
-        os.remove(_LOG_FILE)
-    except FileNotFoundError:
+        for old_log in glob.glob(_LOG_FILE + ".*"):
+            try:
+                os.remove(old_log)
+            except OSError:
+                pass
+        try:
+            os.remove(_LOG_FILE)
+        except FileNotFoundError:
+            pass
+    except OSError:
         pass
-except Exception:
-    pass
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        # Logs are intentionally reset on every process/redeploy.
-        # The database is untouched; only bot.log is truncated.
-        logging.FileHandler(
-            _LOG_FILE,
-            mode='w',
-            encoding='utf-8'
-        )
-    ]
-)
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    file_handler = logging.FileHandler(_LOG_FILE, mode="w", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
 
-log = logging.getLogger("bot")
+    root.setLevel(logging.INFO)
+    root.addHandler(stream_handler)
+    root.addHandler(file_handler)
 
+    bot_logger = logging.getLogger("bot")
+    bot_logger.setLevel(logging.INFO)
+    bot_logger.propagate = True
+    return bot_logger
+
+log = _configure_bot_logging()
 logging.getLogger("httpx").setLevel(logging.WARNING)
-
 logging.getLogger("telegram").setLevel(logging.WARNING)
 
 TEHRAN_TZ = pytz.timezone('Asia/Tehran')
