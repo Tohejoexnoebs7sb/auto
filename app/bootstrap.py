@@ -98,58 +98,9 @@ BACKUP_DIR = os.path.join(DATA_DIR, "backups")
 
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
-from logging.handlers import RotatingFileHandler
-
-logging.Formatter.converter = lambda *args: datetime.now(pytz.timezone("Asia/Tehran")).timetuple()
-
-_LOG_FILE = os.path.join(DATA_DIR, "bot.log")
-
-def _configure_bot_logging():
-    """Create the single active log file and reset it on every process start."""
-    root = logging.getLogger()
-    for handler in list(root.handlers):
-        try:
-            handler.flush()
-        except Exception:
-            pass
-        try:
-            handler.close()
-        except Exception:
-            pass
-        root.removeHandler(handler)
-
-    # Keep the requested behavior: every start/restart/deploy begins with a
-    # completely fresh bot.log. Database/backups are never touched here.
-    try:
-        for old_log in glob.glob(_LOG_FILE + ".*"):
-            try:
-                os.remove(old_log)
-            except OSError:
-                pass
-        try:
-            os.remove(_LOG_FILE)
-        except FileNotFoundError:
-            pass
-    except OSError:
-        pass
-
-    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    file_handler = logging.FileHandler(_LOG_FILE, mode="w", encoding="utf-8")
-    file_handler.setFormatter(formatter)
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setFormatter(formatter)
-
-    root.setLevel(logging.INFO)
-    root.addHandler(stream_handler)
-    root.addHandler(file_handler)
-
-    bot_logger = logging.getLogger("bot")
-    bot_logger.setLevel(logging.INFO)
-    bot_logger.propagate = True
-    return bot_logger
-
-log = _configure_bot_logging()
+# Logging is configured once by app.core.runtime; do not add a second file handler here.
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
 logging.getLogger("telegram").setLevel(logging.WARNING)
 
 TEHRAN_TZ = pytz.timezone('Asia/Tehran')
@@ -549,11 +500,13 @@ PROXY_PROTOCOLS = ("MTPROTO", "SOCKS5")
 
 CONFIG_PROTOCOLS = ("VLESS", "VMESS", "TROJAN", "SHADOWSOCKS", "SOCKS", "HYSTERIA", "HYSTERIA2", "HY2", "WIREGUARD", "WG")
 
-CONFIG_RETENTION_HOURS = 48
+CONFIG_RETENTION_HOURS = 24
 
-RUNTIME_RETENTION_HOURS = 12
+RUNTIME_RETENTION_HOURS = 24
 
-DB_CLEAN_INTERVAL = 15 * 60
+DB_CLEAN_INTERVAL = 30 * 60
+
+LOG_CLEAN_INTERVAL = 30 * 60
 
 DB_SOFT_LIMIT_BYTES = 9 * 1024 * 1024
 
