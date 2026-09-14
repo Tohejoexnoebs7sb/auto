@@ -91,8 +91,16 @@ def _remove_old_log_files():
 def configure_bot_logging(reset=True):
     """Install one active bot.log handler and optionally reset the file."""
     root = logging.getLogger()
-    logging._acquireLock()
+    # Python 3.13 no longer exposes logging._acquireLock/_releaseLock.
+    # Use our own re-entrant lock so startup and the 30-minute reset cannot
+    # reconfigure the root handlers concurrently.
+    global _LOG_CONFIG_LOCK
     try:
+        lock = _LOG_CONFIG_LOCK
+    except NameError:
+        _LOG_CONFIG_LOCK = threading.RLock()
+        lock = _LOG_CONFIG_LOCK
+    with lock:
         for handler in list(root.handlers):
             if isinstance(handler, logging.FileHandler):
                 try: handler.flush(); handler.close()
@@ -108,8 +116,6 @@ def configure_bot_logging(reset=True):
             sh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
             root.addHandler(sh)
         root.addHandler(fh)
-    finally:
-        logging._releaseLock()
     logging.getLogger("bot").setLevel(logging.INFO)
     logging.getLogger("bot").propagate = True
 
