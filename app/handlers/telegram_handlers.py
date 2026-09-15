@@ -100,7 +100,7 @@ async def _on_callback_impl(u, ctx):
             current=get_iran_ping_min_ok()
             ctx.user_data["action"]="set_iran_ping_threshold"
             await q.edit_message_text(
-                f"🎯 <b>حداقل Ping ایران</b>\n\nمقدار فعلی: <b>{current}/4</b>\n\nیک عدد صحیح از <b>۰ تا ۴</b> بفرست.\nاین مقدار برای <b>تمامی پروفایل‌ها و هر دو نوع کانفیگ/پروکسی</b> اعمال می‌شود.\nمثلاً ۲ یعنی هر محل ایران باید حداقل ۲ پاسخ موفق از ۴ پاسخ داشته باشد؛ اگر حتی یک محل ایران ناقص/غایب باشد، رد می‌شود.",
+                f"🎯 <b>حداقل Ping ایران</b>\n\nمقدار فعلی: <b>{current}/4</b>\n\nیک عدد صحیح از <b>۰ تا ۴</b> بفرست.\nاین مقدار برای <b>تمامی پروفایل‌ها و هر دو نوع کانفیگ/پروکسی</b> اعمال می‌شود.\nمثلاً ۲ یعنی حداقل یک محل ایران باید ۲ پاسخ موفق از ۴ پاسخ داشته باشد.",
                 parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ برگشت", callback_data="general_settings", style="primary")]])
             )
             return
