@@ -4,6 +4,7 @@ from __future__ import annotations
 # Function bodies are preserved; shared names are injected by app.loader after
 # all feature modules are imported, so cross-module dependencies remain compatible.
 from app.core.runtime import *  # noqa: F401,F403
+import math
 
 async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, enable_proxies=True, is_instant=False):
     log.info("=" * 50)
@@ -508,9 +509,15 @@ async def _run_manual_runnow_isolated(bot, profile_id):
         lock = asyncio.Lock()
         _MANUAL_RUN_LOCKS[pid] = lock
     async with lock:
-        return await _run_cycle_for_profile_unlocked(
-            bot, pid, enable_configs=True, enable_proxies=True, is_instant=True
-        )
+        total=0
+        messages=[]
+        if get_profile_post_configs(pid):
+            count,message=await run_cycle_for_profile(bot,pid,enable_configs=True,enable_proxies=False,is_instant=True)
+            total+=int(count or 0); messages.append(str(message))
+        if get_profile_post_proxies(pid):
+            count,message=await run_cycle_for_profile(bot,pid,enable_configs=False,enable_proxies=True,is_instant=True)
+            total+=int(count or 0); messages.append(str(message))
+        return total, "; ".join(messages) if messages else "nothing enabled"
 
 async def profile_loop_config(bot, profile_id):
     log.info(f"🔄 Starting config loop for profile {profile_id}")
@@ -676,14 +683,21 @@ async def _auto_scan_stream(profile_id, stream):
     sources=[normalize_channel_input(x) for x in get_profile_sources(pid)]
     sources=[x for x in sources if x]
     if not sources: return 0
-    sem=asyncio.Semaphore(20 if get_profile_low_cost_mode(pid) else 28)
+
+    scan_key=(pid, stream)
+    cursor_index=int(_AUTO_SCAN_OFFSETS.get(scan_key, 0) or 0) % len(sources)
+    batch_size=max(6, min(12, int(math.ceil(len(sources) / 4))))
+    selected_sources=[sources[(cursor_index+i) % len(sources)] for i in range(min(batch_size, len(sources)))]
+    _AUTO_SCAN_OFFSETS[scan_key]=(cursor_index+len(selected_sources)) % len(sources)
+
+    sem=asyncio.Semaphore(8 if get_profile_low_cost_mode(pid) else 12)
     async def one(src):
         async with sem:
             try:
                 return await asyncio.wait_for(scrape_channel_paginated(pid,src,max_pages=1,stream=stream),timeout=15.0)
             except Exception as exc:
                 log.warning("[AUTO-SCAN][%s][profile=%s] %s failed: %s",stream,pid,src,exc); return None
-    results=await asyncio.gather(*[one(src) for src in sources])
+    results=await asyncio.gather(*[one(src) for src in selected_sources])
     pending_hashes={r[0] for r in _pending_batch_rows(pid,stream)}
     ping_enabled=get_profile_ping_enabled(pid); inserted=0; cursor_updates=[]
 
@@ -703,7 +717,7 @@ async def _auto_scan_stream(profile_id, stream):
             log.debug("[AUTO-SCAN][proxy] geo lookup failed for %s: %s", str(proxy_url)[:90], exc)
         return flag, country_code
 
-    for src,result in zip(sources,results):
+    for src,result in zip(selected_sources,results):
         if not result: continue
         configs,proxies,newest_id=result
         if newest_id: cursor_updates.append((src,newest_id))
@@ -731,7 +745,15 @@ async def _auto_health_test_stream(profile_id, stream):
             cur=c.execute("UPDATE pending_batch_items SET ping=1 WHERE profile_id=? AND kind=? AND ping<=0",(pid,stream)); conn.commit(); return max(0,cur.rowcount)
         except sqlite3.Error: conn.rollback(); return 0
     limit=AUTO_CONFIG_TEST_BATCH if stream=="config" else AUTO_PROXY_TEST_BATCH
-    rows=c.execute("SELECT identity_hash,url,source FROM pending_batch_items WHERE profile_id=? AND kind=? AND ping<=0 ORDER BY added_at ASC LIMIT ?",(pid,stream,limit)).fetchall()
+    cutoff=(datetime.now(TEHRAN_TZ)-timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
+    rows=c.execute(
+        "SELECT p.identity_hash,p.url,p.source FROM pending_batch_items p "
+        "WHERE p.profile_id=? AND p.kind=? AND p.ping<=0 "
+        "AND NOT EXISTS (SELECT 1 FROM batch_test_cache b WHERE b.profile_id=p.profile_id "
+        "AND b.kind=p.kind AND b.identity_hash=p.identity_hash AND b.tested_at>=?) "
+        "ORDER BY p.added_at ASC LIMIT ?",
+        (pid,stream,cutoff,limit)
+    ).fetchall()
     if not rows: return 0
     sem=asyncio.Semaphore(3 if get_profile_low_cost_mode(pid) else 4)
     host_mode=get_profile_config_ping_mode(pid) if stream=="config" else get_profile_proxy_ping_mode(pid)
@@ -740,27 +762,33 @@ async def _auto_health_test_stream(profile_id, stream):
         h,url,src=row
         async with sem:
             try:
-                # 0 = current Check-Host only; 1 = real full-config; 2 = full-config then host.
-                if test_mode in (1,2):
-                    full_ms, full_ok, _detail = await full_config_ping(url)
-                    if not full_ok:
-                        return h,0,0,False
-                else:
-                    full_ms=0
-                if test_mode==1:
+                url_host, _url_port = extract_host(url)
+                if not url_host:
+                    return h,0,0,False
+                # 0 = Check-Host only; 1 = real full-config; 2 = full-config + Check-Host.
+                if test_mode == 0:
+                    host_ms,host_ok,count=await _check_host_ping(url_host,host_mode)
+                    return h,host_ms,count,host_ok
+                full_ms,full_ok,_detail=await full_config_ping(url)
+                if not full_ok or full_ms <= 0:
+                    return h,0,0,False
+                if test_mode == 1:
                     return h,float(full_ms),1,True
-                host_ms,host_ok,count=await check_full_link_ping(url,host_mode,perform_ping=True)
-                return h,host_ms,count,host_ok
+                host_ms,host_ok,count=await _check_host_ping(url_host,host_mode)
+                if not host_ok:
+                    return h,0,0,False
+                return h,float(full_ms),count,True
             except Exception as exc:
                 log.debug("[AUTO-TEST] failed %s: %s", h, exc)
                 return h,0,0,False
     results=await asyncio.gather(*[test(r) for r in rows])
     passed=failed=0
     for h,ping,count,ok in results:
+        _batch_mark_tested(pid, stream, h)
         if ok and ping>0:
             c.execute("UPDATE pending_batch_items SET ping=?,ping_count=? WHERE profile_id=? AND kind=? AND identity_hash=?",(float(ping),int(count),pid,stream,h)); passed+=1
         else:
-            c.execute("DELETE FROM pending_batch_items WHERE profile_id=? AND kind=? AND identity_hash=?",(pid,stream,h)); failed+=1
+            failed+=1
     conn.commit()
     if passed or failed: log.info("[AUTO-TEST][%s][profile=%s] passed=%d failed=%d",stream,pid,passed,failed)
     return passed
