@@ -6,13 +6,16 @@ from __future__ import annotations
 from app.core.runtime import *  # noqa: F401,F403
 
 _AUTO_STREAM_LOCKS = {}
+_AUTO_POST_DEADLINES = {}
 _AUTO_SCRAPE_CACHE = {}
 _AUTO_SCRAPE_CACHE_LOCK = asyncio.Lock()
 _AUTO_GLOBAL_SCRAPE_SEM = asyncio.Semaphore(32)
 _AUTO_SCRAPE_CACHE_TTL = 8.0
 
-def _auto_stream_lock(profile_id, stream):
-    key = (int(profile_id), str(stream))
+def _auto_stream_lock(profile_id, stream, operation="shared"):
+    # Keep network-heavy scan/test/post operations independent; only same-operation
+    # re-entry is serialized so a slow tester cannot starve the poster.
+    key = (int(profile_id), str(stream), str(operation))
     lock = _AUTO_STREAM_LOCKS.get(key)
     if lock is None:
         lock = asyncio.Lock()
@@ -805,15 +808,15 @@ async def _auto_health_test_stream_unlocked(profile_id, stream):
     return passed
 
 async def _auto_scan_stream(profile_id, stream):
-    async with _auto_stream_lock(profile_id, stream):
+    async with _auto_stream_lock(profile_id, stream, "scan"):
         return await _auto_scan_stream_unlocked(profile_id, stream)
 
 async def _auto_health_test_stream(profile_id, stream):
-    async with _auto_stream_lock(profile_id, stream):
+    async with _auto_stream_lock(profile_id, stream, "test"):
         return await _auto_health_test_stream_unlocked(profile_id, stream)
 
 async def _auto_post_pending(profile_id, stream, bot, force_instant=False):
-    async with _auto_stream_lock(profile_id, stream):
+    async with _auto_stream_lock(profile_id, stream, "post"):
         return await _auto_post_pending_unlocked(profile_id, stream, bot, force_instant)
 
 async def _auto_scanner_worker(profile_id,stream):
@@ -909,7 +912,7 @@ async def _auto_post_pending_unlocked(profile_id,stream,bot,force_instant=False)
 
 async def _auto_exact_poster_worker(profile_id,stream,bot):
     name=f"auto_post_{stream}_{profile_id}"; log.info("[AUTO-POST] started %s | timer independent",name)
-    loop=asyncio.get_running_loop(); next_deadline=None; interval_seconds=None
+    loop=asyncio.get_running_loop(); next_deadline=_AUTO_POST_DEADLINES.get((int(profile_id), str(stream))); interval_seconds=None
     while True:
         try:
             _WORKER_HEARTBEATS[name]=time.time(); profile=get_profile(profile_id)
@@ -940,11 +943,20 @@ async def _auto_exact_poster_worker(profile_id,stream,bot):
                 # A positive interval is a complete accumulation window. Do not
                 # publish immediately when the worker starts or when the setting
                 # changes; the first deadline is one full interval from now.
-                interval_seconds=seconds; next_deadline=loop.time()+seconds
+                interval_seconds=seconds
+                if next_deadline is None:
+                    next_deadline=loop.time()+seconds
+                else:
+                    # Preserve an overdue deadline across watchdog restarts.
+                    now_mono=loop.time()
+                    if next_deadline > now_mono + seconds:
+                        next_deadline=now_mono+seconds
+                _AUTO_POST_DEADLINES[(int(profile_id), str(stream))]=next_deadline
             wait=next_deadline-loop.time()
             if wait>0: await asyncio.sleep(wait); continue
             scheduled=datetime.now(TEHRAN_TZ); log.info("[AUTO-POST] TICK profile=%s stream=%s scheduled=%s interval=%sm",profile_id,stream,scheduled.isoformat(),minutes)
             now_mono=loop.time(); missed=max(0,int((now_mono-next_deadline)//seconds)); next_deadline+=(missed+1)*seconds
+            _AUTO_POST_DEADLINES[(int(profile_id), str(stream))]=next_deadline
             sent=await _auto_post_pending(profile_id,stream,bot,False)
             _WORKER_HEARTBEATS[name]=time.time()
             log.info("[AUTO-POST] DONE profile=%s stream=%s sent=%d next_in=%.1fs",profile_id,stream,sent,max(0,next_deadline-loop.time()))
