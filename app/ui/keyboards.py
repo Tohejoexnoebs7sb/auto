@@ -171,6 +171,8 @@ def profile_admin_kb(profile_id):
          InlineKeyboardButton("📊 آمار", callback_data=f"ast_{profile_id}", style="primary")],
         [InlineKeyboardButton("⏱️ تایمر", callback_data=f"timer_menu_{profile_id}", style="primary"),
          InlineKeyboardButton("📜 لاگ", callback_data=f"log_menu_{profile_id}", style="primary")],
+        [InlineKeyboardButton("💾 فاصله بک‌آپ", callback_data=f"setbackupinterval_{profile_id}", style="primary"),
+         InlineKeyboardButton("⏰ زمان‌بندی Cron", callback_data=f"setcron_{profile_id}", style="primary")],
         [InlineKeyboardButton("📤 ارسال دستی", callback_data=f"manual_{profile_id}", style="primary"),
          InlineKeyboardButton("📋 صف ارسال دستی", callback_data=f"mq_list_{profile_id}", style="primary")],
         [InlineKeyboardButton("🗑 حذف پست‌های کانال", callback_data=f"delposts_menu_{profile_id}", style="danger"),
