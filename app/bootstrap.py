@@ -127,6 +127,7 @@ c = conn.cursor()
 
 # The database functions live in app.storage.database, so bind the live
 # connection/cursor there as well. The old monolith exposed these as globals.
+import math
 import app.storage.database as _database_module
 _database_module.conn = conn
 _database_module.c = c
@@ -1110,9 +1111,9 @@ _MANUAL_RUN_TASKS = {}
 
 _active_tasks = {}
 
-AUTO_SCAN_INTERVAL_SECONDS = 12.0
+AUTO_SCAN_INTERVAL_SECONDS = 30.0
 
-AUTO_TEST_INTERVAL_SECONDS = 8.0
+AUTO_TEST_INTERVAL_SECONDS = 12.0
 
 AUTO_INSTANT_POST_POLL_SECONDS = 2.0
 
@@ -1121,6 +1122,8 @@ AUTO_CONFIG_TEST_BATCH = 8
 AUTO_PROXY_TEST_BATCH = 8
 
 _auto_next_runs = {}
+
+_AUTO_SCAN_OFFSETS = {}
 
 backup_locks = {}
 
@@ -1417,10 +1420,13 @@ _WORKER_TASKS = {}
 
 _WORKER_HEARTBEATS = {}
 
+_WORKER_FACTORIES = {}
+
 # Keep worker registries shared across extracted modules.
 for _mod in _loaded_modules:
     vars(_mod)["_WORKER_TASKS"] = _WORKER_TASKS
     vars(_mod)["_WORKER_HEARTBEATS"] = _WORKER_HEARTBEATS
+    vars(_mod)["_WORKER_FACTORIES"] = _WORKER_FACTORIES
 
 BOT_REF = None
 
