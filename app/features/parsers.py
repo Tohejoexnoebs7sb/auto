@@ -77,14 +77,23 @@ def _append_archive(kind, rows):
 def archive_current_posted_data():
     """Move short-lived URL copies into compact gzip archives before DB cleanup."""
     counts = {"configs": 0, "proxies": 0, "ok": True}
+    db = None
     try:
-        cfg_rows = c.execute("SELECT profile_id,full_url,backup_num FROM seen WHERE full_url IS NOT NULL AND full_url!=''").fetchall()
-        prx_rows = c.execute("SELECT profile_id,proxy_url FROM proxies_seen WHERE proxy_url IS NOT NULL AND proxy_url!=''").fetchall()
+        # This function is executed from the maintenance thread. Never use the
+        # event-loop's shared cursor here; a private connection prevents thread
+        # races with Telegram callbacks and posting workers.
+        db = get_conn()
+        cur = db.cursor()
+        cfg_rows = cur.execute("SELECT profile_id,full_url,backup_num FROM seen WHERE full_url IS NOT NULL AND full_url!=''").fetchall()
+        prx_rows = cur.execute("SELECT profile_id,proxy_url FROM proxies_seen WHERE proxy_url IS NOT NULL AND proxy_url!=''").fetchall()
         counts["configs"] = _append_archive("config", cfg_rows)
         counts["proxies"] = _append_archive("proxy", prx_rows)
     except sqlite3.Error:
         counts["ok"] = False
         log.exception("archive current posted data failed")
+    finally:
+        if db is not None:
+            db.close()
     return counts
 
 def load_archive_dedup_cache():
