@@ -9,6 +9,7 @@ from app.core.runtime import *  # noqa: F401,F403
 # module keeps its own function globals, so resolve the same stable default
 # here instead of depending on a later cross-module injection.
 ENABLE_AUTO = True
+APP_REF = None
 
 async def post_working_configs(bot, profile_id, working, proxies_with_ping, force=False, skip_duplicate=False):
     total_configs = 0
@@ -205,29 +206,24 @@ async def database_compact_worker():
         log.exception("[DB COMPACT] worker failed")
 
 async def database_cleanup_worker():
-    log.info('[DB CLEANER] worker started | bounded URL history | runtime-retention=24h | no periodic VACUUM')
+    log.info('[DB CLEANER] worker started | bounded URL history | runtime-retention=24h | compact-after-cleanup')
     # Never compete with startup/callback initialization.
     await asyncio.sleep(10)
     while True:
         try:
-            # Delete disposable rows in a worker thread. Do not VACUUM every 30
-            # minutes: a full SQLite VACUUM can lock the database for a long time
-            # and starve the posting pipeline. SQLite will reuse freed pages.
+            # Delete disposable rows first, then physically reclaim the space.
+            # Both operations run in a worker thread, never on the Telegram event loop.
             await asyncio.to_thread(automatic_database_cleanup)
+            await asyncio.to_thread(compact_database_once)
         except Exception:
             log.exception('[DB CLEANER] worker error')
         await asyncio.sleep(DB_CLEAN_INTERVAL)
 
 async def _worker_guard(name, coro_factory, restart_delay=5):
-    """Run long-lived workers forever and keep a real heartbeat while they wait."""
-    async def _pulse():
-        while True:
-            _WORKER_HEARTBEATS[name] = time.time()
-            await asyncio.sleep(30)
-
+    """Run long lived workers forever without allowing one exception to kill them."""
     while True:
-        pulse_task = asyncio.create_task(_pulse())
         try:
+            _WORKER_HEARTBEATS[name] = time.time()
             await coro_factory()
             _WORKER_HEARTBEATS[name] = time.time()
         except asyncio.CancelledError:
@@ -236,16 +232,15 @@ async def _worker_guard(name, coro_factory, restart_delay=5):
         except Exception:
             log.exception(f"[WATCHDOG] worker crashed: {name}; restarting")
             await asyncio.sleep(restart_delay)
-        finally:
-            pulse_task.cancel()
-            try:
-                await pulse_task
-            except asyncio.CancelledError:
-                pass
+
+_WORKER_FACTORIES = {}
 
 def start_worker(app, name, coro_factory):
     if name in _WORKER_TASKS and not _WORKER_TASKS[name].done():
         return _WORKER_TASKS[name]
+    if app is None:
+        log.error(f"[WATCHDOG] cannot start {name}: application reference unavailable")
+        return None
     _WORKER_FACTORIES[name] = coro_factory
     task = app.create_task(_worker_guard(name, coro_factory))
     _WORKER_TASKS[name] = task
@@ -263,25 +258,31 @@ async def _profile_scheduler_supervisor(app):
 async def worker_watchdog():
     while True:
         try:
-            now=time.time()
+            now = time.time()
+            _WORKER_HEARTBEATS["watchdog"] = now
             for name, task in list(_WORKER_TASKS.items()):
+                if name == "watchdog":
+                    continue
                 if task.done():
-                    log.warning(f"[WATCHDOG] dead worker detected: {name}; restarting")
+                    log.warning(f"[WATCHDOG] dead worker detected: {name}")
                     factory = _WORKER_FACTORIES.get(name)
-                    if factory is not None:
-                        start_worker(BOT_REF, name, factory)
-                elif now - _WORKER_HEARTBEATS.get(name, now) > 300:
-                    log.warning(f"[WATCHDOG] stale worker heartbeat: {name}")
-            await asyncio.sleep(60)
+                    if factory is not None and APP_REF is not None:
+                        _WORKER_TASKS.pop(name, None)
+                        start_worker(APP_REF, name, factory)
+                elif name.startswith("auto_") and now - _WORKER_HEARTBEATS.get(name, now) > 180:
+                    log.error(f"[WATCHDOG] stale worker heartbeat: {name}; restarting")
+                    task.cancel()
+            await asyncio.sleep(30)
         except asyncio.CancelledError:
             break
         except Exception:
             log.exception("[WATCHDOG] monitor error")
-            await asyncio.sleep(60)
+            await asyncio.sleep(30)
 
 async def post_init(app):
-    global BOT_REF, BOT_START_TIME
+    global BOT_REF, BOT_START_TIME, APP_REF
     BOT_REF = app.bot
+    APP_REF = app
     BOT_START_TIME = datetime.now(TEHRAN_TZ)
     # پاکسازی تایمرهای منقضی‌شده در ابتدا
     for prof in get_profiles():
