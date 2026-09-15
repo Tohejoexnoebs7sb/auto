@@ -100,7 +100,7 @@ async def _on_callback_impl(u, ctx):
             current=get_iran_ping_min_ok()
             ctx.user_data["action"]="set_iran_ping_threshold"
             await q.edit_message_text(
-                f"🎯 <b>حداقل Ping ایران</b>\n\nمقدار فعلی: <b>{current}/4</b>\n\nیک عدد صحیح از <b>۰ تا ۴</b> بفرست.\nاین مقدار برای <b>تمامی پروفایل‌ها و هر دو نوع کانفیگ/پروکسی</b> اعمال می‌شود.\nمثلاً ۲ یعنی حداقل یک محل ایران باید ۲ پاسخ موفق از ۴ پاسخ داشته باشد.",
+                f"🎯 <b>حداقل Ping ایران</b>\n\nمقدار فعلی: <b>{current}/4</b>\n\nیک عدد صحیح از <b>۰ تا ۴</b> بفرست.\nاین مقدار برای <b>تمامی پروفایل‌ها و هر دو نوع کانفیگ/پروکسی</b> اعمال می‌شود.\nمثلاً ۲ یعنی هر محل ایران باید حداقل ۲ پاسخ موفق از ۴ پاسخ داشته باشد؛ اگر حتی یک محل ایران ناقص/غایب باشد، رد می‌شود.",
                 parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ برگشت", callback_data="general_settings", style="primary")]])
             )
             return
@@ -1254,7 +1254,8 @@ async def _on_callback_impl(u, ctx):
             else:
                 current=get_profile_proxy_test_mode(profile_id); new_mode=(current+1)%3
                 set_profile_proxy_test_mode(profile_id,new_mode); label="پروکسی"
-            await q.answer(f"🧪 {label}: {_test_mode_label(new_mode)}")
+            region = get_profile_config_ping_mode(profile_id) if d.startswith("cfg_test_mode_") else get_profile_proxy_ping_mode(profile_id)
+            await q.answer(f"🧪 {label}: {_test_mode_label(new_mode, region)}")
             # Re-open the relevant settings screen so the persisted mode is visible immediately.
             if d.startswith("cfg_test_mode_"):
                 await q.edit_message_text("⚙️ <b>تنظیمات تست کانفیگ</b>", parse_mode="HTML", reply_markup=profile_config_settings_kb(profile_id))
