@@ -232,9 +232,6 @@ def set_iran_ping_min_ok(value, apply_all_profiles=True):
     """Persist the Iran Ping threshold and optionally synchronize every profile."""
     value = max(0, min(4, int(value)))
     c.execute("INSERT OR REPLACE INTO cfg (k, v) VALUES ('iran_ping_min_ok', ?)", (str(value),))
-    if apply_all_profiles:
-        # Keep every profile consistent with the admin-wide default.
-        c.execute("UPDATE profiles SET ping_mode='iran', config_ping_mode='iran', proxy_ping_mode='iran'")
     conn.commit()
     return value
 
@@ -331,34 +328,42 @@ async def _check_host_ping(host, mode):
                 # (default 2/4). One missing/failed Iranian location rejects the host.
                 # Global: retain the existing rule of at least one location at 4/4.
 
-            # Iran mode accepts the fastest complete Iranian location that meets
-            # the configured threshold. A single unavailable Check-Host node must
-            # not reject an otherwise healthy target.
-            if mode == "iran":
-                best_iran = []
+            # Iran is intentionally ALL-or-NOTHING: we do not accept a host just
+            # because one Iranian location passed. Every IR node returned by
+            # Check-Host must be present, complete (4 packets), and >= the configured threshold.
+            if mode == "iran" and all_relevant_concrete and len(concrete_nodes) == len(relevant_nodes):
+                iran_results = []
+                iran_ok = True
                 for node_name in relevant_nodes:
                     raw = result.get(node_name)
-                    if raw is None:
-                        continue
                     ok_count, avg_ms, resolved_ip, complete = _parse_check_host_packets(raw)
-                    if complete and ok_count >= required and avg_ms > 0:
-                        best_iran.append((avg_ms, ok_count, node_name, resolved_ip))
-                if best_iran:
-                    best_iran.sort(key=lambda x: x[0])
-                    final_avg, ok_count, node_name, resolved_ip = best_iran[0]
-                    if resolved_ip:
-                        _PING_TARGET_IP_CACHE[target.lower()] = (time.monotonic(), resolved_ip)
+                    iran_results.append((node_name, ok_count, avg_ms, complete))
+                    if not complete or ok_count < required:
+                        iran_ok = False
+
+                if iran_ok and iran_results:
+                    avg_values = [x[2] for x in iran_results if x[2] > 0]
+                    final_avg = int(round(sum(avg_values) / len(avg_values))) if avg_values else 0
+                    min_ok = min(x[1] for x in iran_results)
+                    # Cache an IP only when the complete Iran-wide check passed.
+                    for node_name, ok_count, avg_ms, complete in iran_results:
+                        raw = result.get(node_name)
+                        _oc, _avg, resolved_ip, _complete = _parse_check_host_packets(raw)
+                        if resolved_ip:
+                            _PING_TARGET_IP_CACHE[target.lower()] = (time.monotonic(), resolved_ip)
+                            break
                     log.info(
-                        "✅ Check-Host IRAN PASS for %s: node=%s, %d/4, avg %sms",
-                        target, node_name, ok_count, final_avg
+                        "✅ Check-Host IRAN ALL PASS for %s: %d Iranian locations, minimum %d/4, avg %sms",
+                        target, len(iran_results), min_ok, final_avg
                     )
-                    return final_avg, True, ok_count
-                if all_relevant_concrete and len(concrete_nodes) == len(relevant_nodes):
-                    log.info(
-                        "❌ Check-Host IRAN FAIL for %s: no Iranian location reached %d/4",
-                        target, required
-                    )
-                    return 0, False, 0
+                    return final_avg, True, min_ok
+
+                failed = [f"{n}={ok}/4" for n, ok, _avg, complete in iran_results if (not complete or ok < required)]
+                log.info(
+                    "❌ Check-Host IRAN FAIL for %s: every IR location must be >=2/4; failed=%s",
+                    target, ", ".join(failed) or "unknown"
+                )
+                return 0, False, 0
 
             # Global: if every relevant node is concrete and no node satisfied
             # the existing 4/4 rule, this check is definitively failed.
@@ -655,11 +660,8 @@ async def check_full_link_ping(url, ping_mode="global", perform_ping=True):
     if engine_mode == 1:
         return real_delay, True, 0
 
-    # Engine mode 2 is Core + Check-Host. The profile's selected region is
-    # authoritative and is never silently replaced by Iran.
-    selected_mode = _normalize_ping_mode(ping_mode)
     _host_delay, host_ok, host_count = await asyncio.wait_for(
-        _check_host_ping(host, selected_mode),
+        _check_host_ping(host, _normalize_ping_mode(ping_mode)),
         timeout=18.0,
     )
     if not host_ok:
