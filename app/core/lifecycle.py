@@ -205,24 +205,29 @@ async def database_compact_worker():
         log.exception("[DB COMPACT] worker failed")
 
 async def database_cleanup_worker():
-    log.info('[DB CLEANER] worker started | bounded URL history | runtime-retention=12h | compact-after-cleanup')
+    log.info('[DB CLEANER] worker started | bounded URL history | runtime-retention=24h | no periodic VACUUM')
     # Never compete with startup/callback initialization.
     await asyncio.sleep(10)
     while True:
         try:
-            # Delete disposable rows first, then physically reclaim the space.
-            # Both operations run in a worker thread, never on the Telegram event loop.
+            # Delete disposable rows in a worker thread. Do not VACUUM every 30
+            # minutes: a full SQLite VACUUM can lock the database for a long time
+            # and starve the posting pipeline. SQLite will reuse freed pages.
             await asyncio.to_thread(automatic_database_cleanup)
-            await asyncio.to_thread(compact_database_once)
         except Exception:
             log.exception('[DB CLEANER] worker error')
         await asyncio.sleep(DB_CLEAN_INTERVAL)
 
 async def _worker_guard(name, coro_factory, restart_delay=5):
-    """Run long lived workers forever without allowing one exception to kill them."""
-    while True:
-        try:
+    """Run long-lived workers forever and keep a real heartbeat while they wait."""
+    async def _pulse():
+        while True:
             _WORKER_HEARTBEATS[name] = time.time()
+            await asyncio.sleep(30)
+
+    while True:
+        pulse_task = asyncio.create_task(_pulse())
+        try:
             await coro_factory()
             _WORKER_HEARTBEATS[name] = time.time()
         except asyncio.CancelledError:
@@ -231,10 +236,17 @@ async def _worker_guard(name, coro_factory, restart_delay=5):
         except Exception:
             log.exception(f"[WATCHDOG] worker crashed: {name}; restarting")
             await asyncio.sleep(restart_delay)
+        finally:
+            pulse_task.cancel()
+            try:
+                await pulse_task
+            except asyncio.CancelledError:
+                pass
 
 def start_worker(app, name, coro_factory):
     if name in _WORKER_TASKS and not _WORKER_TASKS[name].done():
         return _WORKER_TASKS[name]
+    _WORKER_FACTORIES[name] = coro_factory
     task = app.create_task(_worker_guard(name, coro_factory))
     _WORKER_TASKS[name] = task
     log.info(f"[BOOT] Worker started: {name}")
@@ -254,7 +266,10 @@ async def worker_watchdog():
             now=time.time()
             for name, task in list(_WORKER_TASKS.items()):
                 if task.done():
-                    log.warning(f"[WATCHDOG] dead worker detected: {name}")
+                    log.warning(f"[WATCHDOG] dead worker detected: {name}; restarting")
+                    factory = _WORKER_FACTORIES.get(name)
+                    if factory is not None:
+                        start_worker(BOT_REF, name, factory)
                 elif now - _WORKER_HEARTBEATS.get(name, now) > 300:
                     log.warning(f"[WATCHDOG] stale worker heartbeat: {name}")
             await asyncio.sleep(60)
