@@ -940,14 +940,15 @@ async def _auto_exact_poster_worker(profile_id,stream,bot):
                 await asyncio.sleep(AUTO_INSTANT_POST_POLL_SECONDS); continue
             seconds=float(minutes*60)
             if interval_seconds!=seconds or next_deadline is None:
-                # A positive interval is a complete accumulation window. Do not
-                # publish immediately when the worker starts or when the setting
-                # changes; the first deadline is one full interval from now.
+                # The current admin/profile interval is authoritative. If it
+                # changes, start a fresh window using the new value. If a worker
+                # is merely restarted with the same value, keep its existing
+                # deadline so watchdog restarts cannot postpone a scheduled post.
+                changed = interval_seconds is not None and interval_seconds != seconds
                 interval_seconds=seconds
-                if next_deadline is None:
+                if next_deadline is None or changed:
                     next_deadline=loop.time()+seconds
                 else:
-                    # Preserve an overdue deadline across watchdog restarts.
                     now_mono=loop.time()
                     if next_deadline > now_mono + seconds:
                         next_deadline=now_mono+seconds
