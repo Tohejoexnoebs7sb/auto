@@ -61,7 +61,7 @@ async def scrape_channel_paginated(profile_id, channel, max_pages=5, stream="com
         # protection prevents reposting already published proxies.
         effective_max_pages = None if max_pages in (None, 0) else int(max_pages)
 
-    log.info(
+    log.debug(
         f"🔍 [profile={profile_id}][stream={stream}] Starting scrape for "
         f"{clean_channel} (max {effective_max_pages} pages, last_msg_id={last_msg_id or 'NONE'})"
     )
@@ -69,7 +69,7 @@ async def scrape_channel_paginated(profile_id, channel, max_pages=5, stream="com
     scrape_client = await _get_scrape_client()
     while (effective_max_pages is None or page_count < effective_max_pages) and not stopped:
         page_count += 1
-        log.info(
+        log.debug(
             f"🔍 [profile={profile_id}][stream={stream}] Scraping page "
             f"{page_count} for {clean_channel}: {current_url}"
         )
@@ -78,7 +78,7 @@ async def scrape_channel_paginated(profile_id, channel, max_pages=5, stream="com
             await _scrape_single_page_with_messages(current_url, clean_channel, scrape_client)
 
         if not msg_ids:
-            log.info(f"⚠️ [profile={profile_id}][stream={stream}] No messages on page {page_count} for {clean_channel}")
+            log.debug(f"⚠️ [profile={profile_id}][stream={stream}] No messages on page {page_count} for {clean_channel}")
             break
 
         # Telegram normally returns newest -> oldest. Keep the newest ID we
@@ -94,7 +94,7 @@ async def scrape_channel_paginated(profile_id, channel, max_pages=5, stream="com
             new_msg_ids.append(mid)
 
         if not new_msg_ids:
-            log.info(
+            log.debug(
                 f"✅ [profile={profile_id}][stream={stream}] Reached cursor for "
                 f"{clean_channel}; no newer messages on page {page_count}."
             )
@@ -133,7 +133,7 @@ async def scrape_channel_paginated(profile_id, channel, max_pages=5, stream="com
     all_configs = list(dict.fromkeys(all_configs))
     all_proxies = list(dict.fromkeys(all_proxies))
 
-    log.info(
+    log.debug(
         f"📊 [profile={profile_id}][stream={stream}] {clean_channel}: "
         f"configs={len(all_configs)}, proxies={len(all_proxies)}, newest={newest_seen_id or 'NONE'}"
     )
