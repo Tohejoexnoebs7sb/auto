@@ -56,7 +56,6 @@ def create_profile(dest_name, sources="", banner_config=None, banner_proxy=None,
         banner_config = "✦ V2Ray Config List\n\n{configs}\n\n◈ #کانفیگ #ویتوری"
     if not banner_proxy:
         banner_proxy = "🌐 <b>Proxies</b>\n━━━━━━━━━━━━━━━━━━\n📅 {date}\n✅ {count} proxies\n━━━━━━━━━━━━━━━━━━\n\n{proxies}\n━━━━━━━━━━━━━━━━━━"
-    ping_mode = _normalize_ping_mode(ping_mode)
     c.execute("""INSERT INTO profiles
         (dest_name, sources, banner_config, banner_proxy, interval_min,
          max_post, max_proxies, post_configs, post_proxies, ping_mode, config_ping_mode, proxy_ping_mode, last_num, created_at,
@@ -68,7 +67,7 @@ def create_profile(dest_name, sources="", banner_config=None, banner_proxy=None,
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (dest_name, sources, banner_config, banner_proxy,
          interval_min, max_post, max_proxies,
-         post_configs, post_proxies, ping_mode, ping_mode, ping_mode, last_num,
+         post_configs, post_proxies, ping_mode, "iran", "iran", last_num,
          get_tehran_time(), show_numbers, custom_query,
          show_date_config, show_date_proxy, schedule_cron, 0, None, 0, backup_interval,
          interval_config, interval_proxy, max_post_config, max_post_proxy,
@@ -137,19 +136,29 @@ def get_profile_max_post_proxy(profile_id):
 def set_profile_max_post_proxy(profile_id, val):
     update_profile(profile_id, max_post_proxy=val)
 
+def _dedupe_profile_sources(sources_list):
+    result = []
+    seen = set()
+    for raw in sources_list or []:
+        normalized = normalize_channel_input(raw)
+        if not normalized:
+            continue
+        key = normalized.lstrip("@").strip().casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(normalized)
+    return result
+
 def get_profile_sources(profile_id):
     prof = get_profile(profile_id)
     if not prof:
         return []
-    s = prof["sources"]
-    items = [x.strip() for x in s.split(",") if x.strip()]
-    items = [normalize_channel_input(x) for x in items if normalize_channel_input(x)]
-    return items
+    return _dedupe_profile_sources(str(prof.get("sources") or "").split(","))
 
 def set_profile_sources(profile_id, sources_list):
-    normalized = [normalize_channel_input(s) for s in sources_list if normalize_channel_input(s)]
-    s = ",".join(normalized)
-    update_profile(profile_id, sources=s)
+    normalized = _dedupe_profile_sources(sources_list)
+    update_profile(profile_id, sources=",".join(normalized))
 
 def get_profile_dest(profile_id):
     prof = get_profile(profile_id)
@@ -200,7 +209,7 @@ def _normalize_ping_mode(mode):
 def get_profile_ping_mode(profile_id):
     """Backward-compatible master ping mode; new UI uses per-stream modes."""
     prof = get_profile(profile_id)
-    return _normalize_ping_mode(prof.get("ping_mode", "global")) if prof else "global"
+    return _normalize_ping_mode(prof.get("ping_mode", "iran")) if prof else "iran"
 
 def set_profile_ping_mode(profile_id, mode):
     mode = _normalize_ping_mode(mode)
@@ -209,11 +218,8 @@ def set_profile_ping_mode(profile_id, mode):
 def get_profile_config_ping_mode(profile_id):
     prof = get_profile(profile_id)
     if not prof:
-        return "global"
-    value = prof.get("config_ping_mode")
-    if value in (None, ""):
-        value = prof.get("ping_mode", "global")
-    return _normalize_ping_mode(value)
+        return "iran"
+    return _normalize_ping_mode(prof.get("config_ping_mode", "iran"))
 
 def set_profile_config_ping_mode(profile_id, mode):
     update_profile(profile_id, config_ping_mode=_normalize_ping_mode(mode))
@@ -221,11 +227,8 @@ def set_profile_config_ping_mode(profile_id, mode):
 def get_profile_proxy_ping_mode(profile_id):
     prof = get_profile(profile_id)
     if not prof:
-        return "global"
-    value = prof.get("proxy_ping_mode")
-    if value in (None, ""):
-        value = prof.get("ping_mode", "global")
-    return _normalize_ping_mode(value)
+        return "iran"
+    return _normalize_ping_mode(prof.get("proxy_ping_mode", "iran"))
 
 def set_profile_proxy_ping_mode(profile_id, mode):
     update_profile(profile_id, proxy_ping_mode=_normalize_ping_mode(mode))
@@ -463,8 +466,14 @@ def set_profile_proxy_test_mode(profile_id, mode):
     update_profile(profile_id, proxy_test_mode=mode)
     return mode
 
-def _test_mode_label(mode):
-    return {0: "🌐 Check-Host", 1: "⚡ Full Config", 2: "⚡ Full Config + Check-Host"}.get(_normalize_test_mode(mode), "🌐 Check-Host")
+def _test_mode_label(mode, ping_mode="iran"):
+    mode = _normalize_test_mode(mode)
+    region = "🇮🇷 ایران" if _normalize_ping_mode(ping_mode) == "iran" else "🌍 جهانی"
+    return {
+        0: f"{region} Check-Host",
+        1: "⚡ Full Config",
+        2: f"⚡ Full Config + {region} Host",
+    }.get(mode, f"{region} Check-Host")
 
 def _pending_batch_rows(profile_id, kind):
     try:
