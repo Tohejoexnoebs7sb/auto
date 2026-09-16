@@ -24,7 +24,7 @@ def header_modes_menu(profile_id):
             f"⚙️ حالت نمایش پروکسی: {'نام کانال' if pm == 'channel' else 'پروتکل'}",
             callback_data=f"hm_proxy_menu_{profile_id}", style="primary"
         )],
-        [InlineKeyboardButton("↩️ بازگشت", callback_data=f"profile_{profile_id}", style="primary")]
+        [InlineKeyboardButton("↩️ بازگشت", callback_data=f"prof_{profile_id}", style="primary")]
     ])
 
 def header_mode_keyboard(profile_id, kind):
@@ -40,7 +40,7 @@ def header_mode_keyboard(profile_id, kind):
             f"{'◉' if mode == 'protocol' else '○'} پروتکل",
             callback_data=f"hm_{kind}_protocol_{profile_id}", style="primary"
         )],
-        [InlineKeyboardButton("↩️ بازگشت", callback_data=f"profile_{profile_id}", style="primary")]
+        [InlineKeyboardButton("↩️ بازگشت", callback_data=f"prof_{profile_id}", style="primary")]
     ])
 
 def get_header_modes(profile_id):
