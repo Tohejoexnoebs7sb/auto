@@ -75,16 +75,20 @@ def _append_archive(kind, rows):
     return written
 
 def archive_current_posted_data():
-    """Move short-lived URL copies into compact gzip archives before DB cleanup."""
     counts = {"configs": 0, "proxies": 0, "ok": True}
+    db = None
     try:
-        cfg_rows = c.execute("SELECT profile_id,full_url,backup_num FROM seen WHERE full_url IS NOT NULL AND full_url!=''").fetchall()
-        prx_rows = c.execute("SELECT profile_id,proxy_url FROM proxies_seen WHERE proxy_url IS NOT NULL AND proxy_url!=''").fetchall()
+        db = get_conn()
+        cfg_rows = db.execute("SELECT profile_id,full_url,backup_num FROM seen WHERE full_url IS NOT NULL AND full_url!=''").fetchall()
+        prx_rows = db.execute("SELECT profile_id,proxy_url FROM proxies_seen WHERE proxy_url IS NOT NULL AND proxy_url!=''").fetchall()
         counts["configs"] = _append_archive("config", cfg_rows)
         counts["proxies"] = _append_archive("proxy", prx_rows)
     except sqlite3.Error:
         counts["ok"] = False
         log.exception("archive current posted data failed")
+    finally:
+        if db:
+            db.close()
     return counts
 
 def load_archive_dedup_cache():
@@ -172,32 +176,68 @@ def country_to_flag(code):
         return "🌐"
     return chr(ord(code[0]) + 127397) + chr(ord(code[1]) + 127397)
 
-async def get_flag_for_ip(ip):
-    cached = c.execute(
-        "SELECT country, flag FROM country_cache WHERE ip=?", (ip,)
-    ).fetchone()
-    if cached and len(cached[1]) > 1:
-        return cached[1], cached[0]  # flag, country_code
+_GEO_CLIENT = None
+_GEO_CLIENT_LOCK = asyncio.Lock()
+_GEO_MEMORY_CACHE = {}
+_GEO_MEMORY_TTL = 6 * 60 * 60
 
+async def _get_geo_client():
+    global _GEO_CLIENT
+    if _GEO_CLIENT is None or _GEO_CLIENT.is_closed:
+        async with _GEO_CLIENT_LOCK:
+            if _GEO_CLIENT is None or _GEO_CLIENT.is_closed:
+                _GEO_CLIENT = httpx.AsyncClient(
+                    timeout=httpx.Timeout(3.0, connect=2.0),
+                    limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
+                )
+    return _GEO_CLIENT
+
+async def _close_geo_client():
+    global _GEO_CLIENT
+    client = _GEO_CLIENT
+    _GEO_CLIENT = None
+    if client and not client.is_closed:
+        await client.aclose()
+
+async def get_flag_for_ip(ip):
+    key = str(ip or "").strip()
+    if not key:
+        return "🌐", ""
+    now = time.monotonic()
+    cached_mem = _GEO_MEMORY_CACHE.get(key)
+    if cached_mem and now - cached_mem[0] < _GEO_MEMORY_TTL:
+        return cached_mem[1], cached_mem[2]
     try:
-        async with httpx.AsyncClient(timeout=3) as cl:
-            r = await cl.get(
-                f"http://ip-api.com/json/{ip}?fields=countryCode",
-                headers={"User-Agent": "Mozilla/5.0"}
-            )
-            if r.status_code == 200:
-                data = r.json()
-                country = data.get("countryCode", "").upper()
-                if country:
-                    flag = country_to_flag(country)
+        cached = c.execute(
+            "SELECT country, flag FROM country_cache WHERE ip=?", (key,)
+        ).fetchone()
+        if cached and len(cached[1]) > 1:
+            _GEO_MEMORY_CACHE[key] = (now, cached[1], cached[0])
+            return cached[1], cached[0]
+    except sqlite3.Error:
+        pass
+    try:
+        cl = await _get_geo_client()
+        r = await cl.get(
+            f"http://ip-api.com/json/{key}?fields=countryCode",
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        if r.status_code == 200:
+            data = r.json()
+            country = str(data.get("countryCode", "")).upper()
+            if country:
+                flag = country_to_flag(country)
+                try:
                     c.execute(
                         "INSERT OR REPLACE INTO country_cache VALUES (?,?,?)",
-                        (ip, country, flag))
+                        (key, country, flag))
                     conn.commit()
-                    return flag, country
+                except sqlite3.Error:
+                    conn.rollback()
+                _GEO_MEMORY_CACHE[key] = (now, flag, country)
+                return flag, country
     except Exception as e:
-        log.warning(f"flag API fail for {ip}: {e}")
-
+        log.debug(f"flag API fail for {key}: {e}")
     return "🌐", ""
 
 def clean_proxy_link(url):
