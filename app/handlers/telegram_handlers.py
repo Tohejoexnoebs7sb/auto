@@ -88,7 +88,7 @@ async def _on_callback_impl(u, ctx):
                 1: "Core / Relay Delay",
                 2: "Core + Relay Delay + Check-Host",
             }
-            await q.answer(f"⚡ هسته Ping سراسری: {labels[new_mode]}")
+            await q.answer(f"⚡ حالت Ping: {labels[new_mode]}")
             lang = get_lang()
             lang_text = "فارسی" if lang == "fa" else "English"
             admins = list_admins()
@@ -249,39 +249,6 @@ async def _on_callback_impl(u, ctx):
                 await show_profile_admin(q.message, profile_id)
             else:
                 await q.answer("⚠️ خطا در داده")
-            return
-
-        if d.startswith("header_modes_"):
-            try:
-                profile_id = int(d.rsplit("_", 1)[1])
-            except (TypeError, ValueError):
-                await q.answer("⚠️ شناسه نامعتبر", show_alert=True)
-                return
-            if not get_profile(profile_id):
-                await q.answer("⚠️ پروفایل یافت نشد", show_alert=True)
-                return
-            await q.edit_message_text("🧾 <b>حالت نمایش هدر</b>\n\nبرای کانفیگ و پروکسی مستقل انتخاب کن.", parse_mode="HTML", reply_markup=header_modes_menu(profile_id))
-            return
-
-        if d.startswith("advanced_schedule_"):
-            try:
-                profile_id = int(d.rsplit("_", 1)[1])
-            except (TypeError, ValueError):
-                await q.answer("⚠️ شناسه نامعتبر", show_alert=True)
-                return
-            if not get_profile(profile_id):
-                await q.answer("⚠️ پروفایل یافت نشد", show_alert=True)
-                return
-            await q.edit_message_text(
-                "🗓 <b>زمان‌بندی پیشرفته</b>\n\n"
-                "بازه بک‌آپ و Cron این پروفایل را مستقل تنظیم کن.",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(f"💾 بازه بک‌آپ: {get_profile_backup_interval(profile_id)}", callback_data=f"setbackupinterval_{profile_id}", style="primary")],
-                    [InlineKeyboardButton(f"⏰ Cron: {get_profile_schedule_cron(profile_id) or 'خالی'}", callback_data=f"setcron_{profile_id}", style="primary")],
-                    [InlineKeyboardButton("↩️ بازگشت", callback_data=f"prof_{profile_id}", style="primary")],
-                ])
-            )
             return
 
         if d.startswith("proto_menu_"):
@@ -1222,11 +1189,17 @@ async def _on_callback_impl(u, ctx):
                 current = get_profile_config_ping_mode(profile_id)
                 new_mode = "iran" if current == "global" else "global"
                 set_profile_config_ping_mode(profile_id, new_mode)
+                if get_profile_config_ping_mode(profile_id) != new_mode:
+                    await q.answer("❌ ذخیره حالت Ping انجام نشد.", show_alert=True)
+                    return
                 label = "کانفیگ"
             else:
                 current = get_profile_proxy_ping_mode(profile_id)
                 new_mode = "iran" if current == "global" else "global"
                 set_profile_proxy_ping_mode(profile_id, new_mode)
+                if get_profile_proxy_ping_mode(profile_id) != new_mode:
+                    await q.answer("❌ ذخیره حالت Ping انجام نشد.", show_alert=True)
+                    return
                 label = "پروکسی"
             await q.answer(f"✅ Ping {label}: {'🇮🇷 ایران' if new_mode == 'iran' else '🌍 جهانی'}")
             await q.edit_message_text(
@@ -3060,9 +3033,11 @@ async def _on_text_impl(u, ctx):
         except:
             return await u.message.reply_text(msg("interval_wrong"))
         if 1 <= n <= 50:
-            set_profile_max_post_config(profile_id, n)
-            persisted = int(get_profile_max_post_config(profile_id) or 1)
-            await u.message.reply_text(msg("max_ok", n=persisted))
+            saved = set_profile_max_post_config(profile_id, n)
+            if int(get_profile_max_post_config(profile_id)) != int(saved):
+                await u.message.reply_text("❌ ذخیره حداکثر کانفیگ انجام نشد.")
+                return
+            await u.message.reply_text(msg("max_ok", n=saved))
         else:
             return await u.message.reply_text(msg("max_err"))
         del ctx.user_data["action"]
@@ -3081,9 +3056,11 @@ async def _on_text_impl(u, ctx):
         except:
             return await u.message.reply_text(msg("interval_wrong"))
         if 1 <= n <= 50:
-            set_profile_max_post_proxy(profile_id, n)
-            persisted = int(get_profile_max_post_proxy(profile_id) or 1)
-            await u.message.reply_text(msg("max_ok", n=persisted))
+            saved = set_profile_max_post_proxy(profile_id, n)
+            if int(get_profile_max_post_proxy(profile_id)) != int(saved):
+                await u.message.reply_text("❌ ذخیره حداکثر پروکسی انجام نشد.")
+                return
+            await u.message.reply_text(msg("max_ok", n=saved))
         else:
             return await u.message.reply_text(msg("max_err"))
         del ctx.user_data["action"]
