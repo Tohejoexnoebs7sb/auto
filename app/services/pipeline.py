@@ -735,6 +735,19 @@ async def _auto_health_test_stream(profile_id, stream):
             cur=c.execute("UPDATE pending_batch_items SET ping=1 WHERE profile_id=? AND kind=? AND ping<=0",(pid,stream)); conn.commit(); return max(0,cur.rowcount)
         except sqlite3.Error: conn.rollback(); return 0
     limit=AUTO_CONFIG_TEST_BATCH if stream=="config" else AUTO_PROXY_TEST_BATCH
+    # A positive ping is only valid for the current health-test cycle.
+    # Never allow an old successful result to survive a later cycle and get
+    # published without being tested again.
+    if stream == "config":
+        try:
+            c.execute(
+                "UPDATE pending_batch_items SET ping=0,ping_count=0 WHERE profile_id=? AND kind='config' AND ping>0",
+                (pid,),
+            )
+            conn.commit()
+        except sqlite3.Error:
+            conn.rollback()
+            return 0
     rows=c.execute("SELECT identity_hash,url,source FROM pending_batch_items WHERE profile_id=? AND kind=? AND ping<=0 ORDER BY added_at ASC LIMIT ?",(pid,stream,limit)).fetchall()
     if not rows: return 0
     sem=asyncio.Semaphore(3 if get_profile_low_cost_mode(pid) else 4)
@@ -836,7 +849,10 @@ async def _auto_post_pending(profile_id,stream,bot,force_instant=False):
             repaired_rows.append((identity_hash, url, source, ping, ping_count, flag, country_code))
         conn.commit()
         rows = repaired_rows
-    if get_profile_ping_enabled(pid): rows=[r for r in rows if float(r[3] or 0)>0]
+    if get_profile_ping_enabled(pid):
+        # Only rows with a real, successful ping result from the current
+        # health-test cycle are eligible for publication.
+        rows=[r for r in rows if float(r[3] or 0)>0 and int(r[4] or 0)>0]
     if not rows: return 0
     if get_profile_batch_posting(pid) and len(rows)<desired: return 0
     rows=rows[:desired]
