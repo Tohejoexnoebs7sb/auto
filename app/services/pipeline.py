@@ -5,6 +5,16 @@ from __future__ import annotations
 # all feature modules are imported, so cross-module dependencies remain compatible.
 from app.core.runtime import *  # noqa: F401,F403
 
+_AUTO_STREAM_LOCKS = {}
+
+def _auto_stream_lock(profile_id, stream):
+    key = (int(profile_id), str(stream))
+    lock = _AUTO_STREAM_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _AUTO_STREAM_LOCKS[key] = lock
+    return lock
+
 async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, enable_proxies=True, is_instant=False):
     log.info("=" * 50)
     log.info(f"🔄 run_cycle for profile {profile_id} (cfg={enable_configs}, prx={enable_proxies}, instant={is_instant})")
@@ -673,20 +683,22 @@ async def _auto_scan_stream(profile_id, stream):
             if expiry.tzinfo is None: expiry=TEHRAN_TZ.localize(expiry)
             if expiry.astimezone(TEHRAN_TZ)>datetime.now(TEHRAN_TZ): return 0
         except Exception: pass
-    sources=[normalize_channel_input(x) for x in get_profile_sources(pid)]
-    sources=[x for x in sources if x]
+    sources=[]
+    source_seen=set()
+    for raw_source in get_profile_sources(pid):
+        source=normalize_channel_input(raw_source)
+        key=source.lower()
+        if source and key not in source_seen:
+            source_seen.add(key)
+            sources.append(source)
     if not sources: return 0
-    sem=asyncio.Semaphore(6 if get_profile_low_cost_mode(pid) else 10)
-    global _AUTO_SCAN_GLOBAL_SEM
-    if "_AUTO_SCAN_GLOBAL_SEM" not in globals():
-        _AUTO_SCAN_GLOBAL_SEM = asyncio.Semaphore(12)
+    sem=asyncio.Semaphore(8 if get_profile_low_cost_mode(pid) else 12)
     async def one(src):
         async with sem:
-            async with _AUTO_SCAN_GLOBAL_SEM:
-                try:
-                    return await asyncio.wait_for(scrape_channel_paginated(pid,src,max_pages=1,stream=stream),timeout=12.0)
-                except Exception as exc:
-                    log.warning("[AUTO-SCAN][%s][profile=%s] %s failed: %s",stream,pid,src,exc); return None
+            try:
+                return await asyncio.wait_for(scrape_channel_paginated(pid,src,max_pages=1,stream=stream),timeout=15.0)
+            except Exception as exc:
+                log.warning("[AUTO-SCAN][%s][profile=%s] %s failed: %s",stream,pid,src,exc); return None
     results=await asyncio.gather(*[one(src) for src in sources])
     pending_hashes={r[0] for r in _pending_batch_rows(pid,stream)}
     ping_enabled=get_profile_ping_enabled(pid); inserted=0; cursor_updates=[]
@@ -735,19 +747,6 @@ async def _auto_health_test_stream(profile_id, stream):
             cur=c.execute("UPDATE pending_batch_items SET ping=1 WHERE profile_id=? AND kind=? AND ping<=0",(pid,stream)); conn.commit(); return max(0,cur.rowcount)
         except sqlite3.Error: conn.rollback(); return 0
     limit=AUTO_CONFIG_TEST_BATCH if stream=="config" else AUTO_PROXY_TEST_BATCH
-    # A positive ping is only valid for the current health-test cycle.
-    # Never allow an old successful result to survive a later cycle and get
-    # published without being tested again.
-    if stream == "config":
-        try:
-            c.execute(
-                "UPDATE pending_batch_items SET ping=0,ping_count=0 WHERE profile_id=? AND kind='config' AND ping>0",
-                (pid,),
-            )
-            conn.commit()
-        except sqlite3.Error:
-            conn.rollback()
-            return 0
     rows=c.execute("SELECT identity_hash,url,source FROM pending_batch_items WHERE profile_id=? AND kind=? AND ping<=0 ORDER BY added_at ASC LIMIT ?",(pid,stream,limit)).fetchall()
     if not rows: return 0
     sem=asyncio.Semaphore(3 if get_profile_low_cost_mode(pid) else 4)
@@ -787,9 +786,10 @@ async def _auto_scanner_worker(profile_id,stream):
     while True:
         try:
             _WORKER_HEARTBEATS[name]=time.time()
-            await _auto_scan_stream(profile_id,stream)
-            delay = 45.0 if get_profile_low_cost_mode(profile_id) else 30.0
-            await asyncio.sleep(delay)
+            async with _auto_stream_lock(profile_id, stream):
+                await _auto_scan_stream(profile_id,stream)
+            _WORKER_HEARTBEATS[name]=time.time()
+            await asyncio.sleep(AUTO_SCAN_INTERVAL_SECONDS)
         except asyncio.CancelledError: return
         except Exception: log.exception("[AUTO-SCAN] worker error %s",name); await asyncio.sleep(2)
 
@@ -798,9 +798,10 @@ async def _auto_tester_worker(profile_id,stream):
     while True:
         try:
             _WORKER_HEARTBEATS[name]=time.time()
-            await _auto_health_test_stream(profile_id,stream)
-            test_delay = 15.0 if get_profile_low_cost_mode(profile_id) else 10.0
-            await asyncio.sleep(test_delay)
+            async with _auto_stream_lock(profile_id, stream):
+                await _auto_health_test_stream(profile_id,stream)
+            _WORKER_HEARTBEATS[name]=time.time()
+            await asyncio.sleep(AUTO_TEST_INTERVAL_SECONDS)
         except asyncio.CancelledError: return
         except Exception: log.exception("[AUTO-TEST] worker error %s",name); await asyncio.sleep(2)
 
@@ -849,10 +850,7 @@ async def _auto_post_pending(profile_id,stream,bot,force_instant=False):
             repaired_rows.append((identity_hash, url, source, ping, ping_count, flag, country_code))
         conn.commit()
         rows = repaired_rows
-    if get_profile_ping_enabled(pid):
-        # Only rows with a real, successful ping result from the current
-        # health-test cycle are eligible for publication.
-        rows=[r for r in rows if float(r[3] or 0)>0 and int(r[4] or 0)>0]
+    if get_profile_ping_enabled(pid): rows=[r for r in rows if float(r[3] or 0)>0]
     if not rows: return 0
     if get_profile_batch_posting(pid) and len(rows)<desired: return 0
     rows=rows[:desired]
@@ -892,7 +890,8 @@ async def _auto_exact_poster_worker(profile_id,stream,bot):
                 except Exception:
                     clear_profile_timer(profile_id); next_deadline=None; interval_seconds=None
             if minutes==0:
-                sent=await _auto_post_pending(profile_id,stream,bot,True)
+                async with _auto_stream_lock(profile_id, stream):
+                    sent=await asyncio.wait_for(_auto_post_pending(profile_id,stream,bot,True), timeout=120.0)
                 if sent: log.info("[AUTO-POST][%s][profile=%s] instant sent=%d",stream,profile_id,sent)
                 await asyncio.sleep(AUTO_INSTANT_POST_POLL_SECONDS); continue
             seconds=float(minutes*60)
@@ -902,16 +901,11 @@ async def _auto_exact_poster_worker(profile_id,stream,bot):
                 # changes; the first deadline is one full interval from now.
                 interval_seconds=seconds; next_deadline=loop.time()+seconds
             wait=next_deadline-loop.time()
-            if wait > 0:
-                # Keep the watchdog informed during long configured intervals.
-                # Sleeping in short chunks does not change the posting deadline.
-                chunk = min(wait, 30.0)
-                await asyncio.sleep(chunk)
-                _WORKER_HEARTBEATS[name] = time.time()
-                continue
+            if wait>0: await asyncio.sleep(wait); continue
             scheduled=datetime.now(TEHRAN_TZ); log.info("[AUTO-POST] TICK profile=%s stream=%s scheduled=%s interval=%sm",profile_id,stream,scheduled.isoformat(),minutes)
             now_mono=loop.time(); missed=max(0,int((now_mono-next_deadline)//seconds)); next_deadline+=(missed+1)*seconds
-            sent=await _auto_post_pending(profile_id,stream,bot,False)
+            async with _auto_stream_lock(profile_id, stream):
+                sent=await asyncio.wait_for(_auto_post_pending(profile_id,stream,bot,False), timeout=120.0)
             log.info("[AUTO-POST] DONE profile=%s stream=%s sent=%d next_in=%.1fs",profile_id,stream,sent,max(0,next_deadline-loop.time()))
         except asyncio.CancelledError: return
         except Exception: log.exception("[AUTO-POST] error profile=%s stream=%s",profile_id,stream); await asyncio.sleep(.5)
