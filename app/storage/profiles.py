@@ -67,7 +67,7 @@ def create_profile(dest_name, sources="", banner_config=None, banner_proxy=None,
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (dest_name, sources, banner_config, banner_proxy,
          interval_min, max_post, max_proxies,
-         post_configs, post_proxies, ping_mode, "iran", "iran", last_num,
+         post_configs, post_proxies, ping_mode, ping_mode, ping_mode, last_num,
          get_tehran_time(), show_numbers, custom_query,
          show_date_config, show_date_proxy, schedule_cron, 0, None, 0, backup_interval,
          interval_config, interval_proxy, max_post_config, max_post_proxy,
@@ -113,52 +113,62 @@ def get_profile_interval_config(profile_id):
     return prof.get("interval_config", 5) if prof else 5
 
 def set_profile_interval_config(profile_id, val):
+    val = max(0, min(1440, int(val)))
     update_profile(profile_id, interval_config=val)
+    return val
 
 def get_profile_interval_proxy(profile_id):
     prof = get_profile(profile_id)
     return prof.get("interval_proxy", 5) if prof else 5
 
 def set_profile_interval_proxy(profile_id, val):
+    val = max(0, min(1440, int(val)))
     update_profile(profile_id, interval_proxy=val)
+    return val
 
 def get_profile_max_post_config(profile_id):
     prof = get_profile(profile_id)
     return prof.get("max_post_config", 8) if prof else 8
 
 def set_profile_max_post_config(profile_id, val):
+    val = max(1, min(50, int(val)))
     update_profile(profile_id, max_post_config=val)
+    return val
 
 def get_profile_max_post_proxy(profile_id):
     prof = get_profile(profile_id)
     return prof.get("max_post_proxy", 10) if prof else 10
 
 def set_profile_max_post_proxy(profile_id, val):
+    val = max(1, min(50, int(val)))
     update_profile(profile_id, max_post_proxy=val)
-
-def _dedupe_profile_sources(sources_list):
-    result = []
-    seen = set()
-    for raw in sources_list or []:
-        normalized = normalize_channel_input(raw)
-        if not normalized:
-            continue
-        key = normalized.lstrip("@").strip().casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(normalized)
-    return result
+    return val
 
 def get_profile_sources(profile_id):
     prof = get_profile(profile_id)
     if not prof:
         return []
-    return _dedupe_profile_sources(str(prof.get("sources") or "").split(","))
+    result = []
+    seen = set()
+    for raw in str(prof.get("sources") or "").split(","):
+        item = normalize_channel_input(raw)
+        key = item.lower()
+        if item and key not in seen:
+            seen.add(key)
+            result.append(item)
+    return result
 
 def set_profile_sources(profile_id, sources_list):
-    normalized = _dedupe_profile_sources(sources_list)
+    normalized = []
+    seen = set()
+    for raw in sources_list or []:
+        item = normalize_channel_input(raw)
+        key = item.lower()
+        if item and key not in seen:
+            seen.add(key)
+            normalized.append(item)
     update_profile(profile_id, sources=",".join(normalized))
+    return normalized
 
 def get_profile_dest(profile_id):
     prof = get_profile(profile_id)
@@ -405,7 +415,9 @@ def get_profile_country_display(profile_id):
     return prof.get("country_display", 2) if prof else 2
 
 def set_profile_country_display(profile_id, mode):
+    mode = max(0, min(2, int(mode)))
     update_profile(profile_id, country_display=mode)
+    return mode
 
 def get_profile_config_header_enabled(profile_id):
     prof = get_profile(profile_id)
@@ -466,14 +478,8 @@ def set_profile_proxy_test_mode(profile_id, mode):
     update_profile(profile_id, proxy_test_mode=mode)
     return mode
 
-def _test_mode_label(mode, ping_mode="iran"):
-    mode = _normalize_test_mode(mode)
-    region = "🇮🇷 ایران" if _normalize_ping_mode(ping_mode) == "iran" else "🌍 جهانی"
-    return {
-        0: f"{region} Check-Host",
-        1: "⚡ Full Config",
-        2: f"⚡ Full Config + {region} Host",
-    }.get(mode, f"{region} Check-Host")
+def _test_mode_label(mode):
+    return {0: "🇮🇷 Check-Host", 1: "⚡ Full Config", 2: "⚡ Full Config + 🇮🇷 Host"}.get(_normalize_test_mode(mode), "🇮🇷 Check-Host")
 
 def _pending_batch_rows(profile_id, kind):
     try:
