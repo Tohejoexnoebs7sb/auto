@@ -5,15 +5,26 @@ from __future__ import annotations
 # all feature modules are imported, so cross-module dependencies remain compatible.
 from app.core.runtime import *  # noqa: F401,F403
 
-_AUTO_STREAM_LOCKS = {}
+_AUTO_SCAN_LOCKS = {}
+_AUTO_TEST_LOCKS = {}
+_AUTO_POST_LOCKS = {}
 
-def _auto_stream_lock(profile_id, stream):
+def _auto_lock(store, profile_id, stream):
     key = (int(profile_id), str(stream))
-    lock = _AUTO_STREAM_LOCKS.get(key)
+    lock = store.get(key)
     if lock is None:
         lock = asyncio.Lock()
-        _AUTO_STREAM_LOCKS[key] = lock
+        store[key] = lock
     return lock
+
+def _auto_scan_lock(profile_id, stream):
+    return _auto_lock(_AUTO_SCAN_LOCKS, profile_id, stream)
+
+def _auto_test_lock(profile_id, stream):
+    return _auto_lock(_AUTO_TEST_LOCKS, profile_id, stream)
+
+def _auto_post_lock(profile_id, stream):
+    return _auto_lock(_AUTO_POST_LOCKS, profile_id, stream)
 
 async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, enable_proxies=True, is_instant=False):
     log.info("=" * 50)
@@ -759,6 +770,7 @@ async def _auto_health_test_stream(profile_id, stream):
                 # 0 = current Check-Host only; 1 = real full-config; 2 = full-config then host.
                 if test_mode in (1,2):
                     full_ms, full_ok, _detail = await full_config_ping(url)
+                    _WORKER_HEARTBEATS[f"auto_test_{stream}_{pid}"] = time.time()
                     if not full_ok:
                         return h,0,0,False
                 else:
@@ -766,6 +778,7 @@ async def _auto_health_test_stream(profile_id, stream):
                 if test_mode==1:
                     return h,float(full_ms),1,True
                 host_ms,host_ok,count=await check_full_link_ping(url,host_mode,perform_ping=True)
+                _WORKER_HEARTBEATS[f"auto_test_{stream}_{pid}"] = time.time()
                 return h,host_ms,count,host_ok
             except Exception as exc:
                 log.debug("[AUTO-TEST] failed %s: %s", h, exc)
@@ -786,7 +799,7 @@ async def _auto_scanner_worker(profile_id,stream):
     while True:
         try:
             _WORKER_HEARTBEATS[name]=time.time()
-            async with _auto_stream_lock(profile_id, stream):
+            async with _auto_scan_lock(profile_id, stream):
                 await _auto_scan_stream(profile_id,stream)
             _WORKER_HEARTBEATS[name]=time.time()
             await asyncio.sleep(AUTO_SCAN_INTERVAL_SECONDS)
@@ -798,7 +811,7 @@ async def _auto_tester_worker(profile_id,stream):
     while True:
         try:
             _WORKER_HEARTBEATS[name]=time.time()
-            async with _auto_stream_lock(profile_id, stream):
+            async with _auto_test_lock(profile_id, stream):
                 await _auto_health_test_stream(profile_id,stream)
             _WORKER_HEARTBEATS[name]=time.time()
             await asyncio.sleep(AUTO_TEST_INTERVAL_SECONDS)
@@ -890,7 +903,7 @@ async def _auto_exact_poster_worker(profile_id,stream,bot):
                 except Exception:
                     clear_profile_timer(profile_id); next_deadline=None; interval_seconds=None
             if minutes==0:
-                async with _auto_stream_lock(profile_id, stream):
+                async with _auto_post_lock(profile_id, stream):
                     sent=await asyncio.wait_for(_auto_post_pending(profile_id,stream,bot,True), timeout=120.0)
                 if sent: log.info("[AUTO-POST][%s][profile=%s] instant sent=%d",stream,profile_id,sent)
                 await asyncio.sleep(AUTO_INSTANT_POST_POLL_SECONDS); continue
@@ -904,7 +917,7 @@ async def _auto_exact_poster_worker(profile_id,stream,bot):
             if wait>0: await asyncio.sleep(wait); continue
             scheduled=datetime.now(TEHRAN_TZ); log.info("[AUTO-POST] TICK profile=%s stream=%s scheduled=%s interval=%sm",profile_id,stream,scheduled.isoformat(),minutes)
             now_mono=loop.time(); missed=max(0,int((now_mono-next_deadline)//seconds)); next_deadline+=(missed+1)*seconds
-            async with _auto_stream_lock(profile_id, stream):
+            async with _auto_post_lock(profile_id, stream):
                 sent=await asyncio.wait_for(_auto_post_pending(profile_id,stream,bot,False), timeout=120.0)
             log.info("[AUTO-POST] DONE profile=%s stream=%s sent=%d next_in=%.1fs",profile_id,stream,sent,max(0,next_deadline-loop.time()))
         except asyncio.CancelledError: return
