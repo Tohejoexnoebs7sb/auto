@@ -779,13 +779,14 @@ async def _auto_health_test_stream_unlocked(profile_id, stream):
         h,url,src=row
         async with sem:
             try:
-                # 0 = current Check-Host only; 1 = real full-config; 2 = full-config then host.
-                if test_mode in (1,2):
-                    full_ms, full_ok, _detail = await full_config_ping(url)
-                    if not full_ok:
-                        return h,0,0,False
-                else:
-                    full_ms=0
+                # 0 = use the global legacy Ping engine exactly; 1 = real full-config;
+                # 2 = full-config followed by the selected profile region Check-Host.
+                if test_mode == 0:
+                    ping, ok, count = await check_full_link_ping(url, host_mode, perform_ping=True)
+                    return h, float(ping or 0), int(count or 0), bool(ok)
+                full_ms, full_ok, _detail = await full_config_ping(url)
+                if not full_ok:
+                    return h,0,0,False
                 if test_mode==1:
                     return h,float(full_ms),1,True
                 host, _port = extract_host(url)
@@ -900,7 +901,9 @@ async def _auto_post_pending_unlocked(profile_id,stream,bot,force_instant=False)
     rows=rows[:desired]
     if stream=="config":
         sent=await post_configs(bot,pid,[(r[1],float(r[3] or 0),int(r[4] or 0)) for r in rows],source_for_seen="auto",is_instant=force_instant,max_post_override=desired)
-        if sent: _pending_batch_remove_posted(pid,"config")
+        if sent:
+            _pending_batch_remove_posted(pid,"config")
+            await check_and_auto_backup(pid)
         return sent
     items=[(r[1],float(r[3] or 0),r[5] or "🌐",r[6] or "") for r in rows]
     cnt,payload,urls=await post_proxies(bot,pid,items,is_instant=force_instant,max_proxies_override=desired)
@@ -940,21 +943,23 @@ async def _auto_exact_poster_worker(profile_id,stream,bot):
                 await asyncio.sleep(AUTO_INSTANT_POST_POLL_SECONDS); continue
             seconds=float(minutes*60)
             if interval_seconds!=seconds or next_deadline is None:
-                # The current admin/profile interval is authoritative. If it
-                # changes, start a fresh window using the new value. If a worker
-                # is merely restarted with the same value, keep its existing
-                # deadline so watchdog restarts cannot postpone a scheduled post.
-                changed = interval_seconds is not None and interval_seconds != seconds
+                # A positive interval is a complete accumulation window. Do not
+                # publish immediately when the worker starts or when the setting
+                # changes; the first deadline is one full interval from now.
                 interval_seconds=seconds
-                if next_deadline is None or changed:
+                if next_deadline is None:
                     next_deadline=loop.time()+seconds
                 else:
+                    # Preserve an overdue deadline across watchdog restarts.
                     now_mono=loop.time()
                     if next_deadline > now_mono + seconds:
                         next_deadline=now_mono+seconds
                 _AUTO_POST_DEADLINES[(int(profile_id), str(stream))]=next_deadline
             wait=next_deadline-loop.time()
-            if wait>0: await asyncio.sleep(wait); continue
+            if wait>0:
+                await asyncio.sleep(min(wait, 30.0))
+                _WORKER_HEARTBEATS[name] = time.time()
+                continue
             scheduled=datetime.now(TEHRAN_TZ); log.info("[AUTO-POST] TICK profile=%s stream=%s scheduled=%s interval=%sm",profile_id,stream,scheduled.isoformat(),minutes)
             now_mono=loop.time(); missed=max(0,int((now_mono-next_deadline)//seconds)); next_deadline+=(missed+1)*seconds
             _AUTO_POST_DEADLINES[(int(profile_id), str(stream))]=next_deadline
@@ -965,8 +970,10 @@ async def _auto_exact_poster_worker(profile_id,stream,bot):
         except Exception: log.exception("[AUTO-POST] error profile=%s stream=%s",profile_id,stream); await asyncio.sleep(.5)
 
 async def _auto_pipeline_supervisor(app):
+    name = "auto_pipeline_supervisor"
     while True:
         try:
+            _WORKER_HEARTBEATS[name] = time.time()
             if ENABLE_AUTO:
                 for prof in get_profiles():
                     pid=int(prof["id"])
