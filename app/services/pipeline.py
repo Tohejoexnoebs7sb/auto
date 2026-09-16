@@ -828,6 +828,32 @@ async def _auto_post_pending(profile_id,stream,bot,force_instant=False):
         if not get_profile_post_proxies(pid): return 0
         desired=max(1,int(get_profile_max_post_proxy(pid) or 1))
     rows=_pending_batch_rows(pid,stream)
+    if stream == "config":
+        # Blacklisted rows must never occupy the front of the persistent AUTO
+        # queue.  The poster itself also skips them, but leaving them in the
+        # queue can make the first N rows all ineligible and starve valid
+        # configs behind them. Remove only those already-known ineligible rows;
+        # this does not change ping/test or Telegram posting logic.
+        kept_rows = []
+        blacklisted_hashes = []
+        for row in rows:
+            try:
+                if get_blacklist(pid) and is_word_blacklisted(pid, row[1]):
+                    blacklisted_hashes.append(row[0])
+                    continue
+            except Exception:
+                pass
+            kept_rows.append(row)
+        if blacklisted_hashes:
+            try:
+                c.executemany(
+                    "DELETE FROM pending_batch_items WHERE profile_id=? AND kind='config' AND identity_hash=?",
+                    [(pid, h) for h in blacklisted_hashes]
+                )
+                conn.commit()
+            except sqlite3.Error:
+                conn.rollback()
+        rows = kept_rows
     if stream == "proxy":
         # Repair legacy pending rows created before proxy GeoIP metadata was
         # persisted. This keeps existing queues intact while ensuring proxy
@@ -866,11 +892,14 @@ async def _auto_post_pending(profile_id,stream,bot,force_instant=False):
     if get_profile_ping_enabled(pid): rows=[r for r in rows if float(r[3] or 0)>0]
     if not rows: return 0
     if get_profile_batch_posting(pid) and len(rows)<desired: return 0
-    rows=rows[:desired]
+    # Let post_configs apply its own dedup/sort/max selection across all
+    # eligible rows. Slicing here would let an old/ineligible row at the front
+    # of the DB queue starve valid rows behind it.
     if stream=="config":
         sent=await post_configs(bot,pid,[(r[1],float(r[3] or 0),int(r[4] or 0)) for r in rows],source_for_seen="auto",is_instant=force_instant,max_post_override=desired)
         if sent: _pending_batch_remove_posted(pid,"config")
         return sent
+    rows=rows[:desired]
     items=[(r[1],float(r[3] or 0),r[5] or "🌐",r[6] or "") for r in rows]
     cnt,payload,urls=await post_proxies(bot,pid,items,is_instant=force_instant,max_proxies_override=desired)
     if cnt and payload:
