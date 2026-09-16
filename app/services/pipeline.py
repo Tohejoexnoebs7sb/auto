@@ -5,45 +5,6 @@ from __future__ import annotations
 # all feature modules are imported, so cross-module dependencies remain compatible.
 from app.core.runtime import *  # noqa: F401,F403
 
-_AUTO_STREAM_LOCKS = {}
-_AUTO_POST_DEADLINES = {}
-_AUTO_SCRAPE_CACHE = {}
-_AUTO_SCRAPE_CACHE_LOCK = asyncio.Lock()
-_AUTO_GLOBAL_SCRAPE_SEM = asyncio.Semaphore(32)
-_AUTO_SCRAPE_CACHE_TTL = 8.0
-
-def _auto_stream_lock(profile_id, stream, operation="shared"):
-    # Keep network-heavy scan/test/post operations independent; only same-operation
-    # re-entry is serialized so a slow tester cannot starve the poster.
-    key = (int(profile_id), str(stream), str(operation))
-    lock = _AUTO_STREAM_LOCKS.get(key)
-    if lock is None:
-        lock = asyncio.Lock()
-        _AUTO_STREAM_LOCKS[key] = lock
-    return lock
-
-async def _cached_auto_scrape(profile_id, source, stream):
-    last_msg_id = get_stream_last_message_id(profile_id, source, stream)
-    key = (str(source).casefold(), str(stream), str(last_msg_id or ""))
-    now = time.monotonic()
-    async with _AUTO_SCRAPE_CACHE_LOCK:
-        cached = _AUTO_SCRAPE_CACHE.get(key)
-        if cached and now - cached[0] < _AUTO_SCRAPE_CACHE_TTL:
-            configs, proxies, newest = cached[1]
-            return list(configs), list(proxies), newest
-        for old_key, old_value in list(_AUTO_SCRAPE_CACHE.items()):
-            if now - old_value[0] >= _AUTO_SCRAPE_CACHE_TTL:
-                _AUTO_SCRAPE_CACHE.pop(old_key, None)
-    async with _AUTO_GLOBAL_SCRAPE_SEM:
-        result = await scrape_channel_paginated(profile_id, source, max_pages=1, stream=stream)
-    async with _AUTO_SCRAPE_CACHE_LOCK:
-        _AUTO_SCRAPE_CACHE[key] = (time.monotonic(), (list(result[0]), list(result[1]), result[2]))
-        if len(_AUTO_SCRAPE_CACHE) > 512:
-            oldest = sorted(_AUTO_SCRAPE_CACHE.items(), key=lambda item: item[1][0])[:128]
-            for old_key, _ in oldest:
-                _AUTO_SCRAPE_CACHE.pop(old_key, None)
-    return result
-
 async def _run_cycle_for_profile_unlocked(bot, profile_id, enable_configs=True, enable_proxies=True, is_instant=False):
     log.info("=" * 50)
     log.info(f"🔄 run_cycle for profile {profile_id} (cfg={enable_configs}, prx={enable_proxies}, instant={is_instant})")
@@ -699,7 +660,7 @@ async def profile_loop_proxy(bot, profile_id):
             log.error(traceback.format_exc())
             await asyncio.sleep(60)
 
-async def _auto_scan_stream_unlocked(profile_id, stream):
+async def _auto_scan_stream(profile_id, stream):
     pid=int(profile_id); profile=get_profile(pid)
     if not profile or not get_profile_enabled(pid): return 0
     if stream=="config":
@@ -715,13 +676,17 @@ async def _auto_scan_stream_unlocked(profile_id, stream):
     sources=[normalize_channel_input(x) for x in get_profile_sources(pid)]
     sources=[x for x in sources if x]
     if not sources: return 0
-    sem=asyncio.Semaphore(20 if get_profile_low_cost_mode(pid) else 28)
+    sem=asyncio.Semaphore(6 if get_profile_low_cost_mode(pid) else 10)
+    global _AUTO_SCAN_GLOBAL_SEM
+    if "_AUTO_SCAN_GLOBAL_SEM" not in globals():
+        _AUTO_SCAN_GLOBAL_SEM = asyncio.Semaphore(12)
     async def one(src):
         async with sem:
-            try:
-                return await asyncio.wait_for(_cached_auto_scrape(pid,src,stream),timeout=18.0)
-            except Exception as exc:
-                log.warning("[AUTO-SCAN][%s][profile=%s] %s failed: %s",stream,pid,src,exc); return None
+            async with _AUTO_SCAN_GLOBAL_SEM:
+                try:
+                    return await asyncio.wait_for(scrape_channel_paginated(pid,src,max_pages=1,stream=stream),timeout=12.0)
+                except Exception as exc:
+                    log.warning("[AUTO-SCAN][%s][profile=%s] %s failed: %s",stream,pid,src,exc); return None
     results=await asyncio.gather(*[one(src) for src in sources])
     pending_hashes={r[0] for r in _pending_batch_rows(pid,stream)}
     ping_enabled=get_profile_ping_enabled(pid); inserted=0; cursor_updates=[]
@@ -762,7 +727,7 @@ async def _auto_scan_stream_unlocked(profile_id, stream):
     if inserted: log.info("[AUTO-SCAN][%s][profile=%s] queued=%d",stream,pid,inserted)
     return inserted
 
-async def _auto_health_test_stream_unlocked(profile_id, stream):
+async def _auto_health_test_stream(profile_id, stream):
     pid=int(profile_id); profile=get_profile(pid)
     if not profile or not get_profile_enabled(pid): return 0
     if not get_profile_ping_enabled(pid):
@@ -779,20 +744,16 @@ async def _auto_health_test_stream_unlocked(profile_id, stream):
         h,url,src=row
         async with sem:
             try:
-                # 0 = use the global legacy Ping engine exactly; 1 = real full-config;
-                # 2 = full-config followed by the selected profile region Check-Host.
-                if test_mode == 0:
-                    ping, ok, count = await check_full_link_ping(url, host_mode, perform_ping=True)
-                    return h, float(ping or 0), int(count or 0), bool(ok)
-                full_ms, full_ok, _detail = await full_config_ping(url)
-                if not full_ok:
-                    return h,0,0,False
+                # 0 = current Check-Host only; 1 = real full-config; 2 = full-config then host.
+                if test_mode in (1,2):
+                    full_ms, full_ok, _detail = await full_config_ping(url)
+                    if not full_ok:
+                        return h,0,0,False
+                else:
+                    full_ms=0
                 if test_mode==1:
                     return h,float(full_ms),1,True
-                host, _port = extract_host(url)
-                if not host:
-                    return h,0,0,False
-                host_ms,host_ok,count=await _check_host_ping(host,host_mode)
+                host_ms,host_ok,count=await check_full_link_ping(url,host_mode,perform_ping=True)
                 return h,host_ms,count,host_ok
             except Exception as exc:
                 log.debug("[AUTO-TEST] failed %s: %s", h, exc)
@@ -808,34 +769,14 @@ async def _auto_health_test_stream_unlocked(profile_id, stream):
     if passed or failed: log.info("[AUTO-TEST][%s][profile=%s] passed=%d failed=%d",stream,pid,passed,failed)
     return passed
 
-async def _auto_scan_stream(profile_id, stream):
-    async with _auto_stream_lock(profile_id, stream, "scan"):
-        return await _auto_scan_stream_unlocked(profile_id, stream)
-
-async def _auto_health_test_stream(profile_id, stream):
-    async with _auto_stream_lock(profile_id, stream, "test"):
-        return await _auto_health_test_stream_unlocked(profile_id, stream)
-
-async def _auto_post_pending(profile_id, stream, bot, force_instant=False):
-    async with _auto_stream_lock(profile_id, stream, "post"):
-        return await _auto_post_pending_unlocked(profile_id, stream, bot, force_instant)
-
 async def _auto_scanner_worker(profile_id,stream):
     name=f"auto_scan_{stream}_{profile_id}"; log.info("[AUTO-SCAN] started %s",name)
     while True:
         try:
             _WORKER_HEARTBEATS[name]=time.time()
             await _auto_scan_stream(profile_id,stream)
-            _WORKER_HEARTBEATS[name]=time.time()
-            try:
-                raw_interval = get_profile_interval_config(profile_id) if stream == "config" else get_profile_interval_proxy(profile_id)
-                post_seconds = max(0, int(raw_interval or 0)) * 60
-            except Exception:
-                post_seconds = 0
-            scan_delay = 30.0 if get_profile_low_cost_mode(profile_id) else 20.0
-            if post_seconds > 0:
-                scan_delay = min(scan_delay, max(10.0, post_seconds / 4.0))
-            await asyncio.sleep(scan_delay)
+            delay = 45.0 if get_profile_low_cost_mode(profile_id) else 30.0
+            await asyncio.sleep(delay)
         except asyncio.CancelledError: return
         except Exception: log.exception("[AUTO-SCAN] worker error %s",name); await asyncio.sleep(2)
 
@@ -845,12 +786,12 @@ async def _auto_tester_worker(profile_id,stream):
         try:
             _WORKER_HEARTBEATS[name]=time.time()
             await _auto_health_test_stream(profile_id,stream)
-            _WORKER_HEARTBEATS[name]=time.time()
-            await asyncio.sleep(AUTO_TEST_INTERVAL_SECONDS)
+            test_delay = 15.0 if get_profile_low_cost_mode(profile_id) else 10.0
+            await asyncio.sleep(test_delay)
         except asyncio.CancelledError: return
         except Exception: log.exception("[AUTO-TEST] worker error %s",name); await asyncio.sleep(2)
 
-async def _auto_post_pending_unlocked(profile_id,stream,bot,force_instant=False):
+async def _auto_post_pending(profile_id,stream,bot,force_instant=False):
     pid=int(profile_id); profile=get_profile(pid)
     if not profile or not get_profile_enabled(pid): return 0
     if stream=="config":
@@ -901,9 +842,7 @@ async def _auto_post_pending_unlocked(profile_id,stream,bot,force_instant=False)
     rows=rows[:desired]
     if stream=="config":
         sent=await post_configs(bot,pid,[(r[1],float(r[3] or 0),int(r[4] or 0)) for r in rows],source_for_seen="auto",is_instant=force_instant,max_post_override=desired)
-        if sent:
-            _pending_batch_remove_posted(pid,"config")
-            await check_and_auto_backup(pid)
+        if sent: _pending_batch_remove_posted(pid,"config")
         return sent
     items=[(r[1],float(r[3] or 0),r[5] or "🌐",r[6] or "") for r in rows]
     cnt,payload,urls=await post_proxies(bot,pid,items,is_instant=force_instant,max_proxies_override=desired)
@@ -915,7 +854,7 @@ async def _auto_post_pending_unlocked(profile_id,stream,bot,force_instant=False)
 
 async def _auto_exact_poster_worker(profile_id,stream,bot):
     name=f"auto_post_{stream}_{profile_id}"; log.info("[AUTO-POST] started %s | timer independent",name)
-    loop=asyncio.get_running_loop(); next_deadline=_AUTO_POST_DEADLINES.get((int(profile_id), str(stream))); interval_seconds=None
+    loop=asyncio.get_running_loop(); next_deadline=None; interval_seconds=None
     while True:
         try:
             _WORKER_HEARTBEATS[name]=time.time(); profile=get_profile(profile_id)
@@ -938,7 +877,6 @@ async def _auto_exact_poster_worker(profile_id,stream,bot):
                     clear_profile_timer(profile_id); next_deadline=None; interval_seconds=None
             if minutes==0:
                 sent=await _auto_post_pending(profile_id,stream,bot,True)
-                _WORKER_HEARTBEATS[name]=time.time()
                 if sent: log.info("[AUTO-POST][%s][profile=%s] instant sent=%d",stream,profile_id,sent)
                 await asyncio.sleep(AUTO_INSTANT_POST_POLL_SECONDS); continue
             seconds=float(minutes*60)
@@ -946,34 +884,25 @@ async def _auto_exact_poster_worker(profile_id,stream,bot):
                 # A positive interval is a complete accumulation window. Do not
                 # publish immediately when the worker starts or when the setting
                 # changes; the first deadline is one full interval from now.
-                interval_seconds=seconds
-                if next_deadline is None:
-                    next_deadline=loop.time()+seconds
-                else:
-                    # Preserve an overdue deadline across watchdog restarts.
-                    now_mono=loop.time()
-                    if next_deadline > now_mono + seconds:
-                        next_deadline=now_mono+seconds
-                _AUTO_POST_DEADLINES[(int(profile_id), str(stream))]=next_deadline
+                interval_seconds=seconds; next_deadline=loop.time()+seconds
             wait=next_deadline-loop.time()
-            if wait>0:
-                await asyncio.sleep(min(wait, 30.0))
+            if wait > 0:
+                # Keep the watchdog informed during long configured intervals.
+                # Sleeping in short chunks does not change the posting deadline.
+                chunk = min(wait, 30.0)
+                await asyncio.sleep(chunk)
                 _WORKER_HEARTBEATS[name] = time.time()
                 continue
             scheduled=datetime.now(TEHRAN_TZ); log.info("[AUTO-POST] TICK profile=%s stream=%s scheduled=%s interval=%sm",profile_id,stream,scheduled.isoformat(),minutes)
             now_mono=loop.time(); missed=max(0,int((now_mono-next_deadline)//seconds)); next_deadline+=(missed+1)*seconds
-            _AUTO_POST_DEADLINES[(int(profile_id), str(stream))]=next_deadline
             sent=await _auto_post_pending(profile_id,stream,bot,False)
-            _WORKER_HEARTBEATS[name]=time.time()
             log.info("[AUTO-POST] DONE profile=%s stream=%s sent=%d next_in=%.1fs",profile_id,stream,sent,max(0,next_deadline-loop.time()))
         except asyncio.CancelledError: return
         except Exception: log.exception("[AUTO-POST] error profile=%s stream=%s",profile_id,stream); await asyncio.sleep(.5)
 
 async def _auto_pipeline_supervisor(app):
-    name = "auto_pipeline_supervisor"
     while True:
         try:
-            _WORKER_HEARTBEATS[name] = time.time()
             if ENABLE_AUTO:
                 for prof in get_profiles():
                     pid=int(prof["id"])
