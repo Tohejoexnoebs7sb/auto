@@ -232,6 +232,9 @@ def set_iran_ping_min_ok(value, apply_all_profiles=True):
     """Persist the Iran Ping threshold and optionally synchronize every profile."""
     value = max(0, min(4, int(value)))
     c.execute("INSERT OR REPLACE INTO cfg (k, v) VALUES ('iran_ping_min_ok', ?)", (str(value),))
+    if apply_all_profiles:
+        # Keep every profile consistent with the admin-wide default.
+        c.execute("UPDATE profiles SET ping_mode='iran', config_ping_mode='iran', proxy_ping_mode='iran'")
     conn.commit()
     return value
 
@@ -661,7 +664,7 @@ async def check_full_link_ping(url, ping_mode="global", perform_ping=True):
         return real_delay, True, 0
 
     _host_delay, host_ok, host_count = await asyncio.wait_for(
-        _check_host_ping(host, _normalize_ping_mode(ping_mode)),
+        _check_host_ping(host, "iran"),
         timeout=18.0,
     )
     if not host_ok:
